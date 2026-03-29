@@ -12,10 +12,6 @@ from pathlib import Path
 import torch
 import active_adaptation as aa
 
-# debugging
-# if aa._BACKEND_SET is False:
-#     aa.set_backend("mjlab")
-
 if aa.get_backend() == "isaac":
     import isaaclab.sim as sim_utils
     from isaaclab.actuators import ImplicitActuatorCfg
@@ -390,8 +386,12 @@ class AssetCfg:
         }
         
         return ArticulationCfg(
-            spawn=sim_utils.UsdFileCfg(
-                usd_path=str(self.usd_path),
+            spawn=sim_utils.UrdfFileCfg(
+                asset_path=str(self.usd_path),
+                fix_base=False,
+                joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+                    gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
+                ),
                 activate_contact_sensors=True,
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     disable_gravity=False,
@@ -629,5 +629,4 @@ def to_simulation_body_order(
     if preferred_body_names is None:
         return list(body_names)
     return sort_names_by_preferred_order(body_names, preferred_body_names)
-
 
