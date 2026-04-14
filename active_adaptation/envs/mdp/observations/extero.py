@@ -1,26 +1,17 @@
 import torch
-import numpy as np
-import einops
 from typing import Tuple, TYPE_CHECKING, Optional, List
 
 import active_adaptation
 from jaxtyping import Float
 from .base import Observation
-from active_adaptation.utils.math import quat_rotate, quat_rotate_inverse, yaw_quat, quat_from_euler_xyz
+from active_adaptation.utils.math import quat_rotate, yaw_quat, quat_from_euler_xyz
 from active_adaptation.utils.symmetry import SymmetryTransform, cartesian_space_symmetry
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
 
 if active_adaptation.get_backend() == "isaac":
-    import isaaclab.sim as sim_utils
-    from isaaclab.terrains.trimesh.utils import make_plane
-    from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
-    from pxr import UsdGeom, UsdPhysics
-    from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg, sim_utils
-
-
-MESHES = {}
+    from isaaclab.utils.warp import raycast_mesh
 
 
 def raymap(width: int, height: int, fov: float) -> Float[torch.Tensor, "height width 3"]:
@@ -82,7 +73,7 @@ class external_forces(Observation):
         self.denom = default_mass_total if divide_by_mass else torch.tensor(scale, device=self.device)
 
     def update(self):
-        forces_b = self.asset._external_force_b[:, self.body_ids]
+        forces_b = self.asset._external_force_b[:, self.body_ids] # advanced indexing creates a copy
         forces_b /= self.denom
         self.forces_b = forces_b
 
@@ -199,8 +190,16 @@ class height_scan(Observation):
         )
         
         if len(self.target_assets) > 0:
-            mesh_pos_w = torch.stack([self.ground_mesh_pos_w] + [target_asset.data.root_link_pos_w for target_asset in self.target_assets], dim=1)
-            mesh_quat_w = torch.stack([self.ground_mesh_quat_w] + [target_asset.data.root_link_quat_w for target_asset in self.target_assets], dim=1)
+            mesh_pos_w = torch.cat(
+                [self.ground_mesh_pos_w]
+                + [target_asset.data.root_link_pos_w.unsqueeze(1) for target_asset in self.target_assets],
+                dim=1,
+            )
+            mesh_quat_w = torch.cat(
+                [self.ground_mesh_quat_w]
+                + [target_asset.data.root_link_quat_w.unsqueeze(1) for target_asset in self.target_assets],
+                dim=1,
+            )
         else:
             mesh_pos_w = self.ground_mesh_pos_w
             mesh_quat_w = self.ground_mesh_quat_w
@@ -236,6 +235,8 @@ class height_scan(Observation):
 
 
 class forward_scan(Observation):
+    supported_backends = ("isaac",)
+
     def __init__(
         self,
         env,
@@ -312,6 +313,8 @@ class forward_scan(Observation):
 
 
 class raycast_camera(Observation):
+    supported_backends = ("isaac",)
+
     supported_dtypes = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -323,8 +326,8 @@ class raycast_camera(Observation):
         self,
         env,
         resolution: Tuple[int, int],
-        fov: float,
-        rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        fov_deg: float,
+        rpy_deg: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         body_name: Optional[str] = None,
         near: float = 0.01,
         far: float = 100.0,
@@ -340,8 +343,9 @@ class raycast_camera(Observation):
         assert self.far - self.near > 1e-6, "Far must be greater than near"
 
         width, height = resolution
-        self.raymap = raymap(width, height, fov).to(self.device)
-        quat = quat_from_euler_xyz(torch.tensor(rpy, device=self.device))
+        self.raymap = raymap(width, height, fov_deg / 180.0 * torch.pi).to(self.device)
+        euler = torch.tensor(rpy_deg, device=self.device)  / 180.0 * torch.pi
+        quat = quat_from_euler_xyz(euler)
         self.raymap = quat_rotate(quat.reshape(1, 1, 4), self.raymap)
         
         self.shape = self.raymap.shape[:2]
@@ -407,6 +411,15 @@ class raycast_camera(Observation):
             #     self.ray_dirs_w[0].reshape(-1, 3),
             #     color=(0.8, 0.0, 0.8, 1.0),
             # )
+
+    def symmetry_transform(self):
+        # Output shape is [N, 1, H, W]; mirror left-right by flipping W.
+        perm = torch.arange(self.shape[1]).flip(0)
+        signs = torch.ones(self.shape[1])
+        x = torch.arange(self.shape[0] * self.shape[1]).reshape(1, 1, *self.shape)
+        y = x.flip(3)
+        assert torch.all(y == x[..., perm]), "raycast_camera symmetry permutation mismatch"
+        return SymmetryTransform(perm=perm, signs=signs)
 
 
 class feet_height_map(Observation):
