@@ -57,10 +57,12 @@ from active_adaptation.learning.ppo.common import (
     make_batch,
     make_mlp,
     Actor,
+    Critic,
     CatTensors,
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.distributed import check_parameters
+from active_adaptation.learning.utils.dormancy import DormancyTracker
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -78,6 +80,7 @@ class PPOConfig:
     clip_param: float = 0.2
     entropy_coef: float = 0.002
 
+    activation: str = "Mish"
     spo: bool = False # use Simple Policy Optimization Loss
     muon: bool = False # use Muon optimizer
     aux_coef: float = 0.0 # loss coefficient for auxiliary prediction loss
@@ -110,6 +113,8 @@ class PPOPolicy(TensorDictModuleBase):
     ):
         super().__init__()
         self.cfg = PPOConfig(**cfg)
+        if self.cfg.debug and self.cfg.compile:
+            raise ValueError("Debug mode and compile mode cannot be enabled together")
         self.device = device
 
         self.entropy_coef = self.cfg.entropy_coef
@@ -143,8 +148,9 @@ class PPOPolicy(TensorDictModuleBase):
         self.act_transform = env.action_manager.symmetry_transform().to(self.device)
         self.action_dim = env.action_manager.action_dim
 
+        activation = getattr(nn, self.cfg.activation)
         actor_modules = [
-            Mod(make_mlp([256, 256, 256]), ["_obs_normed"], ["_actor_feature"]),
+            Mod(make_mlp([256, 256, 256], activation=activation), ["_obs_normed"], ["_actor_feature"]),
             Mod(Actor(self.action_dim), ["_actor_feature"], ["loc", "scale"])
         ]
         if self.cfg.aux_coef > 0.0:
@@ -159,8 +165,8 @@ class PPOPolicy(TensorDictModuleBase):
         ).to(self.device)
         
         self.critic = Seq(
-            Mod(make_mlp([256, 256, 256]), ["_obs_normed"], ["_critic_feature"]),
-            Mod(nn.LazyLinear(1), ["_critic_feature"], ["state_value"])
+            Mod(make_mlp([256, 256, 256], activation=activation), ["_obs_normed"], ["_critic_feature"]),
+            Mod(Critic(1), ["_critic_feature"], ["state_value"])
         ).to(self.device)
 
         self.vecnorm(fake_input)
@@ -209,17 +215,26 @@ class PPOPolicy(TensorDictModuleBase):
         self.update = self._update
         if self.cfg.compile and not aa.is_distributed():
             self.update = torch.compile(self.update)
+        self._rollout_dormancy_tracker: Union[DormancyTracker, None] = None
     
     def on_stage_start(self, stage: str):
         pass
 
     def get_rollout_policy(self, mode: str="train", critic: bool = False):
+        if self._rollout_dormancy_tracker is not None:
+            self._rollout_dormancy_tracker.close()
+            self._rollout_dormancy_tracker = None
+
         if critic:
             policy = Seq(self.vecnorm, self.actor, self.critic)
         else:
             policy = Seq(self.vecnorm, self.actor)
         if self.cfg.compile:
             policy = torch.compile(policy)
+        if self.cfg.debug:
+            tracker = DormancyTracker(policy)
+            policy.forward = tracker.wrap(policy.forward)
+            self._rollout_dormancy_tracker = tracker
         return policy
 
     @VecNorm.freeze()
@@ -273,6 +288,13 @@ class PPOPolicy(TensorDictModuleBase):
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_std"] = tensordict["ret"].std().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
+        
+        if self.cfg.debug and self._rollout_dormancy_tracker is not None:
+            dormancy = self._rollout_dormancy_tracker.compute_dormancy()
+            for module_name, value in dormancy.items():
+                infos[f"dormancy/{module_name}"] = value
+            self._rollout_dormancy_tracker.reset()
+        
         if aa.is_distributed():
             self.vecnorm.apply(vecnorm_sync_)
             if self.cfg.debug:
