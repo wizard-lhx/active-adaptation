@@ -34,13 +34,15 @@ class VecNorm(nn.Module):
     def __init__(
         self,
         input_shape: Union[torch.Size, tuple, int],
-        stats_shape: Union[torch.Size, tuple, int],
+        stats_shape: Union[torch.Size, tuple, int]=None,
         decay: float=0.999,
     ):
         super().__init__()
         if isinstance(input_shape, int):
             input_shape = (input_shape,)
-        if isinstance(stats_shape, int):
+        if stats_shape is None:
+            stats_shape = input_shape
+        elif isinstance(stats_shape, int):
             stats_shape = (stats_shape,)
         self.input_shape = torch.Size(input_shape)
         self.stats_shape = torch.Size(stats_shape)
@@ -188,4 +190,3 @@ if __name__ == "__main__":
         vecnorm(torch.randn(4096, 4) * torch.tensor([1, -2, 3, -4]))
     mean, std = vecnorm._compute()
     print(mean.squeeze(0), std.squeeze(0))
-

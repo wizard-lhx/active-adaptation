@@ -26,10 +26,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
 import warnings
-import functools
 import torch.utils._pytree as pytree
 
-from torchrl.data import CompositeSpec, TensorSpec
+from torchrl.data import Composite, TensorSpec
 from torchrl.modules import ProbabilisticActor
 from tensordict import TensorDict
 from tensordict.nn import (
@@ -39,13 +38,29 @@ from tensordict.nn import (
 )
 
 from hydra.core.config_store import ConfigStore
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Union, Tuple
 from collections import OrderedDict
 
 from active_adaptation.learning.modules import VecNorm, IndependentNormal
-from ..utils.valuenorm import ValueNorm1, ValueNormFake
-from .common import *
+from active_adaptation.learning.ppo.common import (
+    ppo_clipped_loss,
+    spo_loss,
+    normalize,
+    OBS_KEY,
+    OBS_PRIV_KEY,
+    OBS_HIST_KEY,
+    ACTION_KEY,
+    REWARD_KEY,
+    TERM_KEY,
+    DONE_KEY,
+    CMD_KEY,
+    GAE,
+    make_batch,
+    make_mlp,
+    Actor,
+)
+from active_adaptation.learning.utils.opt import OptimizerGroup
 
 USE_DDP = True
 
@@ -64,6 +79,8 @@ class PPOConfig:
     desired_kl: Union[float, None] = None
     clip_param: float = 0.2
     entropy_coef: float = 0.002
+    spo: bool = False # use Simple Policy Optimization Loss
+    muon: bool = False # use Muon optimizer
     
     aux_coef: float = 0.0 # loss coefficient for auxiliary prediction loss
     value_norm: bool = False
@@ -81,8 +98,8 @@ class PPOPolicy(TensorDictModuleBase):
     def __init__(
         self, 
         cfg: PPOConfig, 
-        observation_spec: CompositeSpec, 
-        action_spec: CompositeSpec, 
+        observation_spec: Composite, 
+        action_spec: Composite, 
         reward_spec: TensorSpec,
         device,
         env=None,
@@ -95,14 +112,9 @@ class PPOPolicy(TensorDictModuleBase):
         self.max_grad_norm = 1.0
         self.desired_kl = self.cfg.desired_kl
         self.clip_param = self.cfg.clip_param
+        self.actor_loss_fn = spo_loss if self.cfg.spo else ppo_clipped_loss
         self.critic_loss_fn = nn.MSELoss(reduction="none")
-        self.gae = GAE(0.99, 0.95)
-        
-        if cfg.value_norm:
-            value_norm_cls = ValueNorm1
-        else:
-            value_norm_cls = ValueNormFake
-        self.value_norm = value_norm_cls(input_shape=1).to(self.device)
+        self.gae = GAE(0.99, 0.95)  
 
         fake_input = observation_spec.zero()
         
@@ -110,14 +122,17 @@ class PPOPolicy(TensorDictModuleBase):
         self.act_transform = env.action_manager.symmetry_transform().to(self.device)
         self.action_dim = env.action_manager.action_dim
 
-        vecnorm = VecNorm(
-            input_shape=observation_spec[OBS_KEY].shape[-1:],
-            stats_shape=observation_spec[OBS_KEY].shape[-1:],
-            decay=1.0
-        )
+        self.vecnorm = Mod(
+            VecNorm(
+                input_shape=observation_spec[OBS_KEY].shape[-1:],
+                stats_shape=observation_spec[OBS_KEY].shape[-1:],
+                decay=1.0
+            ),
+            in_keys=[OBS_KEY],
+            out_keys=["_obs_normed"]
+        ).to(self.device)
         
         actor_modules = [
-            Mod(vecnorm, [OBS_KEY], ["_obs_normed"]),
             Mod(make_mlp([256, 256, 256]), ["_obs_normed"], ["_actor_feature"]),
             Mod(Actor(self.action_dim), ["_actor_feature"], ["loc", "scale"])
         ]
@@ -133,26 +148,45 @@ class PPOPolicy(TensorDictModuleBase):
         ).to(self.device)
         
         self.critic = Seq(
-            Mod(vecnorm, [OBS_KEY], ["_obs_normed"]),
             Mod(make_mlp([256, 256, 256]), ["_obs_normed"], ["_critic_feature"]),
             Mod(nn.LazyLinear(1), ["_critic_feature"], ["state_value"])
         ).to(self.device)
 
+        self.vecnorm(fake_input)
         self.actor(fake_input)
         self.critic(fake_input)
 
-        self.opt = torch.optim.Adam(
-            [
-                {"params": self.actor.parameters()},
-                {"params": self.critic.parameters()},
-            ],
-            lr=cfg.lr
-        )
+        def is_matrix_shaped(param: torch.Tensor) -> bool:
+            return param.dim() >= 2
+
+        if self.cfg.muon:
+            muon = torch.optim.Muon([
+                {"params": [p for p in self.actor.parameters() if is_matrix_shaped(p)]},
+                {"params": [p for p in self.critic.parameters() if is_matrix_shaped(p)]},
+            ], lr=cfg.lr, adjust_lr_fn="match_rms_adamw", weight_decay=0.01)
+
+            adamw = torch.optim.AdamW([
+                {"params": [p for p in self.actor.parameters() if not is_matrix_shaped(p)]},
+                {"params": [p for p in self.critic.parameters() if not is_matrix_shaped(p)]},
+            ], lr=cfg.lr, weight_decay=0.01)
+            self.opt = OptimizerGroup([muon, adamw])
+        else:
+            self.opt = torch.optim.AdamW(
+                [
+                    {"params": self.actor.parameters()},
+                    {"params": self.critic.parameters()},
+                ],
+                lr=cfg.lr,
+                weight_decay=0.01
+            )
         
         def init_(module):
             if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, 0.01)
+                nn.init.orthogonal_(module.weight, 0.1)
                 nn.init.constant_(module.bias, 0.)
+            elif isinstance(module, Actor):
+                nn.init.orthogonal_(module.actor_mean.weight, 0.01)
+                nn.init.constant_(module.actor_mean.bias, 0.)
         
         self.actor.apply(init_)
         self.critic.apply(init_)
@@ -180,9 +214,9 @@ class PPOPolicy(TensorDictModuleBase):
 
     def get_rollout_policy(self, mode: str="train", critic: bool = False):
         if critic:
-            policy = Seq(self.critic, self.actor)
+            policy = Seq(self.vecnorm, self.actor, self.critic)
         else:
-            policy = self.actor
+            policy = Seq(self.vecnorm, self.actor)
         if self.cfg.compile:
             policy = torch.compile(policy, fullgraph=True)
         return policy
@@ -193,7 +227,7 @@ class PPOPolicy(TensorDictModuleBase):
 
         tensordict = tensordict.exclude("stats")
         infos = []
-        self.compute_advantage(tensordict, self.critic, "adv", "ret", update_value_norm=True)
+        self.compute_advantage(tensordict, self.critic, "adv", "ret")
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"]
         log_probs_before = tensordict["action_log_prob"]
@@ -219,14 +253,22 @@ class PPOPolicy(TensorDictModuleBase):
             log_probs_after = dist.log_prob(action)
             pg_loss_after = log_probs_after.reshape_as(adv_unnormalized) * adv_unnormalized
             pg_loss_before = log_probs_before.reshape_as(adv_unnormalized) * adv_unnormalized
+            actor_feature = tensordict_["_actor_feature"].reshape(-1, tensordict_["_actor_feature"].shape[-1]) # [N*T, D]
+            critic_feature = tensordict_["_critic_feature"].reshape(-1, tensordict_["_critic_feature"].shape[-1]) # [N*T, D]
+            actor_effective_rank = effective_rank(actor_feature)
+            critic_effective_rank = effective_rank(critic_feature)
                 
         infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
         infos["actor/lr"] = self.opt.param_groups[0]["lr"]
         infos["actor/pg_loss_raw_after"] = pg_loss_after.mean().item()
         infos["actor/pg_loss_raw_before"] = pg_loss_before.mean().item()
+        infos["actor/effective_rank"] = actor_effective_rank.item()
+        infos["critic/effective_rank"] = critic_effective_rank.item()
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_std"] = tensordict["ret"].std().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
+        if active_adaptation.is_distributed():
+            self.vecnorm.module.synchronize(mode="broadcast")
         return dict(sorted(infos.items()))
 
     @torch.no_grad()
@@ -240,13 +282,12 @@ class PPOPolicy(TensorDictModuleBase):
         critic: Mod, 
         adv_key: str="adv",
         ret_key: str="ret",
-        update_value_norm: bool=True,
     ):
         keys = tensordict.keys(True, True)
         if not ("state_value" in keys and ("next", "state_value") in keys):
             with tensordict.view(-1) as tensordict_flat:
-                critic(tensordict_flat)
-                critic(tensordict_flat["next"])
+                critic(self.vecnorm(tensordict_flat))
+                critic(self.vecnorm(tensordict_flat["next"]))
 
         values = tensordict["state_value"]
         next_values = tensordict["next", "state_value"]
@@ -255,13 +296,8 @@ class PPOPolicy(TensorDictModuleBase):
         discount = tensordict["next", "discount"]
         terms = tensordict[TERM_KEY]
         dones = tensordict[DONE_KEY]
-        values = self.value_norm.denormalize(values)
-        next_values = self.value_norm.denormalize(next_values)
 
         adv, ret = self.gae(rewards, terms, dones, values, next_values, discount)
-        if update_value_norm:
-            self.value_norm.update(ret)
-        ret = self.value_norm.normalize(ret)
 
         tensordict.set(adv_key, adv)
         tensordict.set(ret_key, ret)
@@ -280,6 +316,8 @@ class PPOPolicy(TensorDictModuleBase):
         symmetry["is_init"] = tensordict["is_init"]
         tensordict = torch.cat([tensordict.select(*symmetry.keys(True, True)), symmetry], dim=0)
 
+        self.vecnorm(tensordict)
+        
         valid = (~tensordict["is_init"]).float()
         valid_cnt = valid.sum()
         action_data = tensordict[ACTION_KEY]
@@ -294,11 +332,9 @@ class PPOPolicy(TensorDictModuleBase):
         ret = tensordict["ret"] # [bsize, 1]
         log_ratio = (log_probs - log_probs_data).reshape_as(adv) # [bsize, 1]
         ratio = torch.exp(log_ratio)
-        surr1 = adv * ratio
-        surr2 = adv * ratio.clamp(1.-self.clip_param, 1.+self.clip_param)
         clamped = ((ratio.detach() - 1.0).abs() > self.clip_param).reshape_as(ret)
-
-        policy_loss = - (torch.min(surr1, surr2).reshape_as(valid) * valid).sum() / valid_cnt
+        
+        policy_loss = self.actor_loss_fn(ratio, adv, self.clip_param)
         entropy_loss = - self.entropy_coef * entropy
 
         values = self.critic(tensordict)["state_value"]
@@ -378,6 +414,24 @@ class PPOPolicy(TensorDictModuleBase):
                 failed_keys.append(name)
         print(f"Successfully loaded {succeed_keys}.")
         return failed_keys
+
+
+def effective_rank(X: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """
+    Effective rank (entropy of normalized squared singular values) for a matrix X of shape [n, d].
+    Uses p_i = σ_i² / Σσ_j² so p is the proportion of variance in each principal direction.
+    Lower values indicate loss of expressivity (variance concentrated in few dimensions).
+    """
+    if X.numel() == 0 or X.shape[0] < 2 or X.shape[1] < 2:
+        return torch.tensor(0.0, device=X.device, dtype=X.dtype)
+    S = torch.linalg.svdvals(X)
+    S = S[S > eps]
+    if S.numel() == 0:
+        return torch.tensor(0.0, device=X.device, dtype=X.dtype)
+    S2 = S.square()
+    p = S2 / S2.sum().clamp_min(eps)
+    entropy = -(p * (p + eps).log()).sum()
+    return entropy.exp()
 
 
 def normalize(x: torch.Tensor, subtract_mean: bool=False):

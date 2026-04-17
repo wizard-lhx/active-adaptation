@@ -52,6 +52,7 @@ dependencies = [
     { name = "mujoco" },
     { name = "omegaconf" },
     { name = "onnxruntime" },
+    { name = "onnxscript" },
     { name = "pdbpp" },
     { name = "pygame" },
     { name = "setproctitle" },
@@ -75,6 +76,7 @@ requires-dist = [
     { name = "mujoco" },
     { name = "omegaconf" },
     { name = "onnxruntime" },
+    { name = "onnxscript" },
     { name = "pdbpp" },
     { name = "pdbpp", specifier = "==0.12.0.post1" },
     { name = "pygame" },
@@ -113,7 +115,7 @@ sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3e/38/7859ff46355f76
 [[package]]
 name = "any4hdmi"
 version = "0.1.0"
-source = { editable = "../../../any4hdmi" }
+source = { git = "https://github.com/EGalahad/any4hdmi.git?rev=main#6ba07bccbe263c592b2c324cea1f11311fe92d0b" }
 dependencies = [
     { name = "mjhub" },
     { name = "mujoco" },
@@ -123,18 +125,6 @@ dependencies = [
     { name = "torch" },
     { name = "tqdm" },
     { name = "warp-lang" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "mjhub", git = "https://github.com/EGalahad/mjhub.git?rev=main" },
-    { name = "mujoco", specifier = ">=2.3.7" },
-    { name = "mujoco-warp", specifier = "==3.5.0.2" },
-    { name = "numpy", specifier = ">=1.23" },
-    { name = "tensordict" },
-    { name = "torch" },
-    { name = "tqdm", specifier = ">=4.66" },
-    { name = "warp-lang", specifier = "==1.12.0" },
 ]
 
 [[package]]
@@ -638,7 +628,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "active-adaptation" },
-    { name = "any4hdmi", editable = "../../../any4hdmi" },
+    { name = "any4hdmi", git = "https://github.com/EGalahad/any4hdmi.git?rev=main" },
     { name = "mjhub", git = "https://github.com/EGalahad/mjhub.git?rev=main" },
 ]
 
@@ -1083,7 +1073,7 @@ wheels = [
 [[package]]
 name = "mjhub"
 version = "0.1.0"
-source = { git = "https://github.com/EGalahad/mjhub.git?rev=main#40aff4e13c6c0c04ce457ec0be706c63ca134429" }
+source = { git = "https://github.com/EGalahad/mjhub.git?rev=main#742fb4562803e7e124fcd1ceb73f58c66e382a51" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "mujoco" },

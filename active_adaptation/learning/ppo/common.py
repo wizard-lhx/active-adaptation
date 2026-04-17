@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import TensorDictModuleBase as ModBase
 from torchrl.modules import ProbabilisticActor
-from torchrl.data import CompositeSpec
+from torchrl.data import Composite
 from typing import List
 
 OBS_KEY = "policy"  # ("agents", "observation")
@@ -39,6 +39,25 @@ REWARD_KEY = ("next", "reward")  # ("agents", "reward")
 TERM_KEY = ("next", "terminated")
 DONE_KEY = ("next", "done")
 CMD_KEY = "command"
+
+
+def ppo_clipped_loss(ratio: torch.Tensor, adv: torch.Tensor, clip_param: float) -> torch.Tensor:
+    """Loss to minimize; negates the clipped surrogate so gradient descent maximizes it."""
+    assert ratio.shape == adv.shape
+    surr1 = adv * ratio
+    surr2 = adv * ratio.clamp(1.0 - clip_param, 1.0 + clip_param)
+    return -torch.min(surr1, surr2).mean()
+
+
+def spo_loss(ratio: torch.Tensor, adv: torch.Tensor, clip_param: float) -> torch.Tensor:
+    """
+    Simple Policy Optimization Loss from https://arxiv.org/pdf/2401.16025.
+    Loss to minimize; negates the SPO objective so gradient descent maximizes it.
+    """
+    assert ratio.shape == adv.shape
+    obj = ratio * adv - adv.abs() / (2.0 * clip_param) * (ratio - 1.0).square()
+    return -obj.mean()
+
 
 
 class DtypeConversion(nn.Module):
@@ -391,7 +410,7 @@ def normalize(x: torch.Tensor, subtract_mean: bool = False):
         return x / x.std().clamp(1e-7)
 
 
-def parse_keys(spec: CompositeSpec, keys: list[str]):
+def parse_keys(spec: Composite, keys: list[str]):
     """
     Parse the keys into `mlp_keys`, `cnn_keys`, and `aux_keys`.
     Keys ending with "_" are considered auxiliary keys.
