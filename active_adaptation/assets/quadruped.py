@@ -191,8 +191,8 @@ registry.register("asset", "b1z1", UNITREE_B1Z1_CFG)
 
 
 UNITREE_A2_CFG = AssetCfg(
-    mjcf_path=ROBOT_MODEL_DIR / "a2" / "a2.xml",
-    usd_path=ROBOT_MODEL_DIR / "a2" / "a2.usd",
+    mjcf_path=FILE_DIR / "a2" / "a2.xml",
+    usd_path=FILE_DIR / "a2" / "a2.usd",
     init_state=InitialStateCfg(
         pos=(0.0, 0.0, 0.6),
         joint_pos={
@@ -267,7 +267,7 @@ UNITREE_A2_CFG = AssetCfg(
             history_length=3,
         ),
     ],
-    body_names_isaac=[
+    body_names_simulation=[
         "base_link",
         "FL_hip",
         "FR_hip",
@@ -286,7 +286,7 @@ UNITREE_A2_CFG = AssetCfg(
         "RL_foot",
         "RR_foot",
     ],
-    joint_names_isaac=[
+    joint_names_simulation=[
         "FL_hip_joint",
         "FR_hip_joint",
         "RL_hip_joint",
