@@ -24,7 +24,7 @@ class Marker(Action):
         super().__init__(env)
         self.asset = self.env.scene.articulations["robot"]
         self.body_frame = body_frame
-        self.color = color
+        self.color = tuple(color)
         self.radius = radius
         self.has_gui = self.env.sim.has_gui()
         self.action_dim = 3 # not actually limited to 3
@@ -35,10 +35,11 @@ class Marker(Action):
                 VisualizationMarkersCfg,
                 sim_utils,
             )
-
+            # unique prim path per Marker instance (multiple envs / actions may coexist)
+            name = f"marker_{id(self):x}"
             self.marker = VisualizationMarkers(
                 VisualizationMarkersCfg(
-                    prim_path="/Visuals/Input/Marker",
+                    prim_path=f"/Visuals/Input/{name}",
                     markers={
                         "marker": sim_utils.SphereCfg(
                             radius=self.radius,
