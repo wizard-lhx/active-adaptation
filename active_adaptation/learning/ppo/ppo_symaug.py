@@ -63,6 +63,7 @@ from active_adaptation.learning.ppo.common import (
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.distributed import check_parameters
 from active_adaptation.learning.utils.dormancy import DormancyTracker
+from active_adaptation.utils.profiling import ScopedTimer
 
 import active_adaptation as aa
 import torch.distributed as distr
@@ -243,7 +244,8 @@ class PPOPolicy(TensorDictModuleBase):
 
         tensordict = tensordict.exclude("stats")
         infos = []
-        self.compute_advantage(tensordict, self.critic, "adv", "ret")
+        with ScopedTimer("compute_advantage"):
+            self.compute_advantage(tensordict, self.critic, "adv", "ret")
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"]
         log_probs_before = tensordict["action_log_prob"]
@@ -254,7 +256,8 @@ class PPOPolicy(TensorDictModuleBase):
             batch = make_batch(td, self.cfg.num_minibatches)
             for minibatch in batch:
                 minibatch = self._augment_symmetry(minibatch)
-                infos.append(self.update(minibatch))
+                with ScopedTimer("update_minibatch"):
+                    infos.append(self.update(minibatch))
                 
                 if self.desired_kl is not None: # adaptive learning rate
                     kl = infos[-1]["actor/kl"]

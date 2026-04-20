@@ -267,9 +267,6 @@ def main(cfg: DictConfig):
                 info.update(policy.train_op(data))
             training_time = training_timer.last_time
 
-            info.update(env.extra)
-            info.update(env.stats_ema)  # step-wise exponential moving average of stats
-
             if hasattr(policy, "step_schedule"):
                 policy.step_schedule(i / total_iters)
 
@@ -287,13 +284,15 @@ def main(cfg: DictConfig):
                 ckpt_path = save(policy, checkpoint_name, upload_to_wandb=should_upload)
 
             if aa.is_main_process():
-                ScopedTimer.print_summary(clear=True, depth=3)
+                ScopedTimer.print_summary(clear=True, depth=2)
                 print(
                     OmegaConf.to_yaml(
                         {k: v for k, v in info.items() if isinstance(v, (float, int))}
                     )
                 )
                 print(f"Latest checkpoint: {ckpt_path}")
+                info.update(env.extra)
+                info.update(env.stats_ema)  # step-wise exponential moving average of stats
                 run.log(info)
 
     if aa.is_main_process():
