@@ -39,7 +39,6 @@ class crash(Termination):
         contact_time = self.contact_sensor.data.current_contact_time[
             :, self.body_indices
         ]
-        print(self.body_names, contact_time[0])
         return (contact_time > self.t_thres).any(1, True)
 
 

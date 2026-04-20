@@ -195,6 +195,7 @@ class ContactSensorCfg:
     secondary: str | Sequence[str] | None = None
 
     # for mjlab, contact match is defined by mode/pattern/entity
+    # ("body" = per-body geoms; "subtree" = MuJoCo xbody, includes descendant contacts)
     primary_contact_match_mode: Literal["geom", "subtree", "body"] = None
     primary_contact_match_pattern: str = None
     primary_contact_match_entity: str | None = None

@@ -238,7 +238,10 @@ UNITREE_A2_CFG = AssetCfg(
             secondary=[],
             track_air_time=True,
             history_length=3,
-            primary_contact_match_mode="subtree",
+            # Use "body" not "subtree": subtree uses mjOBJ_XBODY so contacts on
+            # descendant geoms (e.g. feet) count toward ancestors (base/thigh),
+            # unlike Isaac per-link sensors; body mode matches Isaac-style behavior.
+            primary_contact_match_mode="body",
             primary_contact_match_pattern=".*",
             primary_contact_match_entity="robot",
             secondary_contact_match_mode="body",
@@ -253,7 +256,7 @@ UNITREE_A2_CFG = AssetCfg(
             conaffinity=1,
             condim=3,
             priority=1,
-            friction=(0.6,),
+            friction=(0.6, 0.01, 0.01),
         ),
     ],
     body_names_simulation=[
@@ -323,7 +326,7 @@ UNITREE_B2_CFG = AssetCfg(
             secondary=[],
             track_air_time=True,
             history_length=3,
-            primary_contact_match_mode="subtree",
+            primary_contact_match_mode="body",
             primary_contact_match_pattern=".*",
             primary_contact_match_entity="robot",
             secondary_contact_match_mode="body",
