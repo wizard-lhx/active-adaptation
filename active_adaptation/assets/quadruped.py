@@ -5,6 +5,7 @@ from active_adaptation.assets.asset_cfg import (
     InitialStateCfg,
     ActuatorCfg,
     ContactSensorCfg,
+    MjlabCollisionCfg,
 )
 from active_adaptation.registry import Registry
 from active_adaptation.utils.symmetry import mirrored
@@ -177,8 +178,8 @@ UNITREE_B1Z1_CFG = AssetCfg(
 registry.register("asset", "b1z1", UNITREE_B1Z1_CFG)
 
 UNITREE_A2_CFG = AssetCfg(
-    mjcf_path=FILE_DIR / "a2" / "a2.xml",
-    usd_path=FILE_DIR / "a2" / "a2.usd",
+    mjcf_path=ROBOT_MODEL_DIR / "a2" / "a2.xml",
+    usd_path=ROBOT_MODEL_DIR / "a2" / "a2.usd",
     init_state=InitialStateCfg(
         pos=(0.0, 0.0, 0.6),
         joint_pos={
@@ -237,9 +238,24 @@ UNITREE_A2_CFG = AssetCfg(
             secondary=[],
             track_air_time=True,
             history_length=3,
+            primary_contact_match_mode="subtree",
+            primary_contact_match_pattern=".*",
+            primary_contact_match_entity="robot",
+            secondary_contact_match_mode="body",
+            secondary_contact_match_pattern="terrain",
         ),
     ],
-    body_names_simulation=[
+    mjlab_collisions=[
+        # no self collisions
+        MjlabCollisionCfg(
+            geom_names_expr=(".*_collision",),
+            contype=0,
+            conaffinity=1,
+            condim=3,
+            priority=1,
+            friction=(0.6,),
+        ),
+    ],
     body_names_simulation=[
         "base_link",
         "FL_hip",
@@ -259,7 +275,6 @@ UNITREE_A2_CFG = AssetCfg(
         "RL_foot",
         "RR_foot",
     ],
-    joint_names_simulation=[
     joint_names_simulation=[
         "FL_hip_joint",
         "FR_hip_joint",
@@ -307,7 +322,12 @@ UNITREE_B2_CFG = AssetCfg(
             primary=".*",
             secondary=[],
             track_air_time=True,
-            history_length=3
+            history_length=3,
+            primary_contact_match_mode="subtree",
+            primary_contact_match_pattern=".*",
+            primary_contact_match_entity="robot",
+            secondary_contact_match_mode="body",
+            secondary_contact_match_pattern="terrain",
         ),
     ],
     actuators={

@@ -4,8 +4,9 @@ This module provides backend-agnostic configuration classes for defining
 assets (robots, objects) that can be used across different simulation
 backends (Isaac Sim, MuJoCo Lab, MuJoCo).
 """
+from __future__ import annotations
 
-from dataclasses import dataclass, field, MISSING
+from dataclasses import dataclass, field, MISSING, asdict
 from typing import Dict, Tuple, List, Optional, Literal, Sequence
 from pathlib import Path
 
@@ -253,7 +254,8 @@ class AssetCfg:
     
     Attributes:
         mjcf_path: Path to the MuJoCo XML/MJCF model file. Required field.
-        usd_path: Path to the USD (Universal Scene Description) model file. Required field.
+        usd_path: Model path for Isaac Sim: ``.usd`` / ``.usda`` / ``.usdc`` (or any
+            non-``.urdf`` suffix) uses USD spawn; ``.urdf`` uses URDF spawn. Required field.
         init_state: Initial state configuration for the asset. Required field.
         actuators: Dictionary mapping actuator names to their configurations. Required field.
         self_collisions: Whether to enable self-collisions for the asset. Defaults to True.
@@ -277,6 +279,7 @@ class AssetCfg:
     body_names_simulation: Optional[List[str]] = None
 
     self_collisions: bool = True
+    mjlab_collisions: List[MjlabCollisionCfg] = field(default_factory=list)
 
     joint_symmetry_mapping: Optional[Dict[str, Tuple[int, str]]] = None
     spatial_symmetry_mapping: Optional[Dict[str, str]] = None
@@ -373,12 +376,13 @@ class AssetCfg:
         """Convert to Isaac Sim asset configuration.
         
         Creates an Isaac Sim ArticulationCfg with appropriate physics properties,
-        collision settings, and actuator configurations. Uses the USD file path
-        for spawning the asset.
+        collision settings, and actuator configurations. Spawns from ``usd_path``:
+        URDF if the path ends in ``.urdf``, otherwise USD (``usd_path`` may be
+        ``.usd`` / ``.usda`` / ``.usdc`` or other non-URDF extensions).
         
         Returns:
             ArticulationCfg: Isaac Sim compatible asset configuration with:
-                - USD file spawning configuration
+                - USD or URDF file spawning configuration
                 - Rigid body properties (damping, velocity limits)
                 - Articulation properties (self-collisions, solver settings)
                 - Collision properties (contact/rest offsets)
@@ -396,34 +400,50 @@ class AssetCfg:
                 armature=merged["armature"],
             )
         }
-        
-        return ArticulationCfg(
-            spawn=sim_utils.UrdfFileCfg(
+
+        rigid_props = sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.002,
+            angular_damping=0.002,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        )
+        articulation_props = sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=self.self_collisions,
+            solver_position_iteration_count=4,
+            solver_velocity_iteration_count=1,
+        )
+        collision_props = sim_utils.CollisionPropertiesCfg(
+            contact_offset=0.02,
+            rest_offset=0.0,
+        )
+
+        asset_path = Path(self.usd_path)
+        if asset_path.suffix.lower() == ".urdf":
+            spawn_cfg = sim_utils.UrdfFileCfg(
                 asset_path=str(self.usd_path),
                 fix_base=False,
                 joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
                     gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
                 ),
                 activate_contact_sensors=True,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=False,
-                    retain_accelerations=False,
-                    linear_damping=0.002,
-                    angular_damping=0.002,
-                    max_linear_velocity=1000.0,
-                    max_angular_velocity=1000.0,
-                    max_depenetration_velocity=1.0,
-                ),
-                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                    enabled_self_collisions=self.self_collisions,
-                    solver_position_iteration_count=4,
-                    solver_velocity_iteration_count=1,
-                ),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.02,
-                    rest_offset=0.0,
-                ),
-            ),
+                rigid_props=rigid_props,
+                articulation_props=articulation_props,
+                collision_props=collision_props,
+            )
+        else:
+            spawn_cfg = sim_utils.UsdFileCfg(
+                usd_path=str(self.usd_path),
+                activate_contact_sensors=True,
+                rigid_props=rigid_props,
+                articulation_props=articulation_props,
+                collision_props=collision_props,
+            )
+
+        return ArticulationCfg(
+            spawn=spawn_cfg,
             init_state=self.init_state.isaaclab(),
             actuators=actuators,
             soft_joint_pos_limit_factor=0.9,
@@ -473,23 +493,10 @@ class AssetCfg:
                 - Articulation info with actuator configurations
                 - Empty collisions tuple (collisions handled by MJCF)
         """
-        # TODO: this is only for g1 mjcf
-        if self.self_collisions:
-            collision_cfg = CollisionCfg(
-                geom_names_expr=(".*_collision",),
-                condim={r"^(left|right)_foot[1-7]_collision$": 3, ".*_collision": 1},
-                priority={r"^(left|right)_foot[1-7]_collision$": 1},
-                friction={r"^(left|right)_foot[1-7]_collision$": (0.6,)},
-            )
-        else:
-            collision_cfg = CollisionCfg(
-                geom_names_expr=(".*_collision",),
-                contype=0,
-                conaffinity=1,
-                condim={r"^(left|right)_foot[1-7]_collision$": 3, ".*_collision": 1},
-                priority={r"^(left|right)_foot[1-7]_collision$": 1},
-                friction={r"^(left|right)_foot[1-7]_collision$": (0.6,)},
-            )
+        collisions = tuple(
+            CollisionCfg(**asdict(collision_cfg))
+            for collision_cfg in self.mjlab_collisions
+        )
         
         spec = mujoco.MjSpec.from_file(str(self.mjcf_path))
 
@@ -503,7 +510,7 @@ class AssetCfg:
                 ),
                 soft_joint_pos_limit_factor=0.9,
             ),
-            collisions=(collision_cfg,),
+            collisions=collisions,
             joint_symmetry_mapping=self.joint_symmetry_mapping,
             spatial_symmetry_mapping=self.spatial_symmetry_mapping,
             joint_names_simulation=self.joint_names_simulation,
@@ -542,6 +549,44 @@ class RigidObjectCfg:
 
     def mjlab(self):
         raise NotImplementedError("MuJoCo Lab backend does not support rigid objects")
+
+
+@dataclass
+class MjlabCollisionCfg:
+    """Configuration to modify collision properties of geoms in the MuJoCo spec.
+
+    Supports regex pattern matching for geom names and dict-based field resolution
+    for fine-grained control over collision properties.
+    """
+
+    geom_names_expr: tuple[str, ...]
+    """Tuple of regex patterns to match geom names."""
+    contype: int | dict[str, int] = 1
+    """Collision type (int or dict mapping patterns to values). Must be non-negative."""
+    conaffinity: int | dict[str, int] = 1
+    """Collision affinity (int or dict mapping patterns to values). Must be
+    non-negative."""
+    condim: int | dict[str, int] = 3
+    """Contact dimension (int or dict mapping patterns to values). Must be one
+    of {1, 3, 4, 6}."""
+    priority: int | dict[str, int] = 0
+    """Collision priority (int or dict mapping patterns to values). Must be
+    non-negative."""
+    friction: tuple[float, ...] | dict[str, tuple[float, ...]] | None = None
+    """Friction coefficients as tuple or dict mapping patterns to tuples."""
+    solref: tuple[float, ...] | dict[str, tuple[float, ...]] | None = None
+    """Solver reference parameters as tuple or dict mapping patterns to tuples."""
+    solimp: tuple[float, ...] | dict[str, tuple[float, ...]] | None = None
+    """Solver impedance parameters as tuple or dict mapping patterns to tuples."""
+    margin: float | dict[str, float] | None = None
+    """Detection margin. Contacts are generated when geom distance < margin."""
+    gap: float | dict[str, float] | None = None
+    """Gap for solver inclusion. Contact included when dist < margin - gap."""
+    solmix: float | dict[str, float] | None = None
+    """Mixing weight for blending solver parameters between geom pairs."""
+    disable_other_geoms: bool = True
+    """Whether to disable collision for non-matching geoms."""
+
 
 # WARNING: will be deprecated: now used in _DelayedJointAction, check projects/hdmi/hdmi/tasks/actions.py:JointPosition
 def get_input_joint_indexing(
