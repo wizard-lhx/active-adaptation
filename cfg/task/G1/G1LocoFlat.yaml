@@ -94,7 +94,7 @@ randomization:
     static_friction_range: [0.6, 2.0]
     dynamic_friction_range: [0.6, 2.0]
     restitution_range: [0.0, 0.2]
-  motor_params:
+  actuator_pd_gains:
     stiffness_range:
       .*: [0.8, 1.1]
     damping_range:
@@ -110,6 +110,7 @@ randomization:
     decay: 0.9
 
 termination:
+  max_episode_length: {}
   crash: 
     body_names_expr:
     - "pelvis"
