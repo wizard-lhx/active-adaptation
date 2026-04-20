@@ -296,7 +296,7 @@ class Twist(Command):
             )
         elif self.env.backend == "mjlab":
             rpy = torch.zeros(self.num_envs, 3)
-            rpy[:, 2] = self.target_yaw.cpu()
+            rpy[:, 2:3] = self.target_yaw.cpu()
             self.axes_handle.batched_wxyzs = quat_from_euler_xyz(rpy)
             self.axes_handle.batched_positions = start.cpu()
             self.lines_handle.points = torch.stack([start, start + self.cmd_linvel_w], 1).cpu()

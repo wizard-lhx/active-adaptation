@@ -8,14 +8,14 @@ from active_adaptation.envs.env_base import _EnvBase
 
 class MjLabViewer:
     """
-    Different from `mjlab.viewer.viser_play.ViserPlayViewer`, this
+    Different from `mjlab.viewer.viser.viewer.ViserPlayViewer`, this
     viewer is not responsible for stepping the environment and is updated
     synchronously from the environment step loop.
     """
 
-    def __init__(self, env: _EnvBase):
+    def __init__(self, env: _EnvBase, sim: Simulation):
         self.env = env
-        self.sim: Simulation = env.sim
+        self.sim = sim
 
         self._server = viser.ViserServer(label="mjlab")
         self._is_setup = False
@@ -24,18 +24,21 @@ class MjLabViewer:
         if self._is_setup:
             return
 
-        self._scene = ViserMujocoScene.create(
-            server=self._server,
-            mj_model=self.sim.mj_model,
-            num_envs=self.env.num_envs,
+        self._scene = ViserMujocoScene(
+            self._server,
+            self.sim.mj_model,
+            self.env.num_envs,
         )
-        self._scene.camera_tracking_enabled = False
         self._scene.debug_visualization_enabled = True
         self._scene.env_idx = 0
 
         tabs = self._server.gui.add_tab_group()
-        self._scene.create_groups_gui(tabs)
-        self._scene.create_visualization_gui()
+        with tabs.add_tab("Scene", icon=viser.Icon.SETTINGS):
+            self._scene.create_scene_gui()
+        with tabs.add_tab("Visualization", icon=viser.Icon.EYE):
+            self._scene.create_overlay_gui()
+        with tabs.add_tab("Groups", icon=viser.Icon.LAYERS_INTERSECT):
+            self._scene.create_groups_gui()
         self._is_setup = True
 
     @property
@@ -79,6 +82,8 @@ class MjLabViewer:
             raise RuntimeError("MjLab viewer is not set up.")
         with self._server.atomic():
             self._scene.update(self.sim.data)
+            if self._scene.needs_update:
+                self._scene.refresh_visualization()
             self._server.flush()
 
     def close(self):

@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from isaaclab.sensors import ContactSensor
 
 from .base import Termination
+from active_adaptation.envs.utils import find_sensor_bodies
 
 
 class crash(Termination):
@@ -20,15 +21,14 @@ class crash(Termination):
         self.t_thres = t_thres
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_indices, self.body_names = self.contact_sensor.find_bodies(
-            body_names_expr
-        )
+        self.body_indices, self.body_names = find_sensor_bodies(self.contact_sensor, body_names_expr)
         self.body_indices = torch.tensor(self.body_indices, device=self.env.device)
 
     def compute(self, termination: torch.Tensor):
         contact_time = self.contact_sensor.data.current_contact_time[
             :, self.body_indices
         ]
+        print(self.body_names, contact_time[0])
         return (contact_time > self.t_thres).any(1, True)
 
 
@@ -53,7 +53,7 @@ class undesired_contact(Termination):
         else:
             self.dim = 3
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_indices, self.body_names = self.contact_sensor.find_bodies(body_names)
+        self.body_indices, self.body_names = find_sensor_bodies(self.contact_sensor, body_names)
         self.body_indices = torch.tensor(self.body_indices, device=self.env.device)
 
     def compute(self, termination: torch.Tensor):
@@ -112,21 +112,6 @@ class cum_error(Termination):
         return (self.command_manager.cum_error > self.thres).any(-1, True)
 
 
-class ee_cum_error(Termination):
-    def __init__(self, env, thres: float = 1.0, min_steps: int = 50):
-        super().__init__(env)
-        from ..commands import CommandEEPose_Cont
-
-        self.thres = torch.as_tensor(thres, device=self.env.device)
-        self.min_steps = min_steps
-        self.command_manager: CommandEEPose_Cont = self.env.command_manager
-
-    def compute(self, termination: torch.Tensor) -> torch.Tensor:
-        a = (self.command_manager._cum_error > self.thres).any(-1)
-        b = self.env.episode_length_buf > self.min_steps
-        return (a & b).reshape(-1, 1)
-
-
 class joint_acc_exceeds(Termination):
     def __init__(self, env, thres: float):
         super().__init__(env)
@@ -136,20 +121,6 @@ class joint_acc_exceeds(Termination):
     def compute(self, termination: torch.Tensor) -> torch.Tensor:
         valid = (self.env.episode_length_buf > 2).unsqueeze(-1)
         return valid & (self.asset.data.joint_acc.abs() > self.thres).any(1, True)
-
-
-class impedance_pos_error(Termination):
-    def __init__(self, env, thres: float = 0.3):
-        super().__init__(env)
-        self.thres = thres
-        self.command_manger = self.env.command_manager
-        self.asset: Articulation = self.env.scene.articulations["robot"]
-
-    def compute(self, termination: torch.Tensor):
-        error = (self.asset.data.root_pos_w - self.command_manger.des_pos_w)[
-            :, :2
-        ].norm(dim=-1, keepdim=True)
-        return error > self.thres
 
 
 class root_height_below(Termination):
@@ -168,7 +139,7 @@ class force_contact(Termination):
     def __init__(self, env, body_names: str, threshold: float):
         super().__init__(env)
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_indices, self.body_names = self.contact_sensor.find_bodies(body_names)
+        self.body_indices, self.body_names = find_sensor_bodies(self.contact_sensor, body_names)
         self.threshold = threshold
 
     def compute(self, termination: torch.Tensor):

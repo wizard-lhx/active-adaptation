@@ -71,7 +71,7 @@ class MjlabBackendEnv(_EnvBase):
             terrain=terrain_cfg,
         )
         scene = Scene(scene_cfg, device=str(self.device))
-        self.sim = Simulation(
+        sim = Simulation(
             num_envs=scene.num_envs,
             cfg=SimulationCfg(
                 nconmax=200,
@@ -87,12 +87,12 @@ class MjlabBackendEnv(_EnvBase):
             device=str(self.device),
         )
 
-        scene.initialize(self.sim.mj_model, self.sim.model, self.sim.data)
-        self.sim.create_graph()
+        scene.initialize(sim.mj_model, sim.model, sim.data)
+        sim.create_graph()
 
-        self.scene = MjlabSceneAdapter(scene)
-        viewer = MjLabViewer(self) if not self.headless else None
-        self.sim = MjlabSimAdapter(self.sim, viewer)
+        self.scene = MjlabSceneAdapter(scene, sim)
+        viewer = MjLabViewer(self, sim) if not self.headless else None
+        self.sim = MjlabSimAdapter(sim, viewer)
 
 
 __all__ = ["MjlabBackendEnv"]
