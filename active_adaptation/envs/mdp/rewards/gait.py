@@ -8,8 +8,7 @@ if TYPE_CHECKING:
     from mjlab.sensor import ContactSensor as MjlabContactSensor
 
 from .base import Reward
-from active_adaptation.utils.math import quat_rotate, quat_rotate_inverse, yaw_quat
-from active_adaptation.envs.utils import find_sensor_bodies
+from active_adaptation.envs.utils import find_bodies, find_sensor_bodies
 
 
 class max_feet_height(Reward):
@@ -17,8 +16,10 @@ class max_feet_height(Reward):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_ids = self.asset.find_bodies(body_names)[0]
-        self.body_contact_ids = find_sensor_bodies(self.contact_sensor, body_names)[0]
+        self.body_ids, self.body_names = find_bodies(self.asset, body_names)
+        self.body_contact_ids = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )[0]
         self.target_height = target_height
 
         self.max_height = torch.zeros(
@@ -58,9 +59,11 @@ class feet_sliding(Reward):
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
         self.contact_data = self.contact_sensor.data
-        self.body_ids = self.asset.find_bodies(body_names)[0]
+        self.body_ids, self.body_names = find_bodies(self.asset, body_names)
         self.body_ids = torch.tensor(self.body_ids, device=self.device)
-        self.body_contact_ids = find_sensor_bodies(self.contact_sensor, body_names)[0]
+        self.body_contact_ids = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )[0]
         self.body_contact_ids = torch.tensor(self.body_contact_ids, device=self.device)
 
     @override
@@ -86,10 +89,12 @@ class quadruped_trot(Reward):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_ids, self.body_names = self.asset.find_bodies(body_names)
+        self.body_ids, self.body_names = find_bodies(self.asset, body_names)
         self.body_ids = torch.tensor(self.body_ids, device=self.device)
 
-        self.body_contact_ids = find_sensor_bodies(self.contact_sensor, body_names)[0]
+        self.body_contact_ids = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )[0]
         self.body_contact_ids = torch.tensor(self.body_contact_ids, device=self.device)
 
     @override
@@ -118,7 +123,7 @@ class feet_clearance(Reward):
         super().__init__(env, weight)
         self.thres = thres
         self.asset: Articulation = self.env.scene.articulations["robot"]
-        self.body_ids = self.asset.find_bodies(body_names)[0]
+        self.body_ids, self.body_names = find_bodies(self.asset, body_names)
         self.body_ids = torch.tensor(self.body_ids, device=self.device)
         self.num_feet = len(self.body_ids)
 
@@ -142,9 +147,11 @@ class feet_air_time(Reward):
         self.thres = thres
         self.asset: Articulation = self.env.scene.articulations["robot"]
 
-        self.articulation_body_ids, self.body_names = self.asset.find_bodies(body_names)
+        self.articulation_body_ids, self.body_names = find_bodies(self.asset, body_names)
         self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_ids = find_sensor_bodies(self.contact_sensor, body_names)[0]
+        self.body_ids = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )[0]
         self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
 
     @override
@@ -166,8 +173,10 @@ class feet_contact_count(Reward):
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
 
-        self.articulation_body_ids = self.asset.find_bodies(body_names)[0]
-        self.body_ids, self.body_names = find_sensor_bodies(self.contact_sensor, body_names)
+        self.articulation_body_ids, self.body_names = find_bodies(self.asset, body_names)
+        self.body_ids = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )[0]
         self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
         self.first_contact = torch.zeros(
             self.num_envs, len(self.body_ids), device=self.env.device

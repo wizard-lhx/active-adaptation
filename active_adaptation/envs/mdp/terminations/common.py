@@ -32,8 +32,13 @@ class crash(Termination):
         self.t_thres = t_thres
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_indices, self.body_names = find_sensor_bodies(self.contact_sensor, body_names_expr)
+        self.body_indices, self.body_names = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names_expr
+        )
         self.body_indices = torch.tensor(self.body_indices, device=self.env.device)
+
+    def __repr__(self) -> str:
+        return f"crash(body_names={self.body_names}, body_indices={self.body_indices.tolist()}, t_thres={self.t_thres})"
 
     def compute(self, termination: torch.Tensor):
         contact_time = self.contact_sensor.data.current_contact_time[
@@ -47,7 +52,7 @@ class undesired_contact(Termination):
     Soft termination based on the contact forces on the specified body names.
     """
 
-    supported_backends = ("isaac",)
+    supported_backends = ("isaac", )
 
     def __init__(
         self,
@@ -62,9 +67,15 @@ class undesired_contact(Termination):
             self.dim = 2
         else:
             self.dim = 3
+        self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_indices, self.body_names = find_sensor_bodies(self.contact_sensor, body_names)
+        self.body_indices, self.body_names = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )
         self.body_indices = torch.tensor(self.body_indices, device=self.env.device)
+
+    def __repr__(self) -> str:
+        return f"undesired_contact(body_names={self.body_names}, body_indices={self.body_indices.tolist()}, thres={self.thres}, lateral_only={self.lateral_only})"
 
     def compute(self, termination: torch.Tensor):
         terminated = torch.zeros(self.num_envs, 1, device=self.env.device, dtype=bool)
@@ -148,9 +159,15 @@ class root_height_below(Termination):
 class force_contact(Termination):
     def __init__(self, env, body_names: str, threshold: float):
         super().__init__(env)
+        self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_indices, self.body_names = find_sensor_bodies(self.contact_sensor, body_names)
+        self.body_indices, self.body_names = find_sensor_bodies(
+            self.asset, self.contact_sensor, body_names
+        )
         self.threshold = threshold
+    
+    def __repr__(self) -> str:
+        return f"force_contact(body_names={self.body_names}, body_indices={self.body_indices.tolist()}, threshold={self.threshold})"
 
     def compute(self, termination: torch.Tensor):
         forces = self.contact_sensor.data.net_forces_w[:, self.body_indices].norm(

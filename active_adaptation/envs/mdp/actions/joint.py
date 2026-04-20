@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from typing_extensions import override
 
 try:
@@ -10,7 +10,6 @@ try:
 except ModuleNotFoundError:
     from mjlab.utils.lab_api import string as string_utils
 
-from active_adaptation.assets import get_input_joint_indexing
 from active_adaptation.utils.symmetry import joint_space_symmetry
 
 from .base import Action
@@ -23,20 +22,21 @@ class _DelayedJointAction(Action):
         action_scaling: Dict[str, float] = 0.5,
         max_delay: int = 2,
         alpha_range: Tuple[float, float] = (0.5, 1.0),
-        input_order: Literal["isaac", "mujoco", "mjlab"] = "isaac",
     ):
         super().__init__(env)
-        action_scaling = dict(action_scaling)
-        self.joint_ids, self.joint_names, self.action_scaling = self.resolve(action_scaling)
-        self.joint_ids = torch.tensor(self.joint_ids, device=self.device)
 
-        self.indexing, self.input_joint_names = get_input_joint_indexing(
-            input_order=input_order,
-            asset_cfg=self.asset.cfg,
-            target_joint_names=self.joint_names,
+        if isinstance(action_scaling, float):
+            action_scaling = {".*": float(action_scaling)}
+        
+        _, self.joint_names, scaling = string_utils.resolve_matching_names_values(
+            dict(action_scaling), self.asset.cfg.joint_names_simulation
+        )
+        self.joint_ids = torch.tensor(
+            [self.asset.joint_names.index(name) for name in self.joint_names],
             device=self.device,
         )
-        self.action_scaling = torch.tensor(self.action_scaling, device=self.device)
+
+        self.action_scaling = torch.tensor(scaling, device=self.device)
         self.max_delay = max_delay
         self.alpha_range = tuple(alpha_range)
         self.decimation = int(self.env.step_dt / self.env.physics_dt)
@@ -63,11 +63,6 @@ class _DelayedJointAction(Action):
     def action_dim(self):
         return len(self.joint_ids)
 
-    def resolve(self, spec):
-        return string_utils.resolve_matching_names_values(
-            dict(spec), self.asset.joint_names
-        )
-
     @override
     def reset(self, env_ids: torch.Tensor):
         self.delay[env_ids] = torch.randint(
@@ -84,8 +79,6 @@ class _DelayedJointAction(Action):
     def process_action(self, action: Optional[torch.Tensor]):
         if action is None:
             return
-
-        action = action[:, self.indexing]
         self.action_buf = self.action_buf.roll(1, dims=1)
         self.action_buf[:, 0] = action
         delay_mask = (
@@ -96,7 +89,7 @@ class _DelayedJointAction(Action):
 
     @override
     def symmetry_transform(self):
-        return joint_space_symmetry(self.asset, self.input_joint_names)
+        return joint_space_symmetry(self.asset, self.joint_names)
 
 
 class JointPosition(_DelayedJointAction):
@@ -115,22 +108,23 @@ class JointPosition(_DelayedJointAction):
         action_scaling: Dict[str, float] = 0.5,
         max_delay: int = 2,
         alpha_range: Tuple[float, float] = (0.5, 1.0),
-        input_order: Literal["isaac", "mujoco", "mjlab"] = "isaac",
     ):
         super().__init__(
             env,
             action_scaling=action_scaling,
             max_delay=max_delay,
             alpha_range=alpha_range,
-            input_order=input_order,
         )
-        self.default_joint_pos = self.asset.data.default_joint_pos.clone()
+        self.default_joint_pos = self.asset.data.default_joint_pos[:, self.joint_ids]
         self.offset = torch.zeros_like(self.default_joint_pos)
+    
+    def __repr__(self) -> str:
+        return f"JointPosition(joint_names={self.joint_names}, joint_ids={self.joint_ids.tolist()})"
 
     @override
     def reset(self, env_ids: torch.Tensor):
         super().reset(env_ids)
-        default_joint_pos = self.asset.data.default_joint_pos[env_ids]
+        default_joint_pos = self.asset.data.default_joint_pos[env_ids.unsqueeze(1), self.joint_ids]
         self.default_joint_pos[env_ids] = default_joint_pos + self.offset[env_ids]
 
     @override
@@ -138,9 +132,8 @@ class JointPosition(_DelayedJointAction):
         self.applied_action.lerp_(self.action_queue[:, 0], self.alpha)
         self.action_queue = self.action_queue.roll(-1, dims=1)
 
-        jpos_target = self.default_joint_pos.clone()
-        jpos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
-        self.asset.set_joint_position_target(jpos_target)
+        jpos_target = self.default_joint_pos + self.applied_action * self.action_scaling
+        self.asset.set_joint_position_target(jpos_target, joint_ids=self.joint_ids)
 
 
 class JointPositionDelta(_DelayedJointAction):
@@ -161,9 +154,8 @@ class JointPositionDelta(_DelayedJointAction):
         clamp_range: Tuple[float, float] = (-0.5 * torch.pi, 0.5 * torch.pi),
         max_delay: int = 2,
         alpha_range: Tuple[float, float] = (0.5, 1.0),
-        input_order: Literal["isaac", "mujoco", "mjlab"] = "isaac",
     ):
-        super().__init__(env, action_scaling, max_delay, alpha_range, input_order)
+        super().__init__(env, action_scaling, max_delay, alpha_range)
         self.default_joint_pos = self.asset.data.default_joint_pos[:, self.joint_ids].clone()
         self.clamp_range = tuple(clamp_range)
         self.jpos_target = self.default_joint_pos.clone()
