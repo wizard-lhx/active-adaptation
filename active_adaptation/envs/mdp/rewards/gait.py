@@ -51,13 +51,13 @@ class max_feet_height(Reward):
 
 
 class feet_sliding(Reward):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaac", "mjlab")
 
-    @override
     def __init__(self, env, body_names: str, weight: float):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
+        self.contact_data = self.contact_sensor.data
         self.body_ids = self.asset.find_bodies(body_names)[0]
         self.body_ids = torch.tensor(self.body_ids, device=self.device)
         self.body_contact_ids = find_sensor_bodies(self.contact_sensor, body_names)[0]
@@ -66,10 +66,13 @@ class feet_sliding(Reward):
     @override
     def _compute(self) -> torch.Tensor:
         in_contact = (
-            self.contact_sensor.data.current_contact_time[:, self.body_contact_ids]
+            self.contact_data.current_contact_time[:, self.body_contact_ids]
             > self.env.physics_dt
         )
-        feet_speed = self.asset.data.body_lin_vel_w[:, self.body_ids].norm(dim=-1)
+        if self.env.backend == "isaac":
+            feet_speed = self.asset.data.body_com_lin_vel_w[:, self.body_ids].norm(dim=-1)
+        elif self.env.backend == "mjlab":
+            feet_speed = self.asset.data.body_link_lin_vel_w[:, self.body_ids].norm(dim=-1)
         sliding = (in_contact * feet_speed).sum(dim=1)
         return -sliding.reshape(self.num_envs, 1)
 
@@ -79,7 +82,6 @@ class quadruped_trot(Reward):
     Reward either (FL-RR) or (FR-RL) are in contact but not both.
     """
 
-    @override
     def __init__(self, env, weight: float, body_names: str):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]

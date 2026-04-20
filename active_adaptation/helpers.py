@@ -2,24 +2,16 @@ import torch
 import hydra
 import numpy as np
 import time
-import wandb
-import logging
 import os
 import datetime
 
-from typing import Sequence
-from tensordict import TensorDictBase, TensorDict
-from tensordict.nn import TensorDictModuleBase as ModBase
-
 from termcolor import colored
-from collections import OrderedDict
 from torchvision.io import write_video
 from omegaconf import OmegaConf, DictConfig
-from active_adaptation.utils.wandb import parse_checkpoint_path, parse_checkpoint, CheckpointBase
+from active_adaptation.utils.wandb import parse_checkpoint, CheckpointBase
+from active_adaptation.utils.profiling import ScopedTimer
 
 import active_adaptation
-
-# active_adaptation.import_projects()
 
 class Every:
     def __init__(self, func, steps):
@@ -72,12 +64,9 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
     if checkpoint is not None:
         checkpoint.update()
     checkpoint_path = checkpoint.get_path() if checkpoint else None
-    print(f"[Info]: Using checkpoint path: {checkpoint_path}")
+    print(f"[Info]: Using checkpoint from: {checkpoint_path}")
     if checkpoint_path is not None:
-        try:
-            state_dict = torch.load(checkpoint_path, weights_only=False)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}: {e}")
+        state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
         state_dict = {}
     
@@ -139,7 +128,7 @@ def evaluate(
 
     inference_time = []
     torch.compiler.cudagraph_mark_step_begin()
-    with set_exploration_type(exploration_type):
+    with ScopedTimer("rollout"), set_exploration_type(exploration_type):
         for i in tqdm(range(env.max_episode_length), miniters=10):
             s = time.perf_counter()
             tensordict_ = policy(tensordict_)
