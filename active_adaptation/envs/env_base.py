@@ -105,6 +105,11 @@ class RewardGroup:
 
     def compute(self) -> torch.Tensor:
         rewards = []
+        if self.name in {"tracking", "tracking_metrics"}:
+            print_enabled = True
+            # print(f"Reward group '{self.name}':")
+        else:
+            print_enabled = False
         for key, func in self.funcs.items():
             reward = func.compute()
             self.env.stats[self.name, key].add_(reward)
@@ -140,12 +145,11 @@ class _EnvBase(EnvBase, RegistryMixin):
         self._setup_mdp_managers()
         self._build_tensor_specs()
 
-        [callback() for callback in self._startup_callbacks]
-
         self.timestamp: int = 0
         self.stats: TensorDict = self.reward_spec["stats"].zero()
         self.input_tensordict = None
         self.extra = {}
+        self._startup_done = False
 
     # ---------------------------------------------------------------------
     # Initialization helpers
@@ -265,12 +269,14 @@ class _EnvBase(EnvBase, RegistryMixin):
             )
 
         # MDP: terminations
+        print("Termination functions:")
         for term_name, term_cfg in self.cfg.get("termination", {}).items():
             term_name, cls_name, term_kwargs = parse_component_spec(term_name, term_cfg)
             term = mdp.Termination.make(cls_name, self, **term_kwargs)
             if not term:
                 continue
             term = cast(mdp.Termination, term)
+            print(f"\t{term_name}: \t{'timeout' if term.is_timeout else 'termination'}")
             self.termination_funcs[term_name] = term
             self._add_mdp_component(term)
 
@@ -381,6 +387,10 @@ class _EnvBase(EnvBase, RegistryMixin):
     def _reset(
         self, tensordict: TensorDictBase | None = None, **kwargs
     ) -> TensorDictBase:
+        if not self._startup_done:
+            [callback() for callback in self._startup_callbacks]
+            self._startup_done = True
+            
         if tensordict is not None:
             env_mask = tensordict.get("_reset").reshape(self.num_envs)
             env_ids = env_mask.nonzero().squeeze(-1)
@@ -433,11 +443,11 @@ class _EnvBase(EnvBase, RegistryMixin):
                 with ScopedTimer("simulation_post_step", sync=False):
                     self.scene.update(self.physics_dt)
                     [callback(substep) for callback in self._post_step_callbacks]
+            # TODO: test if this is needed
+            if self.backend == "mjlab":
+                self.sim._sim.forward()
 
-            with ScopedTimer("update_callbacks", sync=False):
-                [callback() for callback in self._update_callbacks]
-
-        if self.sim.has_gui():
+        if self.sim.has_gui() and self.backend != "mjlab":
             self.sim.render()
 
         self.episode_length_buf.add_(1)
@@ -445,12 +455,19 @@ class _EnvBase(EnvBase, RegistryMixin):
 
         tensordict = TensorDict({}, self.num_envs, device=self.device)
 
+        with ScopedTimer("command_update", sync=False):
+            self.command_manager.update()
+        with ScopedTimer("update_callbacks", sync=False):
+            [callback() for callback in self._update_callbacks]
+            # for callback in self._update_callbacks:
+            #     with ScopedTimer(f"{callback.__self__.__class__.__name__}", sync=False):
+            #         callback()
         with ScopedTimer("reward", sync=False):
             tensordict = self._compute_reward(tensordict)
         with ScopedTimer("termination", sync=False):
             tensordict = self._compute_termination(tensordict)
-        with ScopedTimer("command", sync=False):
-            self.command_manager.update()
+        with ScopedTimer("command_step", sync=False):
+            self.command_manager.step()
         with ScopedTimer("observation", sync=False):
             tensordict = self._compute_observation(tensordict)
 
@@ -499,7 +516,7 @@ class _EnvBase(EnvBase, RegistryMixin):
         return tensordict
 
     def _compute_termination(self, tensordict: TensorDictBase) -> TensorDictBase:
-        truncated = self.episode_length_buf[:, None] >= self.max_episode_length
+        truncated = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
         terminated = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
         discount = torch.ones((self.num_envs, 1), device=self.device)
         for key, func in self.termination_funcs.items():
@@ -580,10 +597,14 @@ class _EnvBase(EnvBase, RegistryMixin):
             except ModuleNotFoundError:
                 pass
             return torch_utils.set_seed(seed)
-        if self.backend == "mujoco":
+        elif self.backend == "mujoco":
             torch.manual_seed(seed)
             np.random.seed(seed)
-            return seed
+        elif self.backend == "mjlab":
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        else:
+            raise ValueError(f"Unknown backend: {self.backend}")
 
     def render(self, mode: str = "human"):
         self.sim.render()
@@ -596,9 +617,11 @@ class _EnvBase(EnvBase, RegistryMixin):
                     *rgb_data.shape
                 )
                 return rgb_data[:, :, :3]
+            if self.backend == "mjlab":
+                return self.sim.render_rgb_array()
             raise NotImplementedError(
                 f"rgb_array mode not supported for backend '{self.backend}'. "
-                "Only Isaac backend supports rgb_array rendering."
+                "Only Isaac and mjlab backends support rgb_array rendering."
             )
         raise NotImplementedError(f"Render mode '{mode}' not supported.")
 
@@ -618,7 +641,9 @@ class _EnvBase(EnvBase, RegistryMixin):
                 del self.scene
                 self.sim.clear_all_callbacks()
                 self.sim.clear_instance()
-            elif self.backend == "mjlab" and self.sim.has_gui():
-                self.sim.viewer.close()
+            elif self.backend == "mjlab":
+                if self.sim.has_gui():
+                    self.sim.viewer.close()
+                self.sim.close()
             super().close(raise_if_closed=raise_if_closed)
 

@@ -12,15 +12,8 @@ Meanwhile, the code for the live demo (runinng Mujoco in browsers) is here [http
 * Easy symmetry augmentation.
 * Seamless Mujoco sim2sim.
 
-Projects using this codebase:
-
-* [FACET: Force-Adaptive Control via Impedance Reference Tracking for Legged Robots](https://arxiv.org/abs/2505.06883)
-
-* [HDMI: Learning Interactive Humanoid Whole-Body Control from * Human Videos](https://arxiv.org/abs/2509.16757)
-
-* [GentleHumanoid: Learning Upper-body Compliance for Contact-rich Human and Object Interaction](https://arxiv.org/abs/2511.04679)
-
-* [Gallant: Voxel Grid-based Humanoid Locomotion and Local-navigation across 3D Constrained Terrains](https://arxiv.org/abs/2511.14625)
+## Current Limitations
+* TorchRL stores redundant information and therefore the rollout buffer consumes more GPU memory.
 
 ## Installation
 
@@ -226,35 +219,15 @@ aa-recent-commands -s train_ppo -s eval_run
 Examples:
 
 ```bash
-python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo
+python test_env.py task=Go2/Go2Flat algo=ppo
 # hydra command-line overrides
-python scripts/train_ppo.py task=Go2/Go2Flat task.num_envs=8192 algo=ppo algo.entropy_coef=0.002 total_frames=200_000_000
+python test_env.py task=Go2/Go2Flat algo=ppo algo.entropy_coef=0.002 total_frames=200_000_000 task.terrain=medium
 # finetuning
-python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo checkpoint_path=${local_checkpoint_path}
-python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo checkpoint_path=run:${wandb_run_path}
-# train using mjlab (requires mjwarp and mjlab)
-python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo backend=mjlab
-# single-node multi-GPU training
+python test_env.py task=Go2/Go2Flat algo=ppo checkpoint_path=${local_checkpoint_path}
+python test_env.py task=Go2/Go2Flat algo=ppo checkpoint_path=run:${wandb_run_path}
+# multi-GPU training
 export OMP_NUM_THREADS=4 # a number greater than 1
-bash scripts/launch_ddp.sh 0,1,2,3 train_ppo.py task=G1/G1LocoFlat ...
-```
-
-### Evaluation and Visualization
-
-Examples:
-
-```bash
-# play the policy
-python play.py task=Go2/Go2Flat algo=ppo checkpoint_path=${local_checkpoint_path}
-python play.py task=Go2/Go2Flat algo=ppo checkpoint_path=run:${wandb_run_path}
-# play with mujoco backend
-python play.py task=Go2/Go2Flat algo=ppo backend=mujoco
-# export to onnx for deployment
-python play.py task=Go2/Go2Flat algo=ppo export_policy=true
-# record video
-python eval.py task=Go2/Go2Flat algo=ppo eval_render=true
-# coordination with servers or other collaborators
-python eval_run.py --run_path ${wandb_run_path} --play # eval/visualize remote runs
+python -m torch.distributed --nnodes=1 --nproc-per-node=4 ...
 ```
 
 ### VSCode/Cursor Python Debugging

@@ -72,8 +72,12 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
     if checkpoint is not None:
         checkpoint.update()
     checkpoint_path = checkpoint.get_path() if checkpoint else None
+    print(f"[Info]: Using checkpoint path: {checkpoint_path}")
     if checkpoint_path is not None:
-        state_dict = torch.load(checkpoint_path, weights_only=False)
+        try:
+            state_dict = torch.load(checkpoint_path, weights_only=False)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}: {e}")
     else:
         state_dict = {}
     

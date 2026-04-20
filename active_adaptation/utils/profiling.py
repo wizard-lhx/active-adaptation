@@ -47,24 +47,37 @@ class ScopedTimer(_DecoratorContextManager):
         """
         return self
 
+    def _detach(self):
+        """Detach this timer from its current parent or the root list."""
+        if self.parent is None:
+            if self in ScopedTimer._root_nodes:
+                ScopedTimer._root_nodes.remove(self)
+            return
+
+        if self in self.parent.children:
+            self.parent.children.remove(self)
+        self.parent = None
+
+    def _attach(self, parent: "ScopedTimer | None"):
+        """Attach this timer to a new parent or the root list."""
+        self.parent = parent
+        if parent is None:
+            if self not in ScopedTimer._root_nodes:
+                ScopedTimer._root_nodes.append(self)
+            return
+
+        if self not in parent.children:
+            parent.children.append(self)
+
     def __enter__(self):
         # Update hierarchical parent/roots based on current stack at each use,
         # so timers appear under the scopes where they are most recently used.
-        if ScopedTimer._stack:
-            parent = ScopedTimer._stack[-1]
-        else:
-            parent = "root"
+        parent = ScopedTimer._stack[-1] if ScopedTimer._stack else None
 
         # Re-parent if needed so the summary tree reflects current usage.
         if self.parent is not parent:
-            if self.parent is not None:
-                raise ValueError(f"Timer {self.name} already has a parent {self.parent.name}")
-            # Attach to new parent or root list.
-            self.parent = parent
-            if parent == "root":
-                ScopedTimer._root_nodes.append(self)
-            else:
-                parent.children.append(self)
+            self._detach()
+            self._attach(parent)
 
         ScopedTimer._stack.append(self)
         self.start = time.perf_counter()
