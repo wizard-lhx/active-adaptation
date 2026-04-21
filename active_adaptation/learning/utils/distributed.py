@@ -1,4 +1,5 @@
 import torch
+from torch import nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -22,12 +23,15 @@ def _max_abs_diff_across_ranks(t: torch.Tensor) -> float:
     return float(span.item())
 
 
-def check_gradients(module: torch.nn.Module):
+def check_gradients(module_or_param: torch.nn.Module | nn.Parameter):
     """
     Check if gradients on different GPUs are the same.
 
     Return the maximum absolute difference between gradients on different GPUs.
     """
+    if isinstance(module_or_param, nn.Parameter):
+        return _max_abs_diff_across_ranks(module_or_param.grad)
+    module = module_or_param
     m = _unwrap(module)
     max_diff = 0.0
     for p in m.parameters():
@@ -36,12 +40,15 @@ def check_gradients(module: torch.nn.Module):
     return max_diff
 
 
-def check_parameters(module: torch.nn.Module):
+def check_parameters(module_or_param: torch.nn.Module | nn.Parameter):
     """
     Check if parameters on different GPUs are the same.
 
     Return the maximum absolute difference between parameters on different GPUs.
     """
+    if isinstance(module_or_param, nn.Parameter):
+        return _max_abs_diff_across_ranks(module_or_param.data)
+    module = module_or_param
     m = _unwrap(module)
     max_diff = 0.0
     for p in m.parameters():
