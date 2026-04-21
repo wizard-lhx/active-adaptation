@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from isaaclab.sensors import ContactSensor
 
 from .base import Termination
-from active_adaptation.envs.utils import find_sensor_bodies
+from active_adaptation.envs.utils import find_sensor_bodies, find_bodies
 
 
 class max_episode_length(Termination):
@@ -175,3 +175,31 @@ class force_contact(Termination):
         )
         in_contact = forces.sum(dim=1, keepdim=True) > self.threshold
         return in_contact
+
+
+class bodies_too_close(Termination):
+    """Terminate when any two of the specified bodies are closer than ``threshold`` (meters)."""
+
+    def __init__(self, env, body_names: str, threshold: float = 0.05):
+        super().__init__(env)
+        self.threshold = threshold
+        self.asset: Articulation = self.env.scene.articulations["robot"]
+        self.body_indices, self.body_names = find_bodies(self.asset, body_names)
+        self.body_indices = torch.tensor(self.body_indices, device=self.env.device)
+        if len(self.body_indices) < 2:
+            raise ValueError("At least two bodies are required")
+        n = len(self.body_indices)
+        self.pair_i, self.pair_j = torch.triu_indices(n, n, offset=1)
+
+    def __repr__(self) -> str:
+        return (
+            f"bodies_too_close(body_names={self.body_names}, "
+            f"body_indices={self.body_indices.tolist()}, threshold={self.threshold})"
+        )
+
+    def compute(self, termination: torch.Tensor):
+        body_pos_w = self.asset.data.body_pos_w[:, self.body_indices]
+        dist = torch.cdist(body_pos_w, body_pos_w)
+        dist = dist[:, self.pair_i, self.pair_j].reshape(self.num_envs, -1)
+        return (dist < self.threshold).any(dim=-1, keepdim=True)
+
