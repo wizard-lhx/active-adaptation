@@ -203,3 +203,78 @@ class bodies_too_close(Termination):
         dist = dist[:, self.pair_i, self.pair_j].reshape(self.num_envs, -1)
         return (dist < self.threshold).any(dim=-1, keepdim=True)
 
+
+def _point_segment_dist_sq(p: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Squared distance from points ``p`` to segment ``a``–``b``. All tensors (B, 3)."""
+    ab = b - a
+    ap = p - a
+    denom = (ab * ab).sum(dim=-1).clamp_min(1e-20)
+    t = ((ap * ab).sum(dim=-1) / denom).clamp(0.0, 1.0)
+    closest = a + t.unsqueeze(-1) * ab
+    return (p - closest).square().sum(dim=-1)
+
+@torch.compile
+def _segment_segment_dist_sq(p1: torch.Tensor, p2: torch.Tensor, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Batched shortest distance squared between segments ``p1``–``p2`` and ``q1``–``q2`` in R^3."""
+    u = p2 - p1
+    v = q2 - q1
+    w0 = p1 - q1
+    a = (u * u).sum(dim=-1)
+    b = (u * v).sum(dim=-1)
+    c = (v * v).sum(dim=-1)
+    d = (u * w0).sum(dim=-1)
+    e = (v * w0).sum(dim=-1)
+    denom = a * c - b * b
+    eps = 1e-20
+    s = (b * e - c * d) / denom.clamp_min(eps)
+    t = (a * e - b * d) / denom.clamp_min(eps)
+    interior = (denom > eps) & (s >= 0.0) & (s <= 1.0) & (t >= 0.0) & (t <= 1.0)
+    diff = w0 + s.unsqueeze(-1) * u - t.unsqueeze(-1) * v
+    d_unc_sq = diff.square().sum(dim=-1)
+    d_edge_sq = torch.minimum(
+        torch.minimum(_point_segment_dist_sq(p1, q1, q2), _point_segment_dist_sq(p2, q1, q2)),
+        torch.minimum(_point_segment_dist_sq(q1, p1, p2), _point_segment_dist_sq(q2, p1, p2)),
+    )
+    return torch.where(interior, d_unc_sq, d_edge_sq)
+
+
+class segments_cross(Termination):
+    """Terminate when the shortest distance between the two segments is below ``threshold``.
+
+    Each segment is the line between two body origins (first/second resolved name order).
+    Uses 3D segment–segment closest distance (not only coplanar intersection).
+    Useful when self-collision is disabled for efficiency.
+    """
+
+    def __init__(
+        self,
+        env,
+        segment1_names: str,
+        segment2_names: str,
+        threshold: float = 0.07,
+    ):
+        super().__init__(env)
+        self.threshold = threshold
+        self._threshold_sq = threshold * threshold
+        self.asset: Articulation = self.env.scene.articulations["robot"]
+        self.segment1_indices, self.segment1_names = find_bodies(self.asset, segment1_names)
+        self.segment1_indices = torch.tensor(self.segment1_indices, device=self.env.device)
+        self.segment2_indices, self.segment2_names = find_bodies(self.asset, segment2_names)
+        self.segment2_indices = torch.tensor(self.segment2_indices, device=self.env.device)
+        if len(self.segment1_indices) != 2 or len(self.segment2_indices) != 2:
+            raise ValueError("segments_cross requires exactly two bodies per segment (endpoints).")
+
+    def __repr__(self) -> str:
+        return (
+            f"segments_cross(segment1={self.segment1_names}, segment2={self.segment2_names}, "
+            f"threshold={self.threshold})"
+        )
+
+    def compute(self, termination: torch.Tensor):
+        pos1 = self.asset.data.body_pos_w[:, self.segment1_indices]
+        pos2 = self.asset.data.body_pos_w[:, self.segment2_indices]
+        p1, p2 = pos1[:, 0], pos1[:, 1]
+        q1, q2 = pos2[:, 0], pos2[:, 1]
+        d_sq = _segment_segment_dist_sq(p1, p2, q1, q2)
+        return (d_sq < self._threshold_sq).reshape(self.num_envs, 1)
+
