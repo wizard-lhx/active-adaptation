@@ -74,8 +74,13 @@ class ScopedTimer(_DecoratorContextManager):
         # so timers appear under the scopes where they are most recently used.
         parent = ScopedTimer._stack[-1] if ScopedTimer._stack else None
 
+        if parent is None:
+            attached = self in ScopedTimer._root_nodes
+        else:
+            attached = self in parent.children
+
         # Re-parent if needed so the summary tree reflects current usage.
-        if self.parent is not parent:
+        if self.parent is not parent or not attached:
             self._detach()
             self._attach(parent)
 

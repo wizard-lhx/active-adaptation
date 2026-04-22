@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import logging
@@ -5,6 +6,7 @@ from typing import Union, Dict, Tuple, Optional
 
 import active_adaptation
 from active_adaptation.utils.math import quat_rotate_inverse
+from active_adaptation.utils.profiling import ScopedTimer
 
 try:
     import isaaclab.utils.string as string_utils
@@ -44,6 +46,12 @@ from .base import Randomization
 
 RangeType = Tuple[float, float]
 NestedRangeType = Union[RangeType, Dict[str, RangeType]]
+PROFILE_SYNC_TIMERS = os.environ.get("AA_PROFILE_SYNC_TIMERS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _mjlab_expand_model_fields(env, *fields: str):
@@ -805,10 +813,20 @@ class perturb_root_vel(Randomization):
         trigger_ids = trigger_ids_cpu.to(device=self.device)
 
         delta_vel = self._sample_delta_vel(trigger_ids.numel())
-        root_vel = torch.cat((self.asset.data.root_link_lin_vel_w[trigger_ids], self.asset.data.root_link_ang_vel_w[trigger_ids]), dim=-1)
+        with ScopedTimer("perturb_root_vel.read_root_vel", sync=PROFILE_SYNC_TIMERS):
+            root_vel = torch.cat(
+                (
+                    self.asset.data.root_link_lin_vel_w[trigger_ids],
+                    self.asset.data.root_link_ang_vel_w[trigger_ids],
+                ),
+                dim=-1,
+            )
         self.time_left_s[trigger_ids_cpu] = self._sample_interval(trigger_ids.numel(), device="cpu")
 
-        self.asset.write_root_link_velocity_to_sim(root_vel + delta_vel, env_ids=trigger_ids)
+        with ScopedTimer("perturb_root_vel.write_root_vel", sync=PROFILE_SYNC_TIMERS):
+            self.asset.write_root_link_velocity_to_sim(
+                root_vel + delta_vel, env_ids=trigger_ids
+            )
         # print(f"Applied random root velocity perturbation of {delta_vel} to envs {trigger_ids}.")
 
 

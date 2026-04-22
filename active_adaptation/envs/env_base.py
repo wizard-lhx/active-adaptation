@@ -1,3 +1,4 @@
+import os
 import warnings
 from collections import OrderedDict
 from typing import Dict, Mapping, cast
@@ -21,6 +22,12 @@ if active_adaptation.get_backend() == "isaac":
 
 
 EMA_DECAY = 0.99
+PROFILE_SYNC_TIMERS = os.environ.get("AA_PROFILE_SYNC_TIMERS", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def parse_component_spec(name: str, cfg):
@@ -363,6 +370,13 @@ class _EnvBase(EnvBase, RegistryMixin):
     def set_progress(self, progress: int):
         self.current_iter = progress
 
+    @staticmethod
+    def _callback_label(callback) -> str:
+        owner = getattr(callback, "__self__", None)
+        if owner is not None:
+            return owner.__class__.__name__
+        return getattr(callback, "__qualname__", getattr(callback, "__name__", "callback"))
+
     @property
     def num_envs(self) -> int:
         return self.scene.num_envs
@@ -433,14 +447,23 @@ class _EnvBase(EnvBase, RegistryMixin):
                     self._apply_action(substep)
                     [callback(substep) for callback in self._pre_step_callbacks]
                     self.scene.write_data_to_sim()
-                with ScopedTimer("simulation_step", sync=False):
+                with ScopedTimer("simulation_step", sync=PROFILE_SYNC_TIMERS):
                     self.sim.step(render=False)
                 with ScopedTimer("simulation_post_step", sync=False):
-                    self.scene.update(self.physics_dt)
-                    [callback(substep) for callback in self._post_step_callbacks]
+                    with ScopedTimer("scene.update", sync=PROFILE_SYNC_TIMERS):
+                        self.scene.update(self.physics_dt)
+                    with ScopedTimer("post_step_callbacks", sync=False):
+                        for callback_idx, callback in enumerate(self._post_step_callbacks):
+                            timer_name = (
+                                f"post_step_callbacks.{callback_idx:02d}."
+                                f"{self._callback_label(callback)}"
+                            )
+                            with ScopedTimer(timer_name, sync=False):
+                                callback(substep)
             # TODO: test if this is needed
-            if self.backend == "mjlab":
-                self.sim._sim.forward()
+            # if self.backend == "mjlab":
+            #     with ScopedTimer("simulation_forward", sync=PROFILE_SYNC_TIMERS):
+            #         self.sim._sim.forward()
 
         if self.sim.has_gui() and self.backend != "mjlab":
             self.sim.render()

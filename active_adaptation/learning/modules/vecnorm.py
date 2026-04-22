@@ -119,32 +119,33 @@ class VecNorm(nn.Module):
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("Distributed training is not initialized")
 
-        if mode == "broadcast":
-            # Make all ranks identical to rank 0 by broadcasting buffers
-            dist.broadcast(self.sum, src=0)
-            dist.broadcast(self.ssq, src=0)
-            dist.broadcast(self.count, src=0)
-        elif mode == "aggregate":
-            # Aggregate raw moments across ranks
-            if self.decay < 1.0:
-                # EMA case: buffers store weighted sums (numerators) and effective counts
-                dist.all_reduce(self.sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(self.ssq, op=dist.ReduceOp.SUM)
-                dist.all_reduce(self.count, op=dist.ReduceOp.SUM)
+        with torch.no_grad():
+            if mode == "broadcast":
+                # Make all ranks identical to rank 0 by broadcasting buffers
+                dist.broadcast(self.sum, src=0)
+                dist.broadcast(self.ssq, src=0)
+                dist.broadcast(self.count, src=0)
+            elif mode == "aggregate":
+                # Aggregate raw moments across ranks
+                if self.decay < 1.0:
+                    # EMA case: buffers store weighted sums (numerators) and effective counts
+                    dist.all_reduce(self.sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(self.ssq, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(self.count, op=dist.ReduceOp.SUM)
+                else:
+                    # Non-EMA: buffers store means; with equal per-rank counts, average across ranks.
+                    world_size = dist.get_world_size()
+                    # Use float64 accumulators to reduce risk of overflow/precision loss
+                    mean_buf = self.sum.to(dtype=torch.float64)
+                    m2_buf = self.ssq.to(dtype=torch.float64)
+                    dist.all_reduce(mean_buf, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(m2_buf, op=dist.ReduceOp.SUM)
+                    mean_global = (mean_buf / world_size).to(dtype=self.sum.dtype)
+                    m2_global = (m2_buf / world_size).to(dtype=self.ssq.dtype)
+                    self.sum.copy_(mean_global)
+                    self.ssq.copy_(m2_global)
             else:
-                # Non-EMA: buffers store means; with equal per-rank counts, average across ranks.
-                world_size = dist.get_world_size()
-                # Use float64 accumulators to reduce risk of overflow/precision loss
-                mean_buf = self.sum.to(dtype=torch.float64)
-                m2_buf = self.ssq.to(dtype=torch.float64)
-                dist.all_reduce(mean_buf, op=dist.ReduceOp.SUM)
-                dist.all_reduce(m2_buf, op=dist.ReduceOp.SUM)
-                mean_global = (mean_buf / world_size).to(dtype=self.sum.dtype)
-                m2_global = (m2_buf / world_size).to(dtype=self.ssq.dtype)
-                self.sum.copy_(mean_global)
-                self.ssq.copy_(m2_global)
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
+                raise ValueError(f"Invalid mode: {mode}")
     
 
     class freeze(_DecoratorContextManager):

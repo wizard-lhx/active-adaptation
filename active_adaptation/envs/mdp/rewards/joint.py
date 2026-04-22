@@ -67,15 +67,9 @@ class joint_vel_l2(Reward):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.joint_ids, _ = self.asset.find_joints(joint_names)
-        self.joint_vel = torch.zeros(
-            self.num_envs, 2, len(self.joint_ids), device=self.device
-        )
-
-    def post_step(self, substep):
-        self.joint_vel[:, substep % 2] = self.asset.data.joint_vel[:, self.joint_ids]
 
     def _compute(self) -> torch.Tensor:
-        joint_vel = self.joint_vel.mean(1)
+        joint_vel = self.asset.data.joint_vel[:, self.joint_ids]
         return -joint_vel.square().sum(1, True)
 
 
