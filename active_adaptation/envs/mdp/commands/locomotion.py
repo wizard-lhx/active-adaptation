@@ -15,7 +15,8 @@ from active_adaptation.utils.math import (
     yaw_quat,
     yaw_rotate,
     wrap_to_pi,
-    MultiUniform
+    MultiUniform,
+    sample_quat_yaw
 )
 import active_adaptation.utils.symmetry as symmetry_utils
 from .base import Command
@@ -37,8 +38,9 @@ class Twist(Command):
         stand_prob=0.2,
         target_yaw_range=(0, torch.pi * 2),
         curriculum: bool = False,
+        teleop: bool = False,
     ):
-        super().__init__(env)
+        super().__init__(env, teleop)
         self.linvel_x_range = linvel_x_range
         self.linvel_y_range = linvel_y_range
         self.angvel_range = angvel_range
@@ -78,11 +80,11 @@ class Twist(Command):
             self.distance_commanded = torch.zeros(self.num_envs, 1)
             self.distance_traveled = torch.zeros(self.num_envs, 1)
 
-            self._cum_error = torch.zeros(self.num_envs, 2)
-            self._cum_linvel_error = self._cum_error[:, 0].unsqueeze(1)
-            self._cum_angvel_error = self._cum_error[:, 1].unsqueeze(1)
+            self.cum_error = torch.zeros(self.num_envs, 2)
+            self._cum_linvel_error = self.cum_error[:, 0].unsqueeze(1)
+            self._cum_angvel_error = self.cum_error[:, 1].unsqueeze(1)
 
-        if self.teleop:
+        if self.teleop and self.env.backend == "isaac":
             self.key_mappings_pos = {
                 "W": torch.tensor(
                     [self.linvel_x_range[1], 0.0, 0.0], device=self.device
@@ -97,6 +99,20 @@ class Twist(Command):
                     [0.0, self.linvel_y_range[0], 0.0], device=self.device
                 ),
             }
+            # use left-right arrow keys to rotate
+            self.key_mappings_yaw = {
+                "LEFT": torch.tensor([self.angvel_range[1]], device=self.device),
+                "RIGHT": torch.tensor([self.angvel_range[0]], device=self.device),
+            }
+            # state for teleoperation commands (shared across all envs)
+            self._teleop_linvel = torch.zeros(3, device=self.device)
+            self._teleop_yaw = torch.zeros(1, device=self.device)
+            # speed modifiers controlled by shift/ctrl
+            self._speed_scale = 0.8
+            self._fast_speed_scale = 1.6
+            self._slow_speed_scale = 0.4
+            from active_adaptation.utils.isaac_keyboard import IsaacKeyboardManager
+            self.keyboard_manager = IsaacKeyboardManager()
         
         if self.env.sim.has_gui():
             if self.env.backend == "mjlab":
@@ -115,17 +131,6 @@ class Twist(Command):
         ], dim=-1)
 
     @override
-    def reset(self, env_ids):
-        self.next_command_linvel[env_ids] = 0.0
-        self.cmd_linvel_b[env_ids] = 0.0
-        self.target_yaw[env_ids] = self.asset.data.heading_w[env_ids, None]
-        self.cmd_yawvel_b[env_ids] = 0.0
-
-        self._cum_linvel_error[env_ids] = 0.0
-        self._cum_angvel_error[env_ids] = 0.0
-        self.is_standing_env[env_ids] = True
-    
-    @override
     def sample_init(self, env_ids):
         if self.curriculum and self.env.episode_count > 1: # and self.env.training:
             distance_traveled = self.distance_traveled[env_ids]
@@ -143,7 +148,34 @@ class Twist(Command):
         return super().sample_init(env_ids)
 
     @override
-    def update(self):
+    def reset(self, env_ids):
+        self.next_command_linvel[env_ids] = 0.0
+        self.cmd_linvel_b[env_ids] = 0.0
+        self.target_yaw[env_ids] = self.asset.data.heading_w[env_ids, None]
+        self.cmd_yawvel_b[env_ids] = 0.0
+
+        self._cum_linvel_error[env_ids] = 0.0
+        self._cum_angvel_error[env_ids] = 0.0
+        self.is_standing_env[env_ids] = True
+
+    @override
+    def update(self) -> None:
+        # Tracking error and curriculum integrals use the command that was active during sim
+        # (last step's output). Rewards and terminations run after this.
+        self._update_twist_tracking()
+
+    @override
+    def step(self) -> None:
+        # Advance commands for the next physics step; observations read this state.
+        if self.teleop:
+            if self.env.backend != "isaac":
+                self._step_twist_command()
+            else:
+                self._step_teleop()
+        else:
+            self._step_twist_command()
+
+    def _update_twist_tracking(self) -> None:
         self.body_heading_w = self.asset.data.heading_w.unsqueeze(1)
         self.lin_vel_w = self.asset.data.root_com_lin_vel_w
         self.ang_vel_w = self.asset.data.root_com_ang_vel_w
@@ -158,14 +190,16 @@ class Twist(Command):
         self._cum_linvel_error.mul_(0.98).add_(linvel_error * self.env.step_dt)
         self._cum_angvel_error.mul_(0.98).add_(angvel_error * self.env.step_dt)
 
+        self.command_speed = self.cmd_linvel_b.norm(dim=-1, keepdim=True)
+        self.current_speed = self.lin_vel_w.norm(dim=-1, keepdim=True)
+        self.distance_commanded = self.distance_commanded + self.command_speed * self.env.step_dt
+        self.distance_traveled = self.distance_traveled + self.current_speed * self.env.step_dt
+
+    def _step_twist_command(self) -> None:
         max_command_speed = (2.5 - self.cmd_yawvel_b.abs()).clamp(0.0)
         self.cmd_linvel_b.lerp_(self.next_command_linvel, 0.1)
         self.cmd_linvel_b = clamp_norm(self.cmd_linvel_b, max=max_command_speed)
         self.command_speed = self.cmd_linvel_b.norm(dim=-1, keepdim=True)
-    
-        self.current_speed = self.lin_vel_w.norm(dim=-1, keepdim=True)
-        self.distance_commanded = self.distance_commanded + self.command_speed * self.env.step_dt
-        self.distance_traveled = self.distance_traveled + self.current_speed * self.env.step_dt
 
         interval_reached = (self.env.episode_length_buf - 20) % self.resample_interval == 0
         resample_vel = interval_reached & (
@@ -193,6 +227,36 @@ class Twist(Command):
         ).reshape(self.num_envs, 1)
 
         self.cmd_linvel_w = quat_rotate(yaw_quat(self.quat_w), self.cmd_linvel_b)
+        self.is_standing_env = (self.command_speed < 0.1) & (self.cmd_yawvel_b.abs() < 0.1)
+
+    def _step_teleop(self) -> None:
+        km = self.keyboard_manager.key_pressed
+        if (km.get("LEFT_SHIFT") or km.get("RIGHT_SHIFT")):
+            scale = self._fast_speed_scale
+        elif (km.get("LEFT_CONTROL") or km.get("RIGHT_CONTROL")):
+            scale = self._slow_speed_scale
+        else:
+            scale = self._speed_scale
+
+        self._teleop_linvel.zero_()
+        for key, vel in self.key_mappings_pos.items():
+            if km.get(key, False):
+                self._teleop_linvel.add_(vel)
+        self._teleop_yaw.zero_()
+        for key, vel in self.key_mappings_yaw.items():
+            if km.get(key, False):
+                self._teleop_yaw.add_(vel)
+
+        linvel = (self._teleop_linvel * scale).unsqueeze(0).expand(self.num_envs, -1)
+        linvel[:, 2] = 0.0
+        max_speed = max(0.0, 2.5 - self._teleop_yaw.abs().item())
+        self.cmd_linvel_b = clamp_norm(linvel, max=max_speed)
+        self.cmd_yawvel_b[:] = (self._teleop_yaw * scale).clamp(*self.angvel_range)
+        self.cmd_base_height[:] = sum(self.base_height_range) / 2
+
+        self.quat_w = self.asset.data.root_link_quat_w
+        self.cmd_linvel_w = quat_rotate(yaw_quat(self.quat_w), self.cmd_linvel_b)
+        self.command_speed = self.cmd_linvel_b.norm(dim=-1, keepdim=True)
         self.is_standing_env = (self.command_speed < 0.1) & (self.cmd_yawvel_b.abs() < 0.1)
 
     def sample_vel_command(self, env_ids: torch.Tensor):
@@ -240,7 +304,7 @@ class Twist(Command):
             )
         elif self.env.backend == "mjlab":
             rpy = torch.zeros(self.num_envs, 3)
-            rpy[:, 2] = self.target_yaw.cpu()
+            rpy[:, 2:3] = self.target_yaw.cpu()
             self.axes_handle.batched_wxyzs = quat_from_euler_xyz(rpy)
             self.axes_handle.batched_positions = start.cpu()
             self.lines_handle.points = torch.stack([start, start + self.cmd_linvel_w], 1).cpu()

@@ -1,3 +1,4 @@
+from active_adaptation import ROBOT_MODEL_DIR
 from active_adaptation.assets import AssetCfg
 from active_adaptation.envs.backends.isaac.adapter import (
     IsaacSceneAdapter,
@@ -50,9 +51,8 @@ class IsaacBackendEnv(_EnvBase):
             prim_path="/World/skyLight",
             spawn=sim_utils.DomeLightCfg(
                 intensity=750.0,
-                texture_file=(
-                    f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/"
-                    "kloofendal_43d_clear_puresky_4k.hdr"
+                texture_file=str(
+                    ROBOT_MODEL_DIR / "scene" / "kloofendal_43d_clear_puresky_4k.hdr"
                 ),
             ),
         )
@@ -68,17 +68,17 @@ class IsaacBackendEnv(_EnvBase):
             setattr(scene_cfg, sensor_cfg.name, sensor_cfg.isaaclab())
 
         scene_cfg.robot.prim_path = "{ENV_REGEX_NS}/Robot"
-        terrain = self.cfg.get("terrain", "plane")
-        if terrain != "plane":
-            raise ValueError(
-                f"Isaac backend only supports `terrain: plane` for now, got `{terrain}`."
-            )
-        scene_cfg.terrain = registry.get("terrain", "plane")
+        terrain_name = self.cfg.get("terrain", "plane")
+        scene_cfg.terrain = registry.get("terrain", terrain_name)
 
-        for obj in self.cfg.get("objects", []):
-            obj_cfg = registry.get("asset", obj.name).isaaclab()
-            obj_cfg.prim_path = "{ENV_REGEX_NS}/" + obj.name
-            setattr(scene_cfg, obj.name, obj_cfg)
+        from isaaclab.assets import ArticulationCfg, RigidObjectCfg
+
+        for obj_name, spec in self.cfg.get("objects", {}).items():
+            obj_cfg = registry.get("asset", spec.name)
+            if not isinstance(obj_cfg, (ArticulationCfg, RigidObjectCfg)):
+                obj_cfg = obj_cfg.isaaclab()
+            obj_cfg.prim_path = "{ENV_REGEX_NS}/" + obj_name
+            setattr(scene_cfg, obj_name, obj_cfg)
 
         sim_cfg = sim_utils.SimulationCfg(
             dt=self.cfg.sim.isaac_physics_dt,
@@ -95,19 +95,18 @@ class IsaacBackendEnv(_EnvBase):
             sim.reset()
 
         sim.set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
-        if self.cfg.enable_cameras:
-            try:
-                import omni.replicator.core as rep
+        try:
+            import omni.replicator.core as rep
 
-                self._render_product = rep.create.render_product(
-                    "/OmniverseKit_Persp", tuple(self.cfg.viewer.resolution)
-                )
-                self._rgb_annotator = rep.AnnotatorRegistry.get_annotator(
-                    "rgb", device="cpu"
-                )
-                self._rgb_annotator.attach([self._render_product])
-            except ModuleNotFoundError:
-                print("Set enable_cameras=true to use cameras.")
+            self._render_product = rep.create.render_product(
+                "/OmniverseKit_Persp", tuple(self.cfg.viewer.resolution)
+            )
+            self._rgb_annotator = rep.AnnotatorRegistry.get_annotator(
+                "rgb", device="cpu"
+            )
+            self._rgb_annotator.attach([self._render_product])
+        except ModuleNotFoundError:
+            print("Set enable_cameras=true to use cameras.")
 
         self.sim = IsaacSimAdapter(sim)
         self.scene = IsaacSceneAdapter(self.scene)

@@ -15,7 +15,7 @@ class last_contact_pos(Observation):
         super().__init__(env)
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.world_frame = world_frame
-        self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
+        self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
         self.body_ids = self.asset.find_bodies(body_names)[0]
 
         self.contact_ids = self.contact_sensor.find_bodies(body_names)[0]
@@ -68,7 +68,7 @@ class contact_indicator(Observation):
     def __init__(self, env, body_names: str):
         super().__init__(env)
         self.asset: Articulation = self.env.scene.articulations["robot"]
-        self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
+        self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
         self.body_names = self.asset.find_bodies(body_names)[1]
         self.body_ids = self.contact_sensor.find_bodies(body_names)[0]
         
@@ -83,7 +83,7 @@ class contact_forces(Observation):
     def __init__(self, env, body_names: str, world_frame: bool=False):
         super().__init__(env)
         self.asset: Articulation = self.env.scene.articulations["robot"]
-        self.contact_sensor: ContactSensor = self.env.scene["contact_forces"]
+        self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
         self.world_frame = world_frame
         self.body_names = self.asset.find_bodies(body_names)[1]
         self.body_ids = self.contact_sensor.find_bodies(body_names)[0]

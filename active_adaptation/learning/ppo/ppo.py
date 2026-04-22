@@ -23,17 +23,12 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributions as D
 import torch.utils._pytree as pytree
-import warnings
 
 from torchrl.data import Composite, TensorSpec
 from torchrl.modules import ProbabilisticActor
-from torchrl.envs.transforms import CatTensors
 from tensordict import TensorDict
 from tensordict.nn import (
-    TensorDictModuleBase,
     TensorDictModule as Mod,
     TensorDictSequential as Seq,
 )
@@ -41,17 +36,29 @@ from tensordict.nn import (
 from hydra.core.config_store import ConfigStore
 from dataclasses import dataclass
 from typing import Union, Tuple
-from collections import OrderedDict
 
 from active_adaptation.learning.modules import (
     VecNorm, 
     IndependentNormal, 
     SymmetryWrapper,
 )
-from .common import *
-from .ppo_base import PPOBase
+from active_adaptation.learning.ppo.common import (
+    normalize,
+    OBS_KEY,
+    ACTION_KEY,
+    REWARD_KEY,
+    GAE,
+    make_batch,
+    make_mlp,
+    Actor,
+    Critic,
+)
+from active_adaptation.learning.ppo.ppo_base import PPOBase
+from active_adaptation.learning.utils.opt import MuonAdamWWrapper
+from active_adaptation.learning.utils.distributed import check_parameters
+from active_adaptation.learning.utils.dormancy import DormancyTracker
 
-import active_adaptation
+import active_adaptation as aa
 import torch.distributed as distr
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -66,16 +73,18 @@ class PPOConfig:
     desired_kl: Union[float, None] = None
     clip_param: float = 0.2
     entropy_coef: float = 0.002
-    layer_norm: Union[str, None] = "before"
 
+    activation: str = "Mish"
+    muon: bool = False # use Muon optimizer
+    
     # symmetry options
     symnet: bool = False # use symmetry wrapper to wrap the policy and critic
     symaug: bool = False # use symmetry augmentation
 
     compile: bool = False
     use_ddp: bool = True
+    debug: bool = False # enable correctness checkers
 
-    checkpoint_path: Union[str, None] = None
     in_keys: Tuple[str, ...] = (OBS_KEY,)
 
 
@@ -112,14 +121,15 @@ class PPOPolicy(PPOBase):
 
         self.action_dim = env.action_manager.action_dim
         
+        activation = getattr(nn, self.cfg.activation)
         self.vecnorm = Seq(Mod(vecnorm, [OBS_KEY], ["_obs_normed"])).to(self.device)
         actor_module = Seq(
-            Mod(make_mlp([256, 256, 256]), ["_obs_normed"], ["_actor_feature"]),
+            Mod(make_mlp([256, 256, 256], activation=activation), ["_obs_normed"], ["_actor_feature"]),
             Mod(Actor(self.action_dim), ["_actor_feature"], ["loc", "scale"])
         )
         self.critic = Seq(
-            Mod(make_mlp([256, 256, 256]), ["_obs_normed"], ["_critic_feature"]),
-            Mod(nn.LazyLinear(1), ["_critic_feature"], ["state_value"])
+            Mod(make_mlp([256, 256, 256], activation=activation), ["_obs_normed"], ["_critic_feature"]),
+            Mod(Critic(1), ["_critic_feature"], ["state_value"])
         ).to(self.device)
 
         if self.cfg.symnet:
@@ -159,37 +169,54 @@ class PPOPolicy(PPOBase):
         self.actor.apply(init_)
         self.critic.apply(init_)
 
-        if active_adaptation.is_distributed():
-            self.world_size = active_adaptation.get_world_size()
+        if aa.is_distributed():
             if self.cfg.use_ddp:
-                self.actor = DDP(self.actor)
-                self.critic = DDP(self.critic)
+                self.actor = DDP(self.actor, device_ids=[aa.get_local_rank()])
+                self.critic = DDP(self.critic, device_ids=[aa.get_local_rank()])
             else:
-                with torch.no_grad():
-                    for param in self.actor.parameters():
-                        distr.broadcast(param, src=0)
-                    for param in self.critic.parameters():
-                        distr.broadcast(param, src=0)
+                for param in self.actor.parameters():
+                    distr.broadcast(param, src=0)
+                for param in self.critic.parameters():
+                    distr.broadcast(param, src=0)
+        self.world_size = aa.get_world_size()
+        self.should_reduce_grads = aa.is_distributed() and not self.cfg.use_ddp
         
-        self.opt = torch.optim.Adam(
-            [
-                {"params": self.actor.parameters()},
-                {"params": self.critic.parameters()},
-            ],
-            lr=cfg.lr
-        )
+        if self.cfg.muon:
+            self.opt = MuonAdamWWrapper(
+                [self.actor, self.critic],
+                lr=cfg.lr,
+                weight_decay=0.01
+            )
+        else:
+            self.opt = torch.optim.AdamW(
+                [
+                    {"params": self.actor.parameters()},
+                    {"params": self.critic.parameters()},
+                ],
+                lr=cfg.lr,
+                weight_decay=0.01
+            )
 
         self.update = self._update
-        if self.cfg.compile and not active_adaptation.is_distributed():
-            self.update = torch.compile(self.update, fullgraph=True)
+        if self.cfg.compile and not aa.is_distributed():
+            self.update = torch.compile(self.update)
+        self._rollout_dormancy_tracker: Union[DormancyTracker, None] = None
 
     def get_rollout_policy(self, mode: str="train", critic: bool = False):
+        if self._rollout_dormancy_tracker is not None:
+            self._rollout_dormancy_tracker.close()
+            self._rollout_dormancy_tracker = None
+
         if critic:
             policy = Seq(self.vecnorm, self.critic, self.actor)
         else:
             policy = Seq(self.vecnorm, self.actor)
         if self.cfg.compile:
-            policy = torch.compile(policy, fullgraph=True)
+            policy = torch.compile(policy)
+        if self.cfg.debug:
+            tracker = DormancyTracker(policy)
+            policy.forward = tracker.wrap(policy.forward)
+            self._rollout_dormancy_tracker = tracker
         return policy
 
     def compute_value(self, tensordict):
@@ -209,7 +236,7 @@ class PPOPolicy(PPOBase):
         
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"]
-        log_probs_before = tensordict["sample_log_prob"]
+        log_probs_before = tensordict["action_log_prob"]
         tensordict["adv"] = normalize(tensordict["adv"], subtract_mean=True)
 
         for epoch in range(self.cfg.ppo_epochs):
@@ -225,6 +252,7 @@ class PPOPolicy(PPOBase):
                     elif kl < self.cfg.desired_kl / 2.0 and kl > 0.0:
                         actor_lr = min(1e-3, actor_lr * 1.5)
                     self.opt.param_groups[0]["lr"] = actor_lr
+            
         
         with torch.no_grad():
             tensordict_ = self.actor(tensordict.copy())
@@ -241,20 +269,30 @@ class PPOPolicy(PPOBase):
         infos["critic/value_std"] = tensordict["ret"].std().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
         infos["critic/valid_ratio"] = valid_ratio.item()
+        
+        if self.cfg.debug and self._rollout_dormancy_tracker is not None:
+            dormancy = self._rollout_dormancy_tracker.compute_dormancy()
+            for module_name, value in dormancy.items():
+                infos[f"dormancy/{module_name}"] = value
+            self._rollout_dormancy_tracker.reset()
 
-        if active_adaptation.is_distributed():
+        if aa.is_distributed() and aa.is_main_process():
             loc_diffs, scale_diffs = check_vecnorm_divergence(self.vecnorm[0].module)
-            if active_adaptation.is_main_process():
-                infos["vecnorm/loc_diff_max"] = max(loc_diffs)
-                infos["vecnorm/scale_diff_max"] = max(scale_diffs)
-                infos["vecnorm/loc_diff_mean"] = sum(loc_diffs) / len(loc_diffs)
-                infos["vecnorm/scale_diff_mean"] = sum(scale_diffs) / len(scale_diffs)
+            infos["vecnorm/loc_diff_max"] = max(loc_diffs)
+            infos["vecnorm/scale_diff_max"] = max(scale_diffs)
+            infos["vecnorm/loc_diff_mean"] = sum(loc_diffs) / len(loc_diffs)
+            infos["vecnorm/scale_diff_mean"] = sum(scale_diffs) / len(scale_diffs)
             self.vecnorm[0].module.synchronize(mode="broadcast")
+            if self.cfg.debug:
+                actor_diff = check_parameters(self.actor)
+                critic_diff = check_parameters(self.critic)
+                infos["actor/diff"] = actor_diff
+                infos["critic/diff"] = critic_diff
         return dict(sorted(infos.items()))
 
     def _update(self, tensordict: TensorDict):
         action_data = tensordict[ACTION_KEY]
-        log_probs_data = tensordict["sample_log_prob"]
+        log_probs_data = tensordict["action_log_prob"]
         
         valid = (~tensordict["is_init"])
         valid_cnt = valid.sum()
@@ -281,7 +319,7 @@ class PPOPolicy(PPOBase):
         self.opt.zero_grad()
         loss.backward()
 
-        if active_adaptation.is_distributed() and not self.cfg.use_ddp:
+        if self.should_reduce_grads:
             for param in self.actor.parameters():
                 distr.all_reduce(param.grad.data, op=distr.ReduceOp.SUM)
                 param.grad.data /= self.world_size
@@ -308,15 +346,8 @@ class PPOPolicy(PPOBase):
         return info
 
 
-def normalize(x: torch.Tensor, subtract_mean: bool=False):
-    if subtract_mean:
-        return (x - x.mean()) / x.std().clamp(1e-7)
-    else:
-        return x  / x.std().clamp(1e-7)
-
-
 def check_vecnorm_divergence(vecnorm: VecNorm):
-    WORLD_SIZE = active_adaptation.get_world_size()
+    WORLD_SIZE = aa.get_world_size()
     
     loc, scale = vecnorm._compute()
     gather_loc = [torch.empty_like(loc) for _ in range(WORLD_SIZE)]

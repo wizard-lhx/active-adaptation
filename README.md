@@ -17,159 +17,202 @@ Meanwhile, the code for the live demo (runinng Mujoco in browsers) is here [http
 
 ## Installation
 
-1. For the following steps, the recommended way to structure the (VSCode or Cursor) workspace is:
-   ```bash
-    ${workspaceFolder}/ # File->Open Folder here
-      .vscode/
-        launch.json # use vscode Python debugging for better experience!
-        settings.json
-      active-adaptation/
-      IsaacLab/
-        _isaac_sim/
-   ```
-2. Install [Isaac Sim 5.1.0](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html) by downloading the latest release and unzip it to a desired location `$ISAACSIM_PATH`.
-3. Install [Isaac Lab](https://github.com/isaac-sim/IsaacLab) and setup a conda environment:
-   ```bash
-   conda create -n lab python=3.11
-   conda activate lab
-   # install IsaacLab to the exisiting conda environment
-   # git clone https://github.com/isaac-sim/IsaacLab.git
-   git clone git@github.com:isaac-sim/IsaacLab.git # SSH recommended
-   cd IsaacLab
-   ln -s $ISAACSIM_PATH _isaac_sim
-   ./isaaclab.sh -c lab
-   ./isaaclab.sh -i none # install without additional RL libraries
-   # reactivate the environment
-   conda activate lab
-   echo $PYTHONPATH 
-   ```
-   You should see the isaac-sim related dependencies are added to `$PYTHONPATH`.
-4. [**Recommended**] Isaac Sim comes with its cumstom Python environment which may lead to conflicts with our conda environment.
-   To avoid Python environment conflicts, try the following steps:
-   ```bash
-   cd $ISAACSIM_PATH/exts/omni.isaac.ml_archive
-   mv pip_prebundle pip_prebundle.back # backup the packages shipped with Isaac Sim
-   ln -s $CONDA_PREFIX/lib/python3.11/site-packages
-   ```
-5. [**Optional**] VSCode setup. This enables the Python extension for code analysis to provide auto-completiong and linting. Edit `.vscode/settings.json` on demand:
-   ```json
-   "python.analysis.extraPaths": [
-        // Recommended
-        "./IsaacLab/source/isaaclab",
-        "./IsaacLab/source/isaaclab_assets",
-        // Optional, modified from IsaacLab/.vscode/settings.json
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.behavior",
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.behavior.ui",
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.domain_randomization",
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.examples",
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.scene_blox",
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.synthetic_recorder",
-        "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.writers",
-        //... note that adding extraPaths may increase VSCode CPU usage
-    ],
-   ```
-6. `pip install -U torch torchvision tensordict torchrl`
-7. Install this repo:
-   ```bash
-   git clone git@github.com:btx0424/active-adaptation.git # SSH recommended
-   cd active-adaptation
-   pip install -e . 
-   ```
+### Workspace layout
+
+For IsaacLab development, the recommended workspace layout is:
+
+```bash
+${workspaceFolder}/
+  .vscode/
+    launch.json
+    settings.json
+  active-adaptation/
+  IsaacLab/
+    _isaac_sim/
+```
+
+### Single Python environment
+
+Use one Python 3.11 environment for this repo.
+
+- Isaac Sim / IsaacLab requires Python 3.11.
+- MJLab also works on Python 3.11.
+- The repo root is the only `uv` project you need.
+
+Setup:
+
+```bash
+git clone git@github.com:btx0424/active-adaptation.git
+cd active-adaptation
+uv sync
+```
+
+For common development commands:
+
+```bash
+uv run aa-discover-projects
+uv run aa-list-tasks
+uv run pyright active_adaptation
+```
+
+### IsaacLab / Isaac Sim setup
+
+Install [Isaac Sim 5.1.0](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html) and [IsaacLab](https://github.com/isaac-sim/IsaacLab) into the same Python 3.11 environment you use for this repo.
+
+After that, run training / eval / play from the repo root:
+
+```bash
+uv run python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo
+uv run python scripts/eval.py task=Go2/Go2Flat algo=ppo eval_render=true
+uv run python scripts/play.py task=Go2/Go2Flat algo=ppo checkpoint_path=/path/to/checkpoint.pt
+```
+
+Notes:
+
+- `uv sync` manages this repo's dependencies in `.venv`.
+- IsaacLab itself may still require its own setup for `PYTHONPATH`, Isaac Sim linking, and extension discovery.
+- The important constraint is that IsaacLab and this repo must use the same Python 3.11 environment.
+
+### MJLab setup
+
+If you want to use the `mjlab` backend, install the optional extra in the same root environment:
+
+```bash
+uv sync --extra mjlab
+```
+
+Then run MJLab commands from the repo root:
+
+```bash
+uv run python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo backend=mjlab
+uv run python scripts/play.py task=Go2/Go2Flat algo=ppo backend=mjlab checkpoint_path=/path/to/checkpoint.pt
+```
+
+### Optional: direct `pip` install
+
+If you are not using `uv`, the root package can still be installed directly:
+
+```bash
+pip install -e .
+pip install mjlab==1.2.0  # only if you need the mjlab backend
+```
+
+### Optional VSCode setup
+
+Edit `.vscode/settings.json` on demand:
+
+```json
+"python.analysis.extraPaths": [
+  "./IsaacLab/source/isaaclab",
+  "./IsaacLab/source/isaaclab_assets",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.behavior",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.behavior.ui",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.domain_randomization",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.examples",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.scene_blox",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.synthetic_recorder",
+  "${workspaceFolder}/IsaacLab/_isaac_sim/exts/isaacsim.replicator.writers"
+],
+```
+
+## Asset download and placement
+
+Some robots and scene files are **not** shipped inside this repository (to keep the clone small). They are loaded from a fixed cache directory next to the package.
+
+### Where files must live
+
+After `pip install -e .`, the code resolves assets from:
+
+**`<active-adaptation repo root>/.cache/aa-robot-models/`**
+
+That path is `ROBOT_MODEL_DIR` in code (`CACHE_DIR` is the repo’s `.cache/` folder). Do not rename `aa-robot-models` unless you also change the code.
+
+### What to download
+
+- **Source:** [Hugging Face dataset `btx0424/aa-robot-models`](https://huggingface.co/datasets/btx0424/aa-robot-models)
+- **Layout under `aa-robot-models/`** (paths used today):
+  - `a2/` — Unitree A2 MJCF/USD (`a2.xml`, `a2.usd`)
+  - `b2/` — Unitree B2 MJCF/USD (`b2.xml`, `b2_flattened.usda`)
+  - `scene/` — e.g. `kloofendal_43d_clear_puresky_4k.hdr` (dome light / sky for the Isaac backend)
+
+If the archive or clone has an extra top-level folder, unpack or move contents so those directories sit **directly** under `.cache/aa-robot-models/`.
+
+### How to get them
+
+From the **root of the cloned `active-adaptation` repo** (where `.cache/` is created automatically):
+
+```bash
+# Option A: Hugging Face CLI (recommended)
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download btx0424/aa-robot-models --repo-type dataset --local-dir .cache/aa-robot-models
+```
+
+You can instead **clone or copy** the dataset contents into `.cache/aa-robot-models/`, or put the data elsewhere and replace `.cache/aa-robot-models` with a **symlink** to that folder.
+
+## CLI commands
+
+These commands are available after `pip install -e .` and help manage projects and tasks.
+
+| Command | Description |
+|--------|-------------|
+| `aa-create-project` | Create a new active-adaptation project scaffold. |
+| `aa-discover-projects` | Discover installed projects and learning modules, write/update `projects.json`. |
+| `aa-list-tasks` | List task names from `cfg/task` in active-adaptation and discovered projects. |
+| `aa-pull` | Run `git pull` for active-adaptation and all enabled projects. |
+| `aa-recent-commands` | List recent training/eval commands from stored history. |
+
+### aa-create-project
+
+Create a new project with packages `{name}/` and `{name}_learning/`, `pyproject.toml`, `cfg/task`, `cfg/exp`, and optional README/`.gitignore` (existing files are not overwritten, e.g. when scaffolding inside a new git repo).
+
+```bash
+aa-create-project -n myproject
+aa-create-project -n myproject -d /path/to/parent
+```
+
+- **`-n`, `--name`** (required): Project/package name (lowercase, alphanumeric + underscores).
+- **`-d`, `--dir`**: Parent directory for the new project folder (default: current directory).
+
+### aa-discover-projects
+
+Scans entry points `active_adaptation.projects` and `active_adaptation.learning` and updates `projects.json` (under the cache directory) with project paths and task dirs. Use this after installing or adding projects so that `aa-list-tasks` and `aa-pull` know about them. Edit `projects.json` to enable or disable projects.
+
+```bash
+aa-discover-projects
+```
+
+### aa-list-tasks
+
+Prints task IDs from YAML files under `cfg/task` for active-adaptation and for each enabled project in `projects.json`. Task names keep the directory prefix (e.g. `G1/G1LocoFlat`). Useful to see which tasks are available for `task=...` in training/eval.
+
+```bash
+aa-list-tasks
+```
+
+### aa-pull
+
+Runs `git pull` in the active-adaptation repo and in all **enabled** projects listed in `projects.json`. Use after `aa-discover-projects` so projects are registered.
+
+```bash
+aa-pull           # active projects only
+aa-pull --all     # all discovered projects, including disabled
+```
+
+### aa-recent-commands
+
+Shows the last N commands (training/eval runs) from the stored command history. Optional filter by script name.
+
+```bash
+aa-recent-commands
+aa-recent-commands -n 10
+aa-recent-commands -s train_ppo -s eval_run
+```
+
+- **`-n`, `--num`**: Number of recent commands (default: 5).
+- **`-s`, `--script`**: Filter by script name (e.g. `train_ppo`, `eval_run`); can be repeated (OR).
 
 
 ## Basic Usage
-
-We use Hydra for configuration management. Each task is specified by a yaml file placed under `cfg/task` or `cfg/task/{subfolder}`, for example:
-
-```yaml
-# @package task
-name: Go2Flat
-task: Quadruped
-
-robot: go2
-terrain: plane
-payload: false
-homogeneous: false
-
-action:
-  _target_: active_adaptation.envs.mdp.action.JointPosition
-  joint_names: .*_joint
-  action_scaling: {.*_joint: 0.5}
-  max_delay: 2
-  alpha: [0.5, 1.0]
-
-command:
-  _target_: active_adaptation.envs.mdp.Command2
-  linvel_x_range: [-1.0, 2.0]
-  linvel_y_range: [-0.7, 0.7]
-  angvel_range:   [-2.0, 2.0]
-  yaw_stiffness_range: [0.5, 0.7]
-  use_stiffness_ratio: 0.99
-  aux_input_range: [.5, 1.]
-  resample_prob: 0.5
-  stand_prob: 0.02
-  target_yaw_range: 
-    - [-0.3927,  0.3927]
-    - [ 1.1781,  1.9635]
-    - [ 2.7489,  3.5343]
-    - [ 4.3197,  5.1051]
-  adaptive: true
-
-observation:
-  policy:
-    command:
-    projected_gravity_b: {noise_std: 0.05}
-    joint_pos:    {noise_std: 0.05, joint_names: .*_joint}
-    joint_vel:    {noise_std: 0.4, joint_names: .*_joint}
-    prev_actions: {steps: 3}
-  priv:
-    applied_action:
-    root_linvel_b:    {yaw_only: true}
-    root_angvel_b:
-    feet_pos_b:
-    feet_vel_b:
-    feet_height_map:  {feet_names: .*foot }
-    applied_torques:  {actuator_name: base_legs}
-    joint_forces:     {joint_names: .*_joint}
-    external_forces:  {body_names: ["base"]}
-    contact_indicator:  {body_names: [".*_foot", ".*_calf"], timing: true}
-
-reward:
-  loco:
-    linvel_exp:         {weight: 1.5, enabled: true, dim: 3, yaw_only: true}
-    angvel_z_exp:       {weight: 0.75, enabled: true}
-    angvel_xy_l2:       {weight: 0.02, enabled: true}
-    linvel_z_l2:        {weight: 2.0, enabled: true}
-    base_height_l1:     {weight: 0.5, enabled: true, target_height: 0.35}
-    energy_l1:          {weight: 0.0002, enabled: true}
-    joint_acc_l2:       {weight: 2.5e-7, enabled: true}
-    joint_torques_l2:   {weight: 2.0e-4, enabled: true}
-    quadruped_stand:    {weight: 0.5}
-    survival:           {weight: 1.0, enabled: true}
-    action_rate_l2:     {weight: 0.01, enabled: true}
-    feet_air_time:      {weight: 0.4, enabled: true, body_names: .*_foot, thres: 0.4}
-  debug:
-    feet_slip:          {weight: 1.0, enabled: false, body_names: .*_foot}
-    feet_contact_count: {weight: 1.0, enabled: false, body_names: .*_foot}
-    undesired_contact:  {body_names: [.*_calf, .*thigh, Head.*], weight: 0.25, enabled: true}
-
-termination: # terminate upon any of the following checks being satisfied
-  crash: {body_names_expr: [Head.*, "base"], t_thres: 0.5, z_thres: 0.}
-  # joint_acc_exceeds: {thres: 5000}
-  cum_error: {thres: 1.0}
-
-randomization:
-  random_scale: [1.0, 1.0]
-  perturb_body_mass:
-    (?!(payload|base|Head.*)).*: [0.8, 1.2]
-    base: [0.8, 1.4]
-  perturb_body_com:
-    "base|torso_link": [-0.03, 0.03]
-```
-
-Observations are grouped by keys and the observation of the same group is concatenated.
-
-Rewards are grouped by keys and the rewards of the same group is summed up, excluding those marked with `enabled=false`. However, rewards with `enabled=false` will still be computed and logged as metrics for debugging purposes.
 
 ### Training
 
@@ -209,112 +252,4 @@ Create and modify `.vscode/launch.json` to add debug configurations. For example
       ]
   }
 ]
-```
-
-### Evaluation and Visualization
-
-Examples:
-
-```bash
-# play the policy
-python play.py task=Go2/Go2Flat algo=ppo checkpoint_path=${local_checkpoint_path}
-python play.py task=Go2/Go2Flat algo=ppo checkpoint_path=run:${wandb_run_path}
-# mujoco sim2sim verification, requires MJCF assets to be specified
-python play_mujoco.py task=Go2/Go2Flat algo=ppo
-# export to onnx for deployment
-python play.py task=Go2/Go2Flat algo=ppo export_policy=true
-# record video
-python eval.py task=Go2/Go2Flat algo=ppo eval_render=true
-# coordination with servers or other collaborators
-python eval_run.py --run_path ${wandb_run_path} --play # eval/visualize remote runs
-```
-
-## Development Guide
-
-### 1. Asset Specification
-
-We borrow the asset specification and management of [IsaacLab](): each robot specification is defined with an `ArticulationCfg` in `active_adaptation/assets/` and stored in `active_adaptation.assets.ROBOTS`.
-
-For Mujoco sim2sim verification (optional), provide a MJCF file that aligns with the USD and put the MJCF under `active_adaptation/assets_mjcf/`. We may implement USD-to-MJCF exporting in the future.
-
-For symmetry augmentation, provide joint- and cartesian-space mappings that specify the left-right symmetry of a robot. See `assets.quadruped` for examples.
-
-### 2. Task Definition
-
-All components, including action, command, observation, reward, termination condition are defined by subclassing the base class. The base classes have a series of callbacks that will be called at each environment step:
-
-```python
-class Observation:
-    def __init__(self, env):
-        self.env: _Env = env
-
-    @property
-    def num_envs(self):
-        return self.env.num_envs
-    
-    @property
-    def device(self):
-        return self.env.device
-
-    @abc.abstractmethod
-    def compute(self) -> torch.Tensor:
-        raise NotImplementedError
-    
-    def __call__(self) ->  Tuple[torch.Tensor, torch.Tensor]:
-        tensor = self.compute()
-        return tensor
-    
-    def startup(self):
-        """Called once upon initialization of the environment"""
-        pass
-    
-    def post_step(self, substep: int):
-        """Called after each physics substep"""
-        pass
-
-    def update(self):
-        """Called after all physics substeps are completed"""
-        pass
-
-    def reset(self, env_ids: torch.Tensor):
-        """Called after episode termination"""
-
-    def debug_draw(self):
-        """Called at each step **after** simulation, if GUI is enabled"""
-        pass
-```
-
-The stepping logic is defined in `active_adaptation.envs.base._Env.step`.
-
-The data tensordict's content looks like:
-
-```
-TensorDict(
-    fields={
-        action: Tensor(shape=torch.Size([4096, 32, 12]), device=cuda:0, dtype=torch.float32, is_shared=True),
-        done: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True),
-        height_scan_: Tensor(shape=torch.Size([4096, 32, 1, 21, 21]), device=cuda:0, dtype=torch.float32, is_shared=True),
-        is_init: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True),
-        next: TensorDict(
-            fields={
-                discount: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.float32, is_shared=True),
-                done: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True),
-                height_scan_: Tensor(shape=torch.Size([4096, 32, 1, 21, 21]), device=cuda:0, dtype=torch.float32, is_shared=True),
-                is_init: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True),
-                policy: Tensor(shape=torch.Size([4096, 32, 100]), device=cuda:0, dtype=torch.float32, is_shared=True),
-                stats: TensorDict(
-                    ...),
-                step_count: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.int64, is_shared=True),
-                terminated: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True),
-                truncated: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True)},
-            batch_size=torch.Size([4096, 32]),
-            device=cuda:0,
-            is_shared=True),
-        policy: Tensor(shape=torch.Size([4096, 32, 100]), device=cuda:0, dtype=torch.float32, is_shared=True),
-        step_count: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.int64, is_shared=True),
-        terminated: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True),
-        truncated: Tensor(shape=torch.Size([4096, 32, 1]), device=cuda:0, dtype=torch.bool, is_shared=True)},
-    batch_size=torch.Size([4096, 32]),
-    device=cuda:0,
-    is_shared=True)
 ```

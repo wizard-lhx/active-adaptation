@@ -1,5 +1,5 @@
 # @package task
-name: Go2Flat
+name: QuadrupedFlat
 
 viewer:
   resolution: [1280, 720]
@@ -7,8 +7,7 @@ viewer:
   eye: [4.0, 4.0, 4.0]
 
 robot:
-  name: go2
-# terrain: slopes_boxes
+  name: quadruped
 terrain: plane
 
 
@@ -21,15 +20,14 @@ sim:
   isaac_physics_dt: 0.005
   mujoco_physics_dt: 0.002
 
-input:
-  action:
-    _target_: JointPosition
-    action_scaling: {.*_joint: 0.5}
-    max_delay: 1
-    alpha_range: [0.5, 1.0]
+action:
+  _target_: active_adaptation.envs.mdp.action.JointPosition
+  action_scaling: {.*_joint: 0.5}
+  max_delay: 1
+  alpha_range: [0.5, 1.0]
 
 command:
-  _target_: Twist
+  class: Twist
   linvel_x_range: [-1.0, 1.6]
   linvel_y_range: [-0.8, 0.8]
   angvel_range:   [-2.0, 2.0]
@@ -43,17 +41,37 @@ command:
     - [ 2.7489,  3.5343]
     - [ 4.3197,  5.1051]
 
+# command:
+#   _target_: active_adaptation.envs.mdp.commands.impedance.VelocityImpulse
+#   linvel_x_range: [-1.0, 1.6]
+#   linvel_y_range: [-0.8, 0.8]
+#   angvel_range:   [-2.0, 2.0]
+#   yaw_stiffness_range: [0.5, 1.1]
+#   use_stiffness_ratio: 0.99
+#   aux_input_range: [.5, 1.]
+#   resample_prob: 0.5
+#   stand_prob: 0.08
+#   target_yaw_range: 
+#     - [-0.3927,  0.3927]
+#     - [ 1.1781,  1.9635]
+#     - [ 2.7489,  3.5343]
+#     - [ 4.3197,  5.1051]
+#   adaptive: false
+
 observation:
+  # command: # won't be normalized
   policy:
-    command:  {}
+    command:
     gravity_multistep: {steps: 4, noise_std: 0.05}
     joint_pos_multistep: {steps: 4, noise_std: 0.05}
     joint_vel_multistep: {steps: 4, noise_std: 0.2}
     prev_actions: {steps: 2}
   # priv:
     root_linvel_b:    {yaw_only: true}
-    root_angvel_b:    {}
+    root_angvel_b:
     body_height:      {body_names: .*_foot}
+    # applied_torque:   {}
+    # contact_indicator:  {body_names: [".*_foot", ".*_calf"]}
   # ext:
   #   external_forces:  {body_names: ["base"]}
   #   external_torques: {body_names: ["base"]}
@@ -69,8 +87,8 @@ reward:
     angvel_z_exp:       {weight: 0.8}
     angvel_xy_l2:       {weight: 0.02}
     linvel_z_l2:        {weight: 2.0}
-    base_height_exp:    {weight: 2.0, target_height: 0.35}
-  regularization:
+    quadruped_trot:     {weight: 1.0, body_names: .*_foot}
+  reg:
     energy_l1:          {weight: 0.0005}
     joint_acc_l2:       {weight: 2.5e-7}
     joint_torques_l2:   {weight: 2.0e-4}
@@ -79,7 +97,7 @@ reward:
     action_rate2_l2:    {weight: 0.002}
     feet_air_time:      {weight: 0.4, body_names: .*_foot, thres: 0.5}
     feet_sliding:       {weight: 0.2, body_names: .*_foot}
-    undesired_contact:  {body_names: [.*_calf, .*thigh, Head.*], weight: 0.25}
+    undesired_contact:  {body_names: [.*_calf, .*thigh], weight: 0.25}
   debug:
     _enabled_: false
     linvel_projection:  {weight: 0.5}
@@ -87,21 +105,21 @@ reward:
     # feet_swing_height:  {weight: 0.1, target_height: 0.1}
 
 termination:
-  max_episode_length: {}
-  crash: {body_names_expr: [Head.*, base], t_thres: 0.06}
+  crash: {body_names_expr: [base, .*_thigh], t_thres: 0.06}
   fall_over: {xy_thres: 0.9}
-  undesired_contact: {body_names: [Head.*, .*_calf]}
+  soft_contact: {body_names: [.*_calf]}
 
 randomization:
+  # random_scale: [1.0, 1.2]
   perturb_body_mass:
-    (?!(payload|base|Head.*)).*: [0.8, 1.2]
-    base: [0.8, 1.4]
+    (?!(payload|base|Head.*)).*: [0.5, 0.5]
+    base: [0.5, 0.5]
     # Head.*: [25.0, 250.0]
   # rand_body_materials:
   #   static_friction_range:  {".*_foot": [0.5, 4.0]}
   #   dynamic_friction_range: {".*_foot": [0.5, 4.0]}
   #   restitution_range:      {".*_foot": [0.0, 0.5]}
-  actuator_pd_gains:
+  motor_params:
     stiffness_range:
       .*: [0.8, 1.1]
     damping_range:

@@ -2,24 +2,16 @@ import torch
 import hydra
 import numpy as np
 import time
-import wandb
-import logging
 import os
 import datetime
 
-from typing import Sequence
-from tensordict import TensorDictBase, TensorDict
-from tensordict.nn import TensorDictModuleBase as ModBase
-
 from termcolor import colored
-from collections import OrderedDict
 from torchvision.io import write_video
 from omegaconf import OmegaConf, DictConfig
-from active_adaptation.utils.wandb import parse_checkpoint_path, parse_checkpoint, CheckpointBase
+from active_adaptation.utils.wandb import parse_checkpoint, CheckpointBase
+from active_adaptation.utils.profiling import ScopedTimer
 
 import active_adaptation
-
-# active_adaptation.import_projects()
 
 class Every:
     def __init__(self, func, steps):
@@ -53,23 +45,9 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
     else:
         raise ValueError(f"Unknown backend: {backend}")
     
-    base_env: _EnvBase = env_cls(cfg.task, str(cfg.device), headless=cfg.headless)
-
-    if checkpoint is None:
-        checkpoint = parse_checkpoint(cfg.checkpoint_path)
-    if checkpoint is not None:
-        checkpoint.update()
-    checkpoint_path = checkpoint.get_path() if checkpoint else None
-    print(f"[Info]: Using checkpoint path: {checkpoint_path}")
-    if checkpoint_path is not None:
-        try:
-            state_dict = torch.load(checkpoint_path, weights_only=False)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load checkpoint from {checkpoint_path}: {e}")
-    else:
-        state_dict = {}
-    
-    policy_in_keys = cfg.algo.get("in_keys", ["policy", "priv"])
+    policy_in_keys = cfg.algo.get("in_keys", None)
+    if policy_in_keys is None:
+        raise ValueError("Specify `in_keys` (e.g., `policy`, `priv`) in `cfg.algo`.")
 
     for obs_group_key in list(cfg.task.observation.keys()):
         if (
@@ -78,6 +56,19 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
         ):
             cfg.task.observation.pop(obs_group_key)
             print(colored(f"Discard obs group {obs_group_key} as it is not used.", "yellow"))
+    
+    base_env = env_cls(cfg.task, str(cfg.device), headless=cfg.headless)
+
+    if checkpoint is None:
+        checkpoint = parse_checkpoint(cfg.checkpoint_path)
+    if checkpoint is not None:
+        checkpoint.update()
+    checkpoint_path = checkpoint.get_path() if checkpoint else None
+    print(f"[Info]: Using checkpoint from: {checkpoint_path}")
+    if checkpoint_path is not None:
+        state_dict = torch.load(checkpoint_path, weights_only=False)
+    else:
+        state_dict = {}
     
     transform = Compose(InitTracker(), StepCounter())
 
@@ -137,7 +128,7 @@ def evaluate(
 
     inference_time = []
     torch.compiler.cudagraph_mark_step_begin()
-    with set_exploration_type(exploration_type):
+    with ScopedTimer("rollout"), set_exploration_type(exploration_type):
         for i in tqdm(range(env.max_episode_length), miniters=10):
             s = time.perf_counter()
             tensordict_ = policy(tensordict_)

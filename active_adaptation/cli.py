@@ -1,10 +1,11 @@
 import argparse
+import json
 import subprocess
 import warnings
 from pathlib import Path
 
-from .project_loading.discovery import discover_projects
-from .project_loading.manifest import PROJECTS_FILE, load_projects, save_projects
+from .project_loading.discovery import _task_dir_for_path, discover_projects
+from .project_loading.manifest import CACHE_DIR, PROJECTS_FILE, load_projects, save_projects
 
 
 def aa_pull():
@@ -12,6 +13,9 @@ def aa_pull():
     Runs `git pull` for active-adaptation and all projects discovered and listed in `projects.json`.
 
     If `--all` is passed, it will pull all projects, including inactive ones.
+
+    Returns:
+        bool: True if all pulls succeeded, False otherwise.
     """
     parser = argparse.ArgumentParser(description="Update all projects")
     parser.add_argument(
@@ -42,16 +46,6 @@ def aa_pull():
             warnings.warn(
                 f"Failed to pull {project_path} with result: {result.returncode}"
             )
-            print(result.stderr)
-
-
-def _task_dir_for_path(project_path: Path) -> Path | None:
-    """Return cfg/task directory for a project path, or None if not found."""
-    for candidate in (project_path, project_path.parent, project_path.parent.parent):
-        task_dir = candidate / "cfg" / "task"
-        if task_dir.is_dir():
-            return task_dir
-    return None
 
 
 def aa_discover_projects(enabled: bool = False):
@@ -64,6 +58,58 @@ def aa_discover_projects(enabled: bool = False):
     save_projects(projects)
     print(f"Modify {PROJECTS_FILE} to enable/disable projects.")
     return projects
+
+
+def aa_project():
+    """
+    Enable or disable a logical project in projects.json.
+
+    The same entry-point name may appear under \"environment\" and/or \"learning\";
+    both parts are updated together when present.
+    """
+    parser = argparse.ArgumentParser(
+        description="Enable or disable a project (environment and/or learning manifest entries)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    for cmd, help_text in (
+        ("enable", "Turn the project on for imports and aa-pull (default scope)"),
+        ("disable", "Turn the project off"),
+    ):
+        p = sub.add_parser(cmd, help=help_text)
+        p.add_argument(
+            "name",
+            metavar="NAME",
+            help="Entry-point name as in projects.json (e.g. same as pyproject entry point name)",
+        )
+    args = parser.parse_args()
+    name = args.name.strip()
+    if not name:
+        raise SystemExit("Project name must be non-empty.")
+
+    projects = load_projects()
+    env = projects.setdefault("environment", {})
+    learning = projects.setdefault("learning", {})
+    in_env = name in env
+    in_learning = name in learning
+
+    if not in_env and not in_learning:
+        raise SystemExit(
+            f"Unknown project {name!r}: not in environment or learning manifest. "
+            f"Run aa-discover-projects first."
+        )
+
+    enabled = args.command == "enable"
+    updated: list[str] = []
+    if in_env:
+        env[name]["enabled"] = enabled
+        updated.append("environment")
+    if in_learning:
+        learning[name]["enabled"] = enabled
+        updated.append("learning")
+
+    save_projects(projects)
+    state = "enabled" if enabled else "disabled"
+    print(f"Project {name!r} {state} ({', '.join(updated)}).")
 
 
 def aa_list_tasks():
@@ -95,3 +141,190 @@ def aa_list_tasks():
             rel = yaml_path.relative_to(task_dir)
             task_id = str(rel.with_suffix("")).replace("\\", "/")
             print(f"  {task_id}  (from {source_name})")
+
+
+def aa_recent_commands(n: int = 5):
+    """
+    List the n most recent commands (training runs / entry-point invocations)
+    from the stored command history. Optionally filter by script name.
+    """
+    parser = argparse.ArgumentParser(description="List recent commands")
+    parser.add_argument(
+        "-n", "--num",
+        type=int,
+        default=5,
+        help="Number of recent commands to show (default: 5)",
+    )
+    parser.add_argument(
+        "-s", "--script",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Filter by script name (e.g. train_ppo, eval_run). Can be given multiple times (OR).",
+    )
+    args = parser.parse_args()
+    n = max(1, args.num)
+    script_filters = args.script
+
+    history_file = CACHE_DIR / "command_history.json"
+    if not history_file.exists():
+        print("No command history found.")
+        return
+
+    history = json.loads(history_file.read_text())
+
+    # Apply script filter: keep entries whose command line matches any of the script names
+    if script_filters:
+        filtered = []
+        for entry in history:
+            cmd = entry.get("args", [])
+            line = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if any(s in line for s in script_filters):
+                filtered.append(entry)
+        history = filtered
+
+    recent = history[-n:]
+    if not recent:
+        print("No command history found." if not script_filters else "No matching commands found.")
+        return
+
+    title = f"Last {len(recent)} command(s)"
+    if script_filters:
+        title += f" (script: {' | '.join(script_filters)})"
+    print(f"\n{title}:\n")
+    for i, entry in enumerate(reversed(recent), start=1):
+        ts = entry.get("timestamp", "?")
+        cmd = entry.get("args", [])
+        line = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        print(f"  {i}. [{ts}]")
+        print(f"     {line}")
+        print()
+
+
+def aa_create_project():
+    """
+    Create a new active-adaptation project scaffold: packages {name}/ and {name}_learning/,
+    pyproject.toml with entry points, cfg/task and cfg/exp, README, and .gitignore.
+    Usage: aa-create-project -n myproject [-d /path/to/parent]
+    """
+    parser = argparse.ArgumentParser(
+        description="Create a new active-adaptation project scaffold",
+    )
+    parser.add_argument(
+        "-n", "--name",
+        required=True,
+        metavar="NAME",
+        help="Project/package name (e.g. myproject → myproject/ and myproject_learning/)",
+    )
+    parser.add_argument(
+        "-d", "--dir",
+        default=".",
+        metavar="PATH",
+        help="Parent directory in which to create the project folder (default: current directory)",
+    )
+    args = parser.parse_args()
+
+    name = args.name.strip()
+    if not name.replace("_", "").isalnum():
+        raise SystemExit("Project name must be alphanumeric (and underscores only).")
+    if name != name.lower():
+        raise SystemExit("Project name must be lowercase.")
+
+    parent = Path(args.dir).resolve()
+    root: Path = parent / name
+    if root.exists():
+        raise SystemExit(f"Directory already exists: {root}")
+
+    root.mkdir(parents=True, exist_ok=True)
+
+    # pyproject.toml
+    pyproject = f'''[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{name}"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "active_adaptation",
+]
+
+[project.entry-points."active_adaptation.projects"]
+{name} = "{name}"
+
+[project.entry-points."active_adaptation.learning"]
+{name} = "{name}_learning"
+
+[tool.setuptools.package-data]
+"*" = ["**/*"]
+'''
+    (root / "pyproject.toml").write_text(pyproject)
+
+    # Main package
+    pkg_dir: Path = root / "src" / name
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text(
+        f"# {name} environment package. Register tasks and assets here.\n"
+    )
+
+    # Learning package
+    learning_dir = root / "src" / f"{name}_learning"
+    learning_dir.mkdir(parents=True)
+    (learning_dir / "__init__.py").write_text(
+        "# Learning scripts and entry points.\n"
+    )
+
+    # cfg/task and cfg/exp
+    (root / "cfg" / "task").mkdir(parents=True)
+    (root / "cfg" / "task" / ".gitkeep").write_text("")
+    (root / "cfg" / "exp").mkdir(parents=True)
+    (root / "cfg" / "exp" / ".gitkeep").write_text("")
+
+    # README and .gitignore: do not overwrite if present (e.g. existing git repo)
+    readme_path = root / "README.md"
+    gitignore_path = root / ".gitignore"
+    if not readme_path.exists():
+        readme_path.write_text(
+            f"# {name}\n\nActive-adaptation project. Add tasks under `cfg/task/`, experiments under `cfg/exp/`.\n"
+        )
+    else:
+        print(f"  (kept existing README.md)")
+    if not gitignore_path.exists():
+        gitignore_path.write_text("""# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+
+# robot assets
+*.usd
+*.xml
+*.urdf
+
+""")
+    else:
+        print(f"  (kept existing .gitignore)")
+
+    print(f"Created project at: {root}")
+    print(f"  - {name}/")
+    print(f"  - {name}_learning/")
+    print(f"  - pyproject.toml")
+    print(f"  - cfg/task/, cfg/exp/")
+    print(f"  - README.md, .gitignore")

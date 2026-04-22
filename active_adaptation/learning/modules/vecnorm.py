@@ -88,6 +88,11 @@ class VecNorm(nn.Module):
         else:
             sum_ = input_vector
             ssq_ = input_vector.square()
+        # Keep running-stat updates in buffer dtype (float32 by default).
+        # This avoids in-place dtype mismatches for fp16/bf16 inputs and is
+        # numerically safer for long-horizon accumulation.
+        sum_ = sum_.to(self.sum.dtype)
+        ssq_ = ssq_.to(self.ssq.dtype)
         if self.decay < 1.0:
             self.count.mul_(self.decay).add_(input_vector.shape[0])
             self.sum.mul_(self.decay).add_(sum_.sum(0))

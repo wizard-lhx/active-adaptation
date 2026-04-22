@@ -1,12 +1,14 @@
-import os
 from pathlib import Path
+from active_adaptation import ROBOT_MODEL_DIR
 from active_adaptation.assets.asset_cfg import (
     AssetCfg,
     InitialStateCfg,
     ActuatorCfg,
     ContactSensorCfg,
+    MjlabCollisionCfg,
 )
 from active_adaptation.registry import Registry
+from active_adaptation.utils.symmetry import mirrored
 
 registry = Registry.instance()
 
@@ -43,41 +45,27 @@ UNITREE_GO2_CFG = AssetCfg(
             armature=0.01,
         ),
     },
-    joint_symmetry_mapping = { 
+    joint_symmetry_mapping = mirrored({ 
         "FL_hip_joint": (-1, "FR_hip_joint"),
-        "FR_hip_joint": (-1, "FL_hip_joint"),
         "RL_hip_joint": (-1, "RR_hip_joint"),
-        "RR_hip_joint": (-1, "RL_hip_joint"),
         "FL_thigh_joint": (1, "FR_thigh_joint"),
-        "FR_thigh_joint": (1, "FL_thigh_joint"),
         "RL_thigh_joint": (1, "RR_thigh_joint"),
-        "RR_thigh_joint": (1, "RL_thigh_joint"),
         "FL_calf_joint": (1, "FR_calf_joint"),
-        "FR_calf_joint": (1, "FL_calf_joint"),
         "RL_calf_joint": (1, "RR_calf_joint"),
-        "RR_calf_joint": (1, "RL_calf_joint")
-    },
-    spatial_symmetry_mapping = {
+    }),
+    spatial_symmetry_mapping = mirrored({
         "FL_hip": "FR_hip",
-        "FR_hip": "FL_hip",
         "RL_hip": "RR_hip",
-        "RR_hip": "RL_hip",
         "FL_thigh": "FR_thigh",
-        "FR_thigh": "FL_thigh",
         "RL_thigh": "RR_thigh",
-        "RR_thigh": "RL_thigh",
         "FL_calf": "FR_calf",
-        "FR_calf": "FL_calf",
         "RL_calf": "RR_calf",
-        "RR_calf": "RL_calf",
         "FL_foot": "FR_foot",
-        "FR_foot": "FL_foot",
         "RL_foot": "RR_foot",
-        "RR_foot": "RL_foot",
         "base": "base",
         "Head_upper": "Head_upper",
         "Head_lower": "Head_lower",
-    },
+    }),
     sensors_isaaclab=[
         ContactSensorCfg(
             name="contact_forces",
@@ -189,10 +177,9 @@ UNITREE_B1Z1_CFG = AssetCfg(
 )
 registry.register("asset", "b1z1", UNITREE_B1Z1_CFG)
 
-
 UNITREE_A2_CFG = AssetCfg(
-    mjcf_path=FILE_DIR / "a2" / "a2.xml",
-    usd_path=FILE_DIR / "a2" / "a2.usd",
+    mjcf_path=ROBOT_MODEL_DIR / "a2" / "a2.xml",
+    usd_path=ROBOT_MODEL_DIR / "a2" / "a2.usd",
     init_state=InitialStateCfg(
         pos=(0.0, 0.0, 0.6),
         joint_pos={
@@ -208,47 +195,33 @@ UNITREE_A2_CFG = AssetCfg(
     actuators={
         "base_legs": ActuatorCfg(
             joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            effort_limit=80.0,
+            effort_limit=120.0,
             velocity_limit=30.0,
-            stiffness=40.0,
-            damping=1.0,
+            stiffness=50.0,
+            damping=2.0,
             friction=0.01,
             armature=0.01,
         ),
     },
-    joint_symmetry_mapping={
+    joint_symmetry_mapping = mirrored({ 
         "FL_hip_joint": (-1, "FR_hip_joint"),
-        "FR_hip_joint": (-1, "FL_hip_joint"),
         "RL_hip_joint": (-1, "RR_hip_joint"),
-        "RR_hip_joint": (-1, "RL_hip_joint"),
         "FL_thigh_joint": (1, "FR_thigh_joint"),
-        "FR_thigh_joint": (1, "FL_thigh_joint"),
         "RL_thigh_joint": (1, "RR_thigh_joint"),
-        "RR_thigh_joint": (1, "RL_thigh_joint"),
         "FL_calf_joint": (1, "FR_calf_joint"),
-        "FR_calf_joint": (1, "FL_calf_joint"),
         "RL_calf_joint": (1, "RR_calf_joint"),
-        "RR_calf_joint": (1, "RL_calf_joint"),
-    },
-    spatial_symmetry_mapping={
+    }),
+    spatial_symmetry_mapping = mirrored({
         "FL_hip": "FR_hip",
-        "FR_hip": "FL_hip",
         "RL_hip": "RR_hip",
-        "RR_hip": "RL_hip",
         "FL_thigh": "FR_thigh",
-        "FR_thigh": "FL_thigh",
         "RL_thigh": "RR_thigh",
-        "RR_thigh": "RL_thigh",
         "FL_calf": "FR_calf",
-        "FR_calf": "FL_calf",
         "RL_calf": "RR_calf",
-        "RR_calf": "RL_calf",
         "FL_foot": "FR_foot",
-        "FR_foot": "FL_foot",
         "RL_foot": "RR_foot",
-        "RR_foot": "RL_foot",
         "base_link": "base_link",
-    },
+    }),
     sensors_isaaclab=[
         ContactSensorCfg(
             name="contact_forces",
@@ -265,6 +238,25 @@ UNITREE_A2_CFG = AssetCfg(
             secondary=[],
             track_air_time=True,
             history_length=3,
+            # Use "body" not "subtree": subtree uses mjOBJ_XBODY so contacts on
+            # descendant geoms (e.g. feet) count toward ancestors (base/thigh),
+            # unlike Isaac per-link sensors; body mode matches Isaac-style behavior.
+            primary_contact_match_mode="body",
+            primary_contact_match_pattern=".*",
+            primary_contact_match_entity="robot",
+            secondary_contact_match_mode="body",
+            secondary_contact_match_pattern="terrain",
+        ),
+    ],
+    mjlab_collisions=[
+        # no self collisions
+        MjlabCollisionCfg(
+            geom_names_expr=(".*_collision",),
+            contype=0,
+            conaffinity=1,
+            condim=3,
+            priority=1,
+            friction=(0.6, 0.01, 0.01),
         ),
     ],
     body_names_simulation=[
@@ -301,4 +293,77 @@ UNITREE_A2_CFG = AssetCfg(
         "RR_calf_joint",
     ],
 )
-registry.register("asset", "a2", UNITREE_A2_CFG)
+
+
+UNITREE_B2_CFG = AssetCfg(
+    mjcf_path=ROBOT_MODEL_DIR / "b2" / "b2.xml",
+    usd_path=ROBOT_MODEL_DIR / "b2" / "b2_flattened.usda",
+    init_state=InitialStateCfg(
+        pos=(0.0, 0.0, 0.6),
+        joint_pos={
+            ".*R_hip_joint": -0.1,
+            ".*L_hip_joint": 0.1,
+            "F[L,R]_thigh_joint": 0.8,
+            "R[L,R]_thigh_joint": 1.0,
+            ".*_calf_joint": -1.5,
+        },
+        joint_vel={".*": 0.0},
+    ),
+    self_collisions=False,
+    sensors_isaaclab=[
+        ContactSensorCfg(
+            name="contact_forces",
+            primary=".*",
+            secondary=[],
+            track_air_time=True,
+            history_length=3
+        ),
+    ],
+    sensors_mjlab=[
+        ContactSensorCfg(
+            name="contact_forces",
+            primary=".*",
+            secondary=[],
+            track_air_time=True,
+            history_length=3,
+            primary_contact_match_mode="body",
+            primary_contact_match_pattern=".*",
+            primary_contact_match_entity="robot",
+            secondary_contact_match_mode="body",
+            secondary_contact_match_pattern="terrain",
+        ),
+    ],
+    actuators={
+        "base_legs": ActuatorCfg(
+            joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
+            effort_limit=200.0,
+            velocity_limit=30.0,
+            stiffness=100.0,
+            damping=2.0,
+            friction=0.01,
+            armature=0.01,
+        ),
+    },
+    joint_symmetry_mapping=mirrored({
+        "FL_hip_joint": (-1, "FR_hip_joint"),
+        "FL_thigh_joint": (1, "FR_thigh_joint"),
+        "FL_calf_joint": (1, "FR_calf_joint"),
+        "RL_hip_joint": (-1, "RR_hip_joint"),
+        "RL_thigh_joint": (1, "RR_thigh_joint"),
+        "RL_calf_joint": (1, "RR_calf_joint"),
+    }),
+    spatial_symmetry_mapping=mirrored({
+        "base_link": "base_link",
+        "FL_hip": "FR_hip",
+        "RL_hip": "RR_hip",
+        "FL_thigh": "FR_thigh",
+        "RL_thigh": "RR_thigh",
+        "FL_calf": "FR_calf",
+        "RL_calf": "RR_calf",
+        "FL_foot": "FR_foot",
+        "RL_foot": "RR_foot",
+    }),
+)
+
+registry.register("asset", "unitree_a2", UNITREE_A2_CFG)
+registry.register("asset", "unitree_b2", UNITREE_B2_CFG)

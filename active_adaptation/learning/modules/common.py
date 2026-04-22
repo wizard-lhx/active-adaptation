@@ -24,6 +24,8 @@ class MLP(nn.Module):
             - "post": Apply layer normalization after activation (post-norm).
             - None: No layer normalization.
             Defaults to "pre".
+        first_non_muon: If True, the first linear layer's weight is marked as non-Muon.
+            Defaults to False.
 
     Example:
         >>> mlp = MLP(num_units=[128, 64, 32], activation=nn.ReLU, layer_norm="pre")
@@ -36,6 +38,7 @@ class MLP(nn.Module):
         num_units: List[int],
         activation: nn.Module = nn.Mish,
         layer_norm: Literal["pre", "post", None] = "pre",
+        first_non_muon: bool = False,
     ):
         super().__init__()
         self.num_units = num_units
@@ -43,7 +46,10 @@ class MLP(nn.Module):
         self.layer_norm = layer_norm
         layers = []
         for i in range(len(num_units) - 1):
-            layers.append(nn.Linear(num_units[i], num_units[i + 1]))
+            layer = nn.Linear(num_units[i], num_units[i + 1])
+            if first_non_muon and i == 0:
+                layer.weight._non_muon = True
+            layers.append(layer)
             if layer_norm == "pre":
                 layers.append(nn.LayerNorm(num_units[i + 1]))
             layers.append(activation())

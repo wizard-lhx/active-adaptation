@@ -12,10 +12,15 @@ from torchrl.envs import EnvBase
 import active_adaptation
 import active_adaptation.envs.mdp as mdp
 import active_adaptation.utils.symmetry as symmetry_utils
-from active_adaptation.envs.adapters import SceneAdapter, SimAdapter
+from active_adaptation.envs.adapters import SimAdapter, SceneAdapter
+from active_adaptation.utils.profiling import ScopedTimer
+from active_adaptation.utils.video_recorder import (
+    VideoRecorder,
+    NullVideoRecorder,
+    IsaacVideoRecorder,
+)
 from active_adaptation.envs.utils import GroundQuery
 from active_adaptation.registry import RegistryMixin
-from active_adaptation.utils.profiling import ScopedTimer
 
 if active_adaptation.get_backend() == "isaac":
     import isaacsim.core.utils.torch as torch_utils
@@ -28,8 +33,6 @@ PROFILE_SYNC_TIMERS = os.environ.get("AA_PROFILE_SYNC_TIMERS", "0").lower() in {
     "yes",
     "on",
 }
-
-
 def parse_component_spec(name: str, cfg):
     if cfg is None or not hasattr(cfg, "items"):
         raise ValueError(f"Component '{name}' must be a mapping.")
@@ -84,6 +87,8 @@ class ObsGroup:
 
 
 class RewardGroup:
+    """Group of reward terms; per-term EMA logging lives on each :class:`~mdp.Reward`."""
+
     def __init__(
         self,
         env: "_EnvBase",
@@ -113,18 +118,23 @@ class RewardGroup:
         else:
             print_enabled = False
         for key, func in self.funcs.items():
-            reward, count = func.compute()
-            # if print_enabled:
-            #     print(f"\t{key}: {reward.mean().item():.4f}")
+            reward = func.compute()
             self.env.stats[self.name, key].add_(reward)
-            ema_sum, ema_cnt = self.env._stats_ema[self.name][key]
-            ema_sum.mul_(EMA_DECAY).add_(reward.sum())
-            ema_cnt.mul_(EMA_DECAY).add_(count)
             if func.enabled:
                 rewards.append(reward)
         if len(rewards):
-            self.rew_buf[:] = torch.cat(rewards, 1)
+            self.rew_buf = torch.cat(rewards, 1)
         return self.rew_buf.sum(dim=1, keepdim=True)
+
+    def get_ema_stats(self) -> Dict[str, float]:
+        """Flatten per-term EMA metrics (e.g. mean, optional var) for logging."""
+        result: Dict[str, float] = {}
+        for key, func in self.funcs.items():
+            mean, var = func.get_ema_stats()
+            result[key] = mean.item()
+            if var is not None:
+                result[f"{key}_var"] = var.item()
+        return result
 
 
 class _EnvBase(EnvBase, RegistryMixin):
@@ -181,7 +191,6 @@ class _EnvBase(EnvBase, RegistryMixin):
         self.input_managers: Mapping[str, mdp.Action] = OrderedDict()
         self.termination_funcs: Mapping[str, mdp.Termination] = OrderedDict()
 
-        self._stats_ema = {}
         self._enabled_reward_groups = 0
 
         self._startup_callbacks = []
@@ -246,7 +255,6 @@ class _EnvBase(EnvBase, RegistryMixin):
         for group_name, group_cfg in reward_cfg.items():
             print(f"Reward group: {group_name}")
             funcs = OrderedDict()
-            self._stats_ema[group_name] = {}
 
             group_cfg = dict(group_cfg)
             enabled = group_cfg.pop("_enabled_", True)
@@ -262,10 +270,6 @@ class _EnvBase(EnvBase, RegistryMixin):
                 funcs[rew_name] = reward
                 self._add_mdp_component(reward)
                 print(f"\t{rew_name}: \t{reward.weight:.2f}")
-                self._stats_ema[group_name][rew_name] = (
-                    torch.tensor(0.0, device=self.device),
-                    torch.tensor(0.0, device=self.device),
-                )
 
             self.reward_groups[group_name] = RewardGroup(
                 self, group_name, funcs, enabled, compile
@@ -386,11 +390,12 @@ class _EnvBase(EnvBase, RegistryMixin):
         return self.input_managers["action"]
 
     @property
-    def stats_ema(self):
+    def stats_ema(self) -> Dict[str, float]:
+        """Aggregate EMA stats from all reward groups."""
         result = {}
-        for group_key, group in self._stats_ema.items():
-            for rew_key, (sum_, cnt) in group.items():
-                result[f"reward.{group_key}/{rew_key}"] = (sum_ / cnt).item()
+        for group_key, group in self.reward_groups.items():
+            for rew_key, value in group.get_ema_stats().items():
+                result[f"reward.{group_key}/{rew_key}"] = value
         return result
 
     def _reset(
@@ -568,16 +573,43 @@ class _EnvBase(EnvBase, RegistryMixin):
     def ground(self):
         if not hasattr(self, "_ground"):
             self._ground = GroundQuery(
-                self.scene, self.backend, self.terrain_type, self.device
+                self.terrain_type, self.device, self.ground_mesh
             )
         return self._ground
 
     @property
     def ground_mesh(self):
-        return self.ground.mesh
+        """Warp ground mesh used for ray-based height queries.
+
+        The concrete mesh construction is delegated to the backend-specific
+        ``SceneAdapter`` implementations so that this environment stays
+        agnostic to how ground geometry is represented per backend.
+        """
+        return self.scene.ground_mesh
 
     def get_ground_height_at(self, pos: torch.Tensor) -> torch.Tensor:
         return self.ground.height_at(pos)
+
+    # ------------------------------------------------------------------
+    # Video recording
+    # ------------------------------------------------------------------
+    def get_recorder(self, path, enabled: bool = True) -> VideoRecorder:
+        """Return a backend-specific video recorder as a context manager.
+
+        Usage:
+            with env.get_recorder(\"video.mp4\", enabled) as rec:
+                ...
+                rec.add_frame()
+
+        For non-Isaac backends, or when ``enabled`` is False, this returns a
+        no-op recorder so call sites don't need to branch.
+        """
+        if not enabled:
+            return NullVideoRecorder()
+        if self.backend == "isaac":
+            return IsaacVideoRecorder(self, path, enabled=True)
+        # Other backends: return a no-op recorder by default.
+        return NullVideoRecorder()
 
     def _set_seed(self, seed: int = -1):
         if self.backend == "isaac":

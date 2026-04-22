@@ -1,5 +1,5 @@
 # @package task
-name: Go2Flat
+name: A2LocoManip
 
 viewer:
   resolution: [1280, 720]
@@ -7,7 +7,7 @@ viewer:
   eye: [4.0, 4.0, 4.0]
 
 robot:
-  name: go2
+  name: unitree_a2_piper
 # terrain: slopes_boxes
 terrain: plane
 
@@ -23,25 +23,30 @@ sim:
 
 input:
   action:
-    _target_: JointPosition
-    action_scaling: {.*_joint: 0.5}
-    max_delay: 1
-    alpha_range: [0.5, 1.0]
+    _target_: ConcatenatedAction
+    actions:
+      - _target_: JointPosition
+        action_scaling:
+          .*_hip_joint: 0.5
+          .*_thigh_joint: 0.5
+          .*_calf_joint: 0.5
+          arm_joint[4-8]: 0.35
+        max_delay: 1
+        alpha_range: [0.8, 0.9]
+      - _target_: JointPositionDelta
+        action_scaling:
+          arm_joint[1-3]: 0.5
+        max_delay: 1
+        alpha_range: [0.8, 0.9]
 
 command:
-  _target_: Twist
-  linvel_x_range: [-1.0, 1.6]
-  linvel_y_range: [-0.8, 0.8]
-  angvel_range:   [-2.0, 2.0]
-  yaw_stiffness_range: [0.5, 1.1]
-  use_stiffness_ratio: 0.99
-  resample_prob: 0.5
-  stand_prob: 0.08
-  target_yaw_range: 
-    - [-0.3927,  0.3927]
-    - [ 1.1781,  1.9635]
-    - [ 2.7489,  3.5343]
-    - [ 4.3197,  5.1051]
+  _target_: SingleEEFLocoManip
+  eef_body_name: gripper_base
+  # Heading-frame (x,y) offsets from root + z above terrain; tune for Piper workspace.
+  workspace_range:
+    - [0.15, 0.55]
+    - [-0.35, 0.35]
+    - [0.2, 0.75]
 
 observation:
   policy:
@@ -53,14 +58,13 @@ observation:
   # priv:
     root_linvel_b:    {yaw_only: true}
     root_angvel_b:    {}
-    body_height:      {body_names: .*_foot}
-  # ext:
-  #   external_forces:  {body_names: ["base"]}
-  #   external_torques: {body_names: ["base"]}
-  # aux_target_:
-  #   root_linvel_b:
-  #   root_angvel_b:
-    # rewards: {}
+  extero:
+    height_scan: {
+      x_range: [-1.2, 1.2],
+      y_range: [-1.0, 1.0],
+      resolution: [0.1, 0.1],
+      flatten: false,
+    }
 
 reward:
   loco:
@@ -69,7 +73,9 @@ reward:
     angvel_z_exp:       {weight: 0.8}
     angvel_xy_l2:       {weight: 0.02}
     linvel_z_l2:        {weight: 2.0}
-    base_height_exp:    {weight: 2.0, target_height: 0.35}
+    base_height_exp:    {weight: 2.0, target_height: 0.4}
+  manip:
+    eef_pos_tracking:   {weight: 1.0, track_var: true}
   regularization:
     energy_l1:          {weight: 0.0005}
     joint_acc_l2:       {weight: 2.5e-7}
@@ -79,7 +85,7 @@ reward:
     action_rate2_l2:    {weight: 0.002}
     feet_air_time:      {weight: 0.4, body_names: .*_foot, thres: 0.5}
     feet_sliding:       {weight: 0.2, body_names: .*_foot}
-    undesired_contact:  {body_names: [.*_calf, .*thigh, Head.*], weight: 0.25}
+    undesired_contact:  {body_names: [.*_calf, .*thigh], weight: 0.25}
   debug:
     _enabled_: false
     linvel_projection:  {weight: 0.5}
@@ -87,21 +93,19 @@ reward:
     # feet_swing_height:  {weight: 0.1, target_height: 0.1}
 
 termination:
-  max_episode_length: {}
-  crash: {body_names_expr: [Head.*, base], t_thres: 0.06}
+  crash: {body_names_expr: [base_link, .*hip, .*thigh], t_thres: 0.06}
   fall_over: {xy_thres: 0.9}
-  undesired_contact: {body_names: [Head.*, .*_calf]}
+  undesired_contact: {body_names: [.*_calf]}
 
 randomization:
   perturb_body_mass:
-    (?!(payload|base|Head.*)).*: [0.8, 1.2]
-    base: [0.8, 1.4]
-    # Head.*: [25.0, 250.0]
-  # rand_body_materials:
-  #   static_friction_range:  {".*_foot": [0.5, 4.0]}
-  #   dynamic_friction_range: {".*_foot": [0.5, 4.0]}
-  #   restitution_range:      {".*_foot": [0.0, 0.5]}
-  actuator_pd_gains:
+    .*: [0.8, 1.2]
+  perturb_body_materials:
+    body_names: .*_foot
+    static_friction_range:  [0.5, 3.0]
+    dynamic_friction_range: [0.5, 3.0]
+    restitution_range:      [0.0, 0.5]
+  motor_params:
     stiffness_range:
       .*: [0.8, 1.1]
     damping_range:
@@ -109,8 +113,3 @@ randomization:
   reset_joint_states_scale:
     pos_scales:
       .*: [0.8, 1.2]
-  random_joint_offset:
-    .*hip_joint: [-0.05, 0.05]
-    F[L,R]_thigh_joint: [-0.05, 0.05]
-    R[L,R]_thigh_joint: [-0.05, 0.05]
-    .*calf_joint: [-0.05, 0.05]

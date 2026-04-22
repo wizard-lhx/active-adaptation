@@ -1,7 +1,7 @@
 import time
 import torch
 from torch.utils._contextlib import _DecoratorContextManager
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 
 class ScopedTimer(_DecoratorContextManager):
@@ -98,33 +98,71 @@ class ScopedTimer(_DecoratorContextManager):
         ScopedTimer._stack.pop()
 
     @staticmethod
+    def _roots_for_summary() -> Tuple[List["ScopedTimer"], bool]:
+        """Timers with no parent are roots; fall back if _root_nodes desynced.
+
+        Returns (roots, flat) where ``flat`` means print without recursing
+        children (used when no node has parent=None).
+        """
+        if ScopedTimer._root_nodes:
+            return list(ScopedTimer._root_nodes), False
+        inferred = [t for t in ScopedTimer._instances.values() if t.parent is None]
+        if inferred:
+            return inferred, False
+        # No explicit roots (e.g. inconsistent tree): show every timer once, flat.
+        return sorted(ScopedTimer._instances.values(), key=lambda t: t.name), True
+
+    @staticmethod
     def print_summary(clear: bool = True, depth: int = 3):
-        """Print timing summary for all timers."""
+        """Print timing summary for all timers.
+
+        ``depth`` is the maximum tree depth to print (levels 0 .. depth-1). Use
+        ``depth <= 0`` for no limit (print the full tree).
+        """
         if not ScopedTimer._instances:
             print("No timers recorded.")
             return
 
-        print("\n" + "=" * 60)
-        print(f"{'Timer Name':<30} {'Count':>8} {'Total (s)':>10} {'Avg (ms)':>10}")
-        print("=" * 60)
+        roots, flat = ScopedTimer._roots_for_summary()
+        total_time = sum(r.time for r in roots)
+        print("\n" + "=" * 70)
+        print(f"{'Timer Name':<30} {'Count':>8} {'Total (s)':>10} {'Avg (ms)':>10} {'%':>8}")
+        print("=" * 70)
 
-        for root in ScopedTimer._root_nodes:
-            root.print_recursive(root, 0, clear=clear, max_depth=depth)
+        if flat:
+            for node in roots:
+                avg_ms = (node.time / node.count * 1000) if node.count > 0 else 0
+                pct = (node.time / total_time * 100) if total_time > 0 else 0.0
+                print(
+                    f"{node.name:<30} {node.count:>8} {node.time:>10.4f} {avg_ms:>10.2f} {pct:>7.1f}%"
+                )
+                if clear:
+                    node.time = 0
+                    node.count = 0
+        else:
+            eff_depth = depth if depth > 0 else -1
+            for root in roots:
+                root.print_recursive(
+                    root, 0, clear=clear, max_depth=eff_depth, total_time=total_time
+                )
 
-        print("=" * 60 + "\n")
+        print("=" * 70 + "\n")
 
-    def print_recursive(self, node: "ScopedTimer", depth: int = 0, clear: bool = True, max_depth: int = -1):
+    def print_recursive(self, node: "ScopedTimer", depth: int = 0, clear: bool = True, max_depth: int = -1, total_time: float = 0.0):
         """Recursively print timer nodes in DFS order."""
-        if depth >= max_depth:
+        # max_depth <= 0 means no limit; otherwise print while depth < max_depth.
+        if max_depth > 0 and depth >= max_depth:
             return
         indent = "  " * depth
         avg_ms = (node.time / node.count * 1000) if node.count > 0 else 0
+        pct = (node.time / total_time * 100) if total_time > 0 else 0.0
         print(
-            f"{indent}{node.name:<30} {node.count:>8} {node.time:>10.4f} {avg_ms:>10.2f}"
+            f"{indent}{node.name:<30} {node.count:>8} {node.time:>10.4f} {avg_ms:>10.2f} {pct:>7.1f}%"
         )
         if clear:
             node.time = 0
             node.count = 0
 
         for child in node.children:
-            self.print_recursive(child, depth + 1, clear=clear, max_depth=max_depth)
+            self.print_recursive(child, depth + 1, clear=clear, max_depth=max_depth, total_time=total_time)
+

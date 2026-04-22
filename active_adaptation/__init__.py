@@ -4,6 +4,9 @@ import json
 import datetime
 import builtins
 import inspect
+import importlib
+import warp as wp
+
 from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 from fractions import Fraction
@@ -82,6 +85,7 @@ if is_distributed():
 CONFIG_PATH = Path(__file__).parent.parent / "cfg"
 ASSET_PATH = Path(__file__).parent / "assets"
 SCRIPT_PATH = Path(__file__).parent.parent / "scripts"
+ROBOT_MODEL_DIR = CACHE_DIR / "aa-robot-models"
 
 
 def set_backend(backend: str):
@@ -121,6 +125,8 @@ def init(cfg: DictConfig, auto_rank: bool):
         auto_rank: Whether to automatically modify `cfg.device` according to the local rank.
     """
 
+    wp.init()
+
     # Store sys.argv to a local file
     if is_main_process():
         argv_file = CACHE_DIR / "command_history.json"
@@ -132,7 +138,11 @@ def init(cfg: DictConfig, auto_rank: bool):
         history.append(entry)
         argv_file.write_text(json.dumps(history, indent=2))
 
-    set_backend(cfg["backend"])
+    set_backend(cfg.backend)
+    if _BACKEND == "mjlab":
+        cfg.device = "cuda"  # force to use GPU for mjlab
+    elif _BACKEND == "mujoco":
+        cfg.device = "cpu"  # force to use CPU for mujoco
 
     if auto_rank and (str(cfg.device) == "cuda"):
         cfg.device = f"cuda:{get_local_rank()}"
@@ -146,7 +156,6 @@ def init(cfg: DictConfig, auto_rank: bool):
                 backend="nccl",
                 # world_size=get_world_size(),
                 # rank=get_local_rank(),
-                # device_id=torch.device(cfg.device)
                 init_method="env://",
             )
 
