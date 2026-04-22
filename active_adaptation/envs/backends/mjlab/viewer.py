@@ -32,6 +32,7 @@ class MjLabViewer:
             self.env.num_envs,
         )
         self._scene.debug_visualization_enabled = True
+        self._scene.camera_tracking_enabled = False
         self._scene.show_all_envs = True
         self._scene.env_idx = 0
 

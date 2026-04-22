@@ -68,8 +68,9 @@ class MjlabBackendEnv(_EnvBase):
                 if resolved_fields["solmix"][i] is not None:
                     geom.solmix = resolved_fields["solmix"][i]
 
-                if self.disable_other_geoms:
-                    other_geoms = set(all_geom_names).difference(geom_subset)
+            other_geoms = ()
+            if self.disable_other_geoms:
+                other_geoms = set(all_geom_names).difference(geom_subset)
                 for geom_name in other_geoms:
                     geom = spec.geom(geom_name)
                     disable_collision(geom)

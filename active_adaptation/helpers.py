@@ -4,10 +4,11 @@ import numpy as np
 import time
 import os
 import datetime
+import imageio.v2 as imageio
 
 from termcolor import colored
-from torchvision.io import write_video
 from omegaconf import OmegaConf, DictConfig
+from tensordict import TensorDictBase
 from active_adaptation.utils.wandb import parse_checkpoint, CheckpointBase
 from active_adaptation.utils.profiling import ScopedTimer
 
@@ -164,12 +165,11 @@ def evaluate(
     # log video
     if len(frames):
         time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
-        video_array = np.stack(frames)
-        frames.clear()
         video_path = os.path.join(os.path.dirname(__file__), f"recording-{time_str}.mp4")
-        write_video(
-            video_path, video_array=video_array, fps=int(1 / env.step_dt), video_codec="h264"
-        )
+        with imageio.get_writer(video_path, fps=int(1 / env.step_dt), codec="h264") as writer:
+            for frame in frames:
+                writer.append_data(np.asarray(frame, dtype=np.uint8))
+        frames.clear()
 
     info["episode_cnt"] = episode_cnt
     return dict(sorted(info.items())), trajs, stats

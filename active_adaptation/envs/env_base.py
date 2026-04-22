@@ -18,6 +18,7 @@ from active_adaptation.utils.video_recorder import (
     VideoRecorder,
     NullVideoRecorder,
     IsaacVideoRecorder,
+    RgbArrayVideoRecorder,
 )
 from active_adaptation.envs.utils import GroundQuery
 from active_adaptation.registry import RegistryMixin
@@ -601,13 +602,16 @@ class _EnvBase(EnvBase, RegistryMixin):
                 ...
                 rec.add_frame()
 
-        For non-Isaac backends, or when ``enabled`` is False, this returns a
-        no-op recorder so call sites don't need to branch.
+        For backends with ``rgb_array`` rendering support, this returns a
+        streaming recorder. Otherwise, or when ``enabled`` is False, this
+        returns a no-op recorder so call sites don't need to branch.
         """
         if not enabled:
             return NullVideoRecorder()
         if self.backend == "isaac":
             return IsaacVideoRecorder(self, path, enabled=True)
+        if self.backend == "mjlab":
+            return RgbArrayVideoRecorder(self, path, enabled=True)
         # Other backends: return a no-op recorder by default.
         return NullVideoRecorder()
 

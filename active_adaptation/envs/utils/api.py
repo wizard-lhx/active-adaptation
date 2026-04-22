@@ -10,7 +10,31 @@ and ordering that match the asset, not an arbitrary backend layout.
 try:
     from isaaclab.utils.string import resolve_matching_names
 except (ImportError, ModuleNotFoundError):
-    from mjlab.utils.lab_api import resolve_matching_names
+    from mjlab.utils.lab_api.string import resolve_matching_names
+
+
+def _get_contact_sensor_primary_names(contact_sensor) -> list[str]:
+    """Return primary body names across Isaac Lab and mjlab contact sensors."""
+    primary_names = getattr(contact_sensor, "primary_names", None)
+    if primary_names is not None:
+        return list(primary_names)
+
+    slots = getattr(contact_sensor, "_slots", None)
+    if slots is not None:
+        names: list[str] = []
+        seen: set[str] = set()
+        for slot in slots:
+            name = getattr(slot, "primary_name", None)
+            if name is None or name in seen:
+                continue
+            names.append(name)
+            seen.add(name)
+        if names:
+            return names
+
+    raise AttributeError(
+        "Contact sensor does not expose primary_names or mjlab _slots.primary_name"
+    )
 
 
 def find_sensor_bodies(
@@ -42,7 +66,7 @@ def find_sensor_bodies(
         )[0]
     except AttributeError:
         # MjLab API
-        names = list(contact_sensor.primary_names)
+        names = _get_contact_sensor_primary_names(contact_sensor)
         body_ids = [names.index(name) for name in body_names]
     return body_ids, body_names
 
