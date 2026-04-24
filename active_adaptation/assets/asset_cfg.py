@@ -591,65 +591,6 @@ class MjlabCollisionCfg:
     """Whether to disable collision for non-matching geoms."""
 
 
-# WARNING: will be deprecated: now used in _DelayedJointAction, check projects/hdmi/hdmi/tasks/actions.py:JointPosition
-def get_input_joint_indexing(
-    input_order: Literal["isaac", "mujoco", "mjlab", "simulation"],
-    asset_cfg: AssetCfg,
-    target_joint_names: List[str],
-    device: str = "cpu",
-) -> Tuple[torch.Tensor, List[str]]:
-    if input_order == aa.get_backend() or input_order == "mujoco":
-        # aa's mujoco backend uses the same joint order as isaaclab
-        return slice(None), target_joint_names
-    if input_order not in {"isaac", "mjlab", "simulation"}:
-        raise ValueError(f"Invalid input_order: {input_order}")
-    if asset_cfg.joint_names_simulation is None:
-        raise ValueError("asset_cfg.joint_names_simulation is required")
-    source_joint_names = [name for name in asset_cfg.joint_names_simulation if name in target_joint_names]
-    if not len(source_joint_names) == len(target_joint_names):
-        raise ValueError(f"Source joint names {source_joint_names} do not match target joint names {target_joint_names}")
-    indexing = [source_joint_names.index(name) for name in target_joint_names]
-    return torch.tensor(indexing, device=device), source_joint_names
-
-# WARNING: will be deprecated: now used in joint_observation, check projects/hdmi/hdmi/tasks/observations/common.py:joint_pos_history
-def get_output_joint_indexing(
-    output_order: Literal["isaac", "mujoco", "mjlab", "simulation"],
-    asset_cfg: AssetCfg,
-    source_joint_names: List[str],
-    device: str = "cpu",
-) -> Tuple[torch.Tensor, List[str]]:
-    if output_order == aa.get_backend() or output_order == "mujoco":
-        return slice(None), source_joint_names
-    if output_order not in {"isaac", "mjlab", "simulation"}:
-        raise ValueError(f"Invalid output_order: {output_order}")
-    if asset_cfg.joint_names_simulation is None:
-        raise ValueError("asset_cfg.joint_names_simulation is required")
-    target_joint_names = [name for name in asset_cfg.joint_names_simulation if name in source_joint_names]
-    if not len(target_joint_names) == len(source_joint_names):
-        raise ValueError(f"Target joint names {target_joint_names} do not match source joint names {source_joint_names}")
-    indexing = [source_joint_names.index(name) for name in target_joint_names]
-    return torch.tensor(indexing, device=device), target_joint_names
-
-
-# WARNING: will be deprecated: now used in body_observation, check projects/hdmi/hdmi/tasks/observations/common.py:body_pos_b
-def get_output_body_indexing(
-    output_order: Literal["isaac", "mujoco", "mjlab", "simulation"],
-    asset_cfg: AssetCfg,
-    source_body_names: List[str],
-    device: str = "cpu",
-) -> Tuple[torch.Tensor, List[str]]:
-    if output_order == aa.get_backend() or output_order == "mujoco":
-        return slice(None), source_body_names
-    if output_order not in {"isaac", "mjlab", "simulation"}:
-        raise ValueError(f"Invalid output_order: {output_order}")
-    if asset_cfg.body_names_simulation is None:
-        raise ValueError("asset_cfg.body_names_simulation is required")
-    target_body_names = [name for name in asset_cfg.body_names_simulation if name in source_body_names]
-    if not len(target_body_names) == len(source_body_names):
-        raise ValueError(f"Target body names {target_body_names} do not match source body names {source_body_names}")
-    indexing = [source_body_names.index(name) for name in target_body_names]
-    return torch.tensor(indexing, device=device), target_body_names
-
 def sort_names_by_preferred_order(
     matched_names: Sequence[str],
     preferred_names: Sequence[str],

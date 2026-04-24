@@ -2,12 +2,10 @@ from .asset_cfg import (
     AssetCfg,
     InitialStateCfg,
     ActuatorCfg,
-    ContactSensorCfg,
-    get_input_joint_indexing,
-    get_output_joint_indexing,
-    get_output_body_indexing,
+    ContactSensorCfg
 )
 from . import quadruped
+from . import quadrupeds
 from . import humanoid
 from . import quadruped_manipulator
 

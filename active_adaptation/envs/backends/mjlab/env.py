@@ -82,7 +82,16 @@ class MjlabBackendEnv(_EnvBase):
 
         registry = Registry.instance()
         asset_cfg = cast(AssetCfg, registry.get("asset", self.cfg.robot.name))
-        sensors = tuple(sensor.mjlab() for sensor in asset_cfg.sensors_mjlab)
+        if callable(asset_cfg):
+            asset_cfg, sensors = asset_cfg(backend="mjlab")
+        elif isinstance(asset_cfg, AssetCfg):
+            asset_cfg = asset_cfg.mjlab()
+            sensors = tuple(sensor.mjlab() for sensor in asset_cfg.sensors_mjlab)
+        else:
+            raise ValueError(
+                "Asset configuration must be an instance of AssetCfg or callable, "
+                f"got {type(asset_cfg)}"
+            )
         terrain = self.cfg.get("terrain", "plane")
         self.terrain_type = terrain
 
@@ -118,7 +127,7 @@ class MjlabBackendEnv(_EnvBase):
         scene_cfg = SceneCfg(
             num_envs=self.cfg.num_envs,
             env_spacing=env_spacing,
-            entities={"robot": asset_cfg.mjlab()},
+            entities={"robot": asset_cfg},
             sensors=sensors,
             terrain=terrain_cfg,
         )
