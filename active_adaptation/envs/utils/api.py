@@ -58,16 +58,21 @@ def find_sensor_bodies(
         ``body_names``: resolved names, same semantics as :func:`find_bodies`.
     """
     _, body_names = find_bodies(asset, body_names)
-    try:
+    if hasattr(contact_sensor, "find_bodies"):
         # IsaacLab API
         body_ids = contact_sensor.find_bodies(
             body_names,
             preserve_order=True,
         )[0]
-    except AttributeError:
+    else:
         # MjLab API
         names = _get_contact_sensor_primary_names(contact_sensor)
-        body_ids = [names.index(name) for name in body_names]
+        body_ids = []
+        for name in body_names:
+            try:
+                body_ids.append(names.index(name))
+            except ValueError as e:
+                raise ValueError(f"Body name {name} not found in {names}") from e
     return body_ids, body_names
 
 

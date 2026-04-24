@@ -29,6 +29,7 @@ class Reward(Generic[CT], MDPComponent, RegistryMixin):
         self,
         env,
         weight: float,
+        *,
         enabled: bool = True,
         track_var: bool = False,
         ema_decay: float = 0.99,

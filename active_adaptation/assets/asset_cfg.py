@@ -426,6 +426,7 @@ class AssetCfg:
             spawn_cfg = sim_utils.UrdfFileCfg(
                 asset_path=str(self.usd_path),
                 fix_base=False,
+                make_instanceable=False,
                 joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
                     gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
                 ),
@@ -433,6 +434,7 @@ class AssetCfg:
                 rigid_props=rigid_props,
                 articulation_props=articulation_props,
                 collision_props=collision_props,
+                replace_cylinders_with_capsules=True,
             )
         else:
             spawn_cfg = sim_utils.UsdFileCfg(
