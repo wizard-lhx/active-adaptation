@@ -159,6 +159,21 @@ class _EnvBase(EnvBase, RegistryMixin):
         self.extra = {}
         self._startup_done = False
 
+    @property
+    def max_episode_length(self) -> torch.Tensor:
+        return self._max_episode_length
+
+    @max_episode_length.setter
+    def max_episode_length(self, value: int | torch.Tensor):
+        if isinstance(value, int):
+            value = torch.full((self.num_envs, 1), value, device=self.device)
+        elif isinstance(value, torch.Tensor):
+            assert value.dtype == torch.long, "Max episode length must be an integer tensor"
+            assert value.shape == (self.num_envs, 1), "Max episode length must be a tensor of shape (num_envs, 1)"
+        else:
+            raise ValueError(f"Invalid type for max episode length: {type(value)}")
+        self._max_episode_length = value.to(self.device)
+
     # ---------------------------------------------------------------------
     # Initialization helpers
     # ---------------------------------------------------------------------
@@ -171,11 +186,11 @@ class _EnvBase(EnvBase, RegistryMixin):
             warnings.warn(
                 "Terrain type is not set. Please check if the scene is properly initialized."
             )
-        self.max_episode_length = int(self.cfg.max_episode_length)
         self.step_dt = float(self.cfg.sim.step_dt)
         self.physics_dt = float(self.sim.get_physics_dt())
         self.decimation = int(self.step_dt / self.physics_dt)
 
+        self.max_episode_length = int(self.cfg.max_episode_length)
         self.episode_length_buf = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -459,13 +474,7 @@ class _EnvBase(EnvBase, RegistryMixin):
                     with ScopedTimer("scene.update", sync=PROFILE_SYNC_TIMERS):
                         self.scene.update(self.physics_dt)
                     with ScopedTimer("post_step_callbacks", sync=False):
-                        for callback_idx, callback in enumerate(self._post_step_callbacks):
-                            timer_name = (
-                                f"post_step_callbacks.{callback_idx:02d}."
-                                f"{self._callback_label(callback)}"
-                            )
-                            with ScopedTimer(timer_name, sync=False):
-                                callback(substep)
+                        [callback(substep) for callback in self._post_step_callbacks]
             # TODO: test if this is needed
             # if self.backend == "mjlab":
             #     with ScopedTimer("simulation_forward", sync=PROFILE_SYNC_TIMERS):
@@ -530,10 +539,9 @@ class _EnvBase(EnvBase, RegistryMixin):
         if self.mult_dt:
             rewards *= self.step_dt
 
-        self.stats["episode_len"][:] = self.episode_length_buf.unsqueeze(1)
+        self.stats["episode_len"][:] = self.episode_length_buf.reshape(self.num_envs, 1)
         self.stats["success"][:] = (
-            (self.episode_length_buf >= self.max_episode_length * 0.9)
-            .unsqueeze(1)
+            (self.episode_length_buf.reshape(self.num_envs, 1) >= self.max_episode_length * 0.9)
             .float()
         )
         tensordict.set("reward", rewards)

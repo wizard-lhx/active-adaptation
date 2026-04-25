@@ -20,7 +20,10 @@ class max_episode_length(Termination):
         super().__init__(env, is_timeout=True)
 
     def compute(self, termination: torch.Tensor):
-        return self.env.episode_length_buf[:, None] >= self.env.max_episode_length
+        cur_length = self.env.episode_length_buf.reshape(self.num_envs, 1)
+        max_length = self.env.max_episode_length
+        return cur_length >= max_length
+
 
 class crash(Termination):
     """
