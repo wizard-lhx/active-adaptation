@@ -124,10 +124,10 @@ class BufferCollector:
 
 @hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
 def main(cfg: DictConfig):
+    aa.init(cfg, auto_rank=True)
+
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
-
-    aa.init(cfg, auto_rank=True)
 
     print(
         f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"

@@ -25,21 +25,21 @@ class Reward(Generic[CT], MDPComponent, RegistryMixin):
         ema_decay: The decay rate of the EMA.
     """
 
+    _ema_decay: float = 0.99
+
     def __init__(
         self,
         env,
         weight: float,
         *,
         enabled: bool = True,
-        track_var: bool = False,
-        ema_decay: float = 0.99,
+        track_var: bool = False
     ):
         super().__init__(env)
         self.command_manager: CT = env.command_manager
         self.weight = weight
         self.enabled = enabled
         self.track_var = track_var
-        self._ema_decay = float(ema_decay)
         d = self.device
         self._ema_sum = torch.zeros(1, device=d)
         self._ema_cnt = torch.zeros(1, device=d)

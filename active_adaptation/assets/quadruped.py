@@ -366,4 +366,4 @@ UNITREE_B2_CFG = AssetCfg(
 )
 
 # registry.register("asset", "unitree_a2", UNITREE_A2_CFG)
-registry.register("asset", "unitree_b2", UNITREE_B2_CFG)
+# registry.register("asset", "unitree_b2", UNITREE_B2_CFG)
