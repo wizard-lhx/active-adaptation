@@ -80,11 +80,11 @@ class IsaacBackendEnv(_EnvBase):
         from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 
         for obj_name, spec in self.cfg.get("objects", {}).items():
-            obj_cfg = registry.get("asset", spec.name)
-            if not isinstance(obj_cfg, (ArticulationCfg, RigidObjectCfg)):
-                obj_cfg = obj_cfg.isaaclab()
-            obj_cfg.prim_path = "{ENV_REGEX_NS}/" + obj_name
-            setattr(scene_cfg, obj_name, obj_cfg)
+            fn = registry.get("asset", spec.pop("_target_"))
+            cfg = fn(backend="isaaclab", **spec)
+            assert isinstance(cfg, (ArticulationCfg, RigidObjectCfg)), f"Asset configuration must be an instance of ArticulationCfg or RigidObjectCfg, got {type(cfg)}"
+            cfg.prim_path = "{ENV_REGEX_NS}/" + obj_name
+            setattr(scene_cfg, obj_name, cfg)
 
         sim_cfg = sim_utils.SimulationCfg(
             dt=self.cfg.sim.isaac_physics_dt,
