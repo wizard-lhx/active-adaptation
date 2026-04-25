@@ -426,6 +426,10 @@ class AssetCfg:
             spawn_cfg = sim_utils.UrdfFileCfg(
                 asset_path=str(self.usd_path),
                 fix_base=False,
+                replace_cylinders_with_capsules=True,
+                self_collision=self.self_collisions,
+                make_instanceable=False,
+                force_usd_conversion=True,
                 joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
                     gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
                 ),
@@ -687,4 +691,3 @@ def to_simulation_body_order(
     if preferred_body_names is None:
         return list(body_names)
     return sort_names_by_preferred_order(body_names, preferred_body_names)
-

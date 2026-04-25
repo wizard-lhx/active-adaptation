@@ -192,8 +192,9 @@ class motor_params_implicit(Randomization):
             low, high = (
                 torch.tensor(value, device=self.device) * self.stiffness_default.unsqueeze(1)
             ).unbind(1)
+            self._validate_log_uniform_range("stiffness_range", low, high)
             self.stiffness_low = low
-            self.stiffness_scale = high - low
+            self.stiffness_high = high
 
         if self.damping_range is not None:
             ids, _, value = string_utils.resolve_matching_names_values(
@@ -204,17 +205,22 @@ class motor_params_implicit(Randomization):
             low, high = (
                 torch.tensor(value, device=self.device) * self.damping_default.unsqueeze(1)
             ).unbind(1)
+            self._validate_log_uniform_range("damping_range", low, high)
             self.damping_low = low
-            self.damping_scale = high - low
+            self.damping_high = high
 
         if self.armature_range is not None:
             ids, _, value = string_utils.resolve_matching_names_values(
                 self.armature_range, self.asset.joint_names
             )
             self.armature_id = torch.tensor(ids, device=self.device)
-            low, high = torch.tensor(value, device=self.device).unbind(1)
-            self.armature_low = low
-            self.armature_scale = high - low
+            self.armature_default = self.asset.data.default_joint_armature[0, self.armature_id]
+            armature_low, armature_high = torch.tensor(value, device=self.device).unbind(1)
+            self._validate_log_uniform_range(
+                "armature_range", armature_low, armature_high
+            )
+            self.armature_low = armature_low
+            self.armature_high = armature_high
 
         if self.friction_range is not None:
             ids, _, value = string_utils.resolve_matching_names_values(
@@ -340,11 +346,10 @@ class motor_params_implicit(Randomization):
             if self.armature_range is None:
                 return
             env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
-            armature = (
-                torch.rand(self.num_envs, len(self.armature_id), device=self.device)
-                * self.armature_scale
-                + self.armature_low
+            armature_scale = self._rand_log_uniform(
+                self.num_envs, self.armature_low, self.armature_high
             )
+            armature = self.armature_default.unsqueeze(0) * armature_scale
             self.asset.write_joint_armature_to_sim(armature, self.armature_id, env_ids)
 
     def reset(self, env_ids):
@@ -372,18 +377,14 @@ class motor_params_implicit(Randomization):
                 self.model.dof_frictionloss[env_ids.unsqueeze(1), self.friction_dof_ids] = friction
         elif self.env.backend == "isaac":
             if self.stiffness_range is not None:
-                stiffness = (
-                    torch.rand(len(env_ids), len(self.stiffness_id), device=self.device)
-                    * self.stiffness_scale
-                    + self.stiffness_low
+                stiffness = self._rand_log_uniform(
+                    len(env_ids), self.stiffness_low, self.stiffness_high
                 )
                 self.asset.write_joint_stiffness_to_sim(stiffness, self.stiffness_id, env_ids)
 
             if self.damping_range is not None:
-                damping = (
-                    torch.rand(len(env_ids), len(self.damping_id), device=self.device)
-                    * self.damping_scale
-                    + self.damping_low
+                damping = self._rand_log_uniform(
+                    len(env_ids), self.damping_low, self.damping_high
                 )
                 self.asset.write_joint_damping_to_sim(damping, self.damping_id, env_ids)
 
@@ -732,7 +733,6 @@ class perturb_body_com(Randomization):
                 self.pos_ranges[:, 0].unsqueeze(0).unsqueeze(-1).expand_as(coms[:, self.body_ids, :3]),
                 self.pos_ranges[:, 1].unsqueeze(0).unsqueeze(-1).expand_as(coms[:, self.body_ids, :3])
             )
-            rand_sample[:, :, 0] *= 0.5
             coms[:, self.body_ids, :3] += rand_sample.to('cpu')
             indices = torch.arange(self.asset.num_instances)
             self.asset.root_physx_view.set_coms(coms, indices)
