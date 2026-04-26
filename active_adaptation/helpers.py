@@ -129,8 +129,9 @@ def evaluate(
 
     inference_time = []
     torch.compiler.cudagraph_mark_step_begin()
+    max_episode_length = env.cfg.max_episode_length
     with ScopedTimer("rollout"), set_exploration_type(exploration_type):
-        for i in tqdm(range(env.max_episode_length), miniters=10):
+        for i in tqdm(range(max_episode_length), miniters=10):
             s = time.perf_counter()
             tensordict_ = policy(tensordict_)
             e = time.perf_counter()

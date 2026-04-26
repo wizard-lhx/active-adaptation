@@ -142,10 +142,7 @@ def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     Raises:
         ValueError: Input shapes of ``q1`` and ``q2`` are not matching.
     """
-    # check input is correct
-    if q1.shape != q2.shape:
-        msg = f"Expected input quaternion shape mismatch: {q1.shape} != {q2.shape}."
-        raise ValueError(msg)
+    q1, q2 = torch.broadcast_tensors(q1, q2)
     # reshape to (N, 4) for multiplication
     shape = q1.shape
     q1 = q1.reshape(-1, 4)
