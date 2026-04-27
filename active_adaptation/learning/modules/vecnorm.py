@@ -76,9 +76,16 @@ class VecNorm(nn.Module):
     def forward(self, input_vector: torch.Tensor):
         if not self.FROZEN:
             self._update(input_vector)
+        return self._normalize(input_vector)
+
+    def _normalize(self, input_vector: torch.Tensor):
         mean, std = self._compute()
         return (input_vector - mean) / std
-    
+
+    def denormalize(self, input_vector: torch.Tensor):
+        mean, std = self._compute()
+        return input_vector * std + mean
+
     def _update(self, input_vector: torch.Tensor):
         input_vector = input_vector.reshape(-1, *self.input_shape)
         if len(self.reduction_dims):
