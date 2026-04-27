@@ -111,8 +111,8 @@ def make_isaaclab_cfg(self_collisions: bool = False):
         actuators={
             "base_legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                effort_limit=120.0,
-                velocity_limit=30.0,
+                effort_limit_sim=120.0,
+                velocity_limit_sim=30.0,
                 stiffness=50.0,
                 damping=2.0,
                 friction=0.01,
