@@ -85,8 +85,8 @@ class MjlabBackendEnv(_EnvBase):
         if callable(asset_cfg):
             asset_cfg, sensors = asset_cfg(backend="mjlab")
         elif isinstance(asset_cfg, AssetCfg):
-            asset_cfg = asset_cfg.mjlab()
             sensors = tuple(sensor.mjlab() for sensor in asset_cfg.sensors_mjlab)
+            asset_cfg = asset_cfg.mjlab()
         else:
             raise ValueError(
                 "Asset configuration must be an instance of AssetCfg or callable, "
