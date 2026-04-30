@@ -54,8 +54,10 @@ class SACConfig:
     gamma: float = 0.99
     utd_ratio: int = 4
     # network sizes
-    critic_batch_size: int = 1024
-    actor_batch_size: int = 512
+    critic_batch_size: int = 2048
+    actor_batch_size: int = 1024
+    # target smoothing
+    target_action_noise: float = 0.01
 
     tau_actor: float = 0.1
     tau_Q: float = 0.2  # a relatively large value for faster convergence
@@ -278,7 +280,7 @@ class SAC(TensorDictModuleBase):
         with torch.no_grad():
             dist, _ = self.actor_target(next_obs)
             next_action = dist.sample()
-
+            next_action = next_action + torch.randn_like(next_action) * self.cfg.target_action_noise
             target_qs = self.Q_target(next_obs, next_action)
             td_target: torch.Tensor = reward + discount * target_qs.mean(dim=-1, keepdim=True)
 
