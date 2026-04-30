@@ -67,6 +67,13 @@ class MLP(nn.Module):
             Output tensor of shape (..., output_dim) where output_dim is num_units[-1].
         """
         return self.layers(x)
+    
+    def orth(self, gain: float = 1.0) -> "MLP":
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain)
+                nn.init.zeros_(module.bias)
+        return self
 
 
 class ResidualMLP(nn.Module):
