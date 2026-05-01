@@ -133,8 +133,8 @@ class TanhNormalActor(nn.Module):
         self.trunk.apply(_init_sac_linear)
         self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
         
-        # self.action_scales: torch.Tensor
-        # self.register_buffer("action_scales", torch.ones(act_dim))
+        self.upscale: torch.Tensor
+        self.register_buffer("upscale", torch.ones(act_dim))
         
         if not std_max > 0.0:
             raise ValueError("std_max must be positive")
@@ -144,7 +144,7 @@ class TanhNormalActor(nn.Module):
         feat = self.trunk(obs)
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
-        dist = TanhNormal(mean, torch.exp(log_std), upscale=1.0, tanh_loc=True)
+        dist = TanhNormal(mean, torch.exp(log_std), upscale=self.upscale, tanh_loc=True)
         return dist, feat
 
 
@@ -377,20 +377,6 @@ class SAC(TensorDictModuleBase):
             log_prob = dist.log_prob(action_update)
             qs = self.Q(obs, action_update)
 
-        actor_diagnostics = {}
-        if isinstance(dist, TanhNormal):
-            eps = 0.05
-            with torch.no_grad():
-                tanh_grad = 1.0 - action_update.detach().square()
-                action_saturation = (1.0 - action_update.detach().abs() < eps).float().mean()
-                mean_saturation = (1.0 - dist.deterministic_sample.detach().abs() < eps).float().mean()
-            actor_diagnostics = {
-                "actor/action_saturation": action_saturation.item(),
-                "actor/mean_saturation": mean_saturation.item(),
-                "actor/tanh_grad": tanh_grad.mean().item(),
-                "actor/tanh_grad_min": tanh_grad.min().item(),
-            }
-
         q_value = torch.mean(qs, dim=-1)
         if isinstance(dist, IndependentNormal):
             entropy = dist.entropy()
@@ -421,6 +407,24 @@ class SAC(TensorDictModuleBase):
             "actor/entropy_std": entropy_std.item(),
             "actor/feature_norm": feature.detach().norm(dim=-1).mean().item(),
         }
+        actor_diagnostics = {}
+        if isinstance(dist, TanhNormal):
+            eps = 0.05
+            with torch.no_grad():
+                tanh_grad = 1.0 - action_update.detach().square()
+                action_saturation = (1.0 - action_update.detach().abs() < eps)
+                mean_saturation = (1.0 - dist.root_dist.mean.detach().tanh().abs() < eps)
+                # mean saturation per action dimension
+                dim_saturation = mean_saturation.float().mean(dim=0).max()
+            actor_diagnostics = {
+                "actor/action_saturation": action_saturation.float().mean().item(),
+                "actor/mean_saturation": mean_saturation.float().mean().item(),
+                "actor/max_saturation": dim_saturation.item(),
+                "actor/tanh_grad": tanh_grad.mean().item(),
+                "actor/tanh_grad_min": tanh_grad.min().item(),
+                "actor/upscale": dist.upscale.mean().item(),
+            }
+            self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
         infos.update(actor_diagnostics)
         return infos
 
