@@ -17,10 +17,7 @@ from torchrl.data import Composite, TensorSpec
 from torchrl.objectives import hold_out_net
 
 from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm
-from active_adaptation.learning.modules.distributions import (
-    TanhNormal,
-    IndependentNormal
-)
+from active_adaptation.learning.modules.distributions import IndependentNormal
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     DONE_KEY,
@@ -33,6 +30,7 @@ from active_adaptation.learning.ppo.common import (
 
 from active_adaptation.learning.offpolicy.buffer import ReplayBuffer
 from active_adaptation.learning.offpolicy.objectives import MultiStepReturn
+from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
 
 
 cs = ConfigStore.instance()
@@ -144,7 +142,7 @@ class TanhNormalActor(nn.Module):
         feat = self.trunk(obs)
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
-        dist = TanhNormal(mean, torch.exp(log_std), upscale=self.upscale, tanh_loc=True)
+        dist = ScaledTanhNormal(mean, torch.exp(log_std), upscale=self.upscale)
         return dist, feat
 
 
@@ -408,12 +406,13 @@ class SAC(TensorDictModuleBase):
             "actor/feature_norm": feature.detach().norm(dim=-1).mean().item(),
         }
         actor_diagnostics = {}
-        if isinstance(dist, TanhNormal):
+        if isinstance(dist, ScaledTanhNormal):
             eps = 0.05
             with torch.no_grad():
-                tanh_grad = 1.0 - action_update.detach().square()
-                action_saturation = (1.0 - action_update.detach().abs() < eps)
-                mean_saturation = (1.0 - dist.root_dist.mean.detach().tanh().abs() < eps)
+                tanh_grad = 1.0 - (action_update.detach() / dist.upscale).square()
+                action_saturation = (1.0 - action_update.detach().abs() / dist.upscale < eps)
+                mean_squashed = torch.tanh(dist.loc.detach() / dist.upscale) * dist.upscale
+                mean_saturation = (1.0 - mean_squashed.abs() / dist.upscale < eps)
                 # mean saturation per action dimension
                 dim_saturation = mean_saturation.float().mean(dim=0).max()
             actor_diagnostics = {
@@ -424,7 +423,7 @@ class SAC(TensorDictModuleBase):
                 "actor/tanh_grad_min": tanh_grad.min().item(),
                 "actor/upscale": dist.upscale.mean().item(),
             }
-            self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
+            # self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
         infos.update(actor_diagnostics)
         return infos
 
