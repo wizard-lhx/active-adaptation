@@ -2,7 +2,7 @@ import copy
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -16,8 +16,11 @@ from tensordict.nn import (
 from torchrl.data import Composite, TensorSpec
 from torchrl.objectives import hold_out_net
 
-from active_adaptation.learning.modules import MLP, VecNorm
-from active_adaptation.learning.modules.distributions import TanhNormal
+from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm
+from active_adaptation.learning.modules.distributions import (
+    TanhNormal,
+    IndependentNormal
+)
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     DONE_KEY,
@@ -53,13 +56,18 @@ class SACConfig:
     n_steps: int = 4
     gamma: float = 0.99
     utd_ratio: int = 4
-    # network sizes
+    # architecture
+    actor_vecnorm: Any = "pre"
+    critic_vecnorm: Any = "pre"
+    # batch sizes
     critic_batch_size: int = 2048
     actor_batch_size: int = 1024
-    # target smoothing
+    # target smoothing: this should help Q(s_t, a_t) to generalize locally around a_t
     target_action_noise: float = 0.01
+    # sac specific
+    entropy_bonus: float = 0.0
 
-    tau_actor: float = 0.1
+    tau_actor: float = 0.1 # a relatively large value for faster convergence
     tau_Q: float = 0.2  # a relatively large value for faster convergence
     lr_alpha: float = 1e-2
     max_grad_norm: float = 1.0
@@ -88,11 +96,11 @@ class TwinQNetwork(nn.Module):
         super().__init__()
         critic_input_dim = obs_dim + act_dim
         self.critic_1 = nn.Sequential(
-            MLP([critic_input_dim, 512, 512], activation, layer_norm=layer_norm),
+            ResidualMLP([critic_input_dim, 512, 512, 512], activation),
             nn.Linear(512, 1),
         )
         self.critic_2 = nn.Sequential(
-            MLP([critic_input_dim, 512, 512], activation, layer_norm=layer_norm),
+            ResidualMLP([critic_input_dim, 512, 512, 512], activation),
             nn.Linear(512, 1),
         )
         self.reset_parameters()
@@ -108,22 +116,65 @@ class TwinQNetwork(nn.Module):
         return torch.cat([q1, q2], dim=-1)
 
 
-class SACActor(nn.Module):
+class TanhNormalActor(nn.Module):
     """Policy trunk + Gaussian + tanh squash (same layout as blade_runner SAC)."""
 
-    def __init__(self, obs_dim: int, act_dim: int):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        layer_norm: str = None,
+        std_max: float = 0.5,
+        std_min: float | None = None,
+    ):
         super().__init__()
-        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=None)
+        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
         self.action = nn.Linear(256, act_dim * 2)
         self.trunk.apply(_init_sac_linear)
         self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
-        self.log_std_max = math.log(0.5)
+        
+        if not std_max > 0.0:
+            raise ValueError("std_max must be positive")
+        self.log_std_max = math.log(std_max)
 
     def forward(self, obs: torch.Tensor):
         feat = self.trunk(obs)
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
         dist = TanhNormal(mean, torch.exp(log_std), upscale=1.0)
+        return dist, feat
+
+
+class NormalActor(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        layer_norm: str = None,
+        pred_std: bool = False,
+    ):
+        super().__init__()
+        self.pred_std = pred_std
+        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
+        if self.pred_std:
+            self.action = nn.Linear(256, act_dim * 2)
+            self.log_std_max = math.log(1.0)
+        else:
+            self.action = nn.Linear(256, act_dim)
+            self.log_std = nn.Parameter(torch.zeros(act_dim))
+        self.trunk.apply(_init_sac_linear)
+        self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
+    
+    def forward(self, obs: torch.Tensor):
+        feat = self.trunk(obs)
+        if self.pred_std:
+            mean, raw = self.action(feat).chunk(2, dim=-1)
+            log_std = self.log_std_max - F.softplus(raw)
+            dist = IndependentNormal(mean, torch.exp(log_std))
+        else:
+            mean = self.action(feat)
+            log_std = torch.exp(self.log_std) * torch.ones_like(mean)
+            dist = IndependentNormal(mean, log_std)
         return dist, feat
 
 
@@ -154,7 +205,7 @@ class SAC(TensorDictModuleBase):
         else:
             self.vecnorm_obs = nn.Identity()
 
-        self.Q = TwinQNetwork(obs_dim, act_dim, layer_norm=None).to(device)
+        self.Q = TwinQNetwork(obs_dim, act_dim, layer_norm=self.cfg.critic_vecnorm).to(device)
         self.V = nn.Sequential(
             MLP([obs_dim, 512, 512], nn.SiLU),
             nn.Linear(512, 1),
@@ -162,7 +213,12 @@ class SAC(TensorDictModuleBase):
         self.V.apply(_init_sac_linear)
 
         self.gae = GAE(self.cfg.gamma, self.cfg.gae_lambda).to(device)
-        self.actor = SACActor(obs_dim, act_dim).to(device)
+        self.actor = TanhNormalActor(
+            obs_dim,
+            act_dim,
+            layer_norm=self.cfg.actor_vecnorm,
+            std_max=0.5,
+        ).to(device)
 
         self.Q_target = copy.deepcopy(self.Q).to(device)
         self.actor_target = copy.deepcopy(self.actor).to(device)
@@ -204,7 +260,7 @@ class SAC(TensorDictModuleBase):
         return policy
 
     def on_stage_start(self, stage: str):
-        pass
+        self.enable_actor = True
 
     @VecNorm.freeze()
     def train_op(self, tensordict: TensorDict):
@@ -218,6 +274,7 @@ class SAC(TensorDictModuleBase):
             # the value should converge to 1.0 in this case
             # multi-step return should significantly speed up convergence
             reward = torch.ones_like(reward) * (1.0 - self.cfg.gamma)
+            neg_rew_ratio = 0.0
         else:
             reward = reward.sum(-1, keepdim=True)
             neg_rew_ratio = (reward <= 0.).float().mean().item()
@@ -236,10 +293,12 @@ class SAC(TensorDictModuleBase):
         if len(self.rb) < self.cfg.warm_up_steps:
             return infos
 
-        for _ in range(self.cfg.utd_ratio):
+        for _ in range(self.cfg.train_every * self.cfg.utd_ratio):
             infos.update(self.train_critic())
 
-        infos.update(self.train_actor())
+        if self.enable_actor:
+            for _ in range(self.cfg.train_every):
+                infos.update(self.train_actor())
 
         if self.global_step % self.cfg.v_update_every == 0:
             for _ in range(self.cfg.v_inner):
@@ -280,9 +339,13 @@ class SAC(TensorDictModuleBase):
         with torch.no_grad():
             dist, _ = self.actor_target(next_obs)
             next_action = dist.sample()
-            next_action = next_action + torch.randn_like(next_action) * self.cfg.target_action_noise
-            target_qs = self.Q_target(next_obs, next_action)
-            td_target: torch.Tensor = reward + discount * target_qs.mean(dim=-1, keepdim=True)
+            next_log_prob = dist.log_prob(next_action)
+            target_action = next_action + torch.randn_like(next_action) * self.cfg.target_action_noise
+            target_qs = self.Q_target(next_obs, target_action)
+            target_q = target_qs.mean(dim=-1, keepdim=True)
+            alpha = self.log_alpha.exp()
+            entropy_bonus = - alpha * next_log_prob.reshape_as(target_q)
+            td_target: torch.Tensor = reward + discount * (target_q + self.cfg.entropy_bonus * entropy_bonus)
 
         qs: torch.Tensor = self.Q(obs, act)
         critic_loss = (qs - td_target).square().sum(-1).mean()
@@ -311,9 +374,25 @@ class SAC(TensorDictModuleBase):
             log_prob = dist.log_prob(action_update)
             qs = self.Q(obs, action_update)
 
+        actor_diagnostics = {}
+        if isinstance(self.actor, TanhNormalActor):
+            eps = 0.05
+            with torch.no_grad():
+                tanh_grad = 1.0 - action_update.detach().square()
+                saturation = (1.0 - action_update.detach().abs() < eps).float().mean()
+            actor_diagnostics = {
+                "actor/saturation": saturation.item(),
+                "actor/tanh_grad": tanh_grad.mean().item(),
+                "actor/tanh_grad_min": tanh_grad.min().item(),
+            }
+
         q_value = torch.mean(qs, dim=-1)
+        if isinstance(dist, IndependentNormal):
+            entropy = dist.entropy()
+        else:
+            entropy = -log_prob
         alpha = self.log_alpha.exp()
-        actor_loss = (alpha.detach() * log_prob.reshape_as(q_value) - q_value).mean()
+        actor_loss = (alpha.detach() * - entropy.reshape_as(q_value) - q_value).mean()
 
         self.opt_alpha.zero_grad(set_to_none=True)
         alpha_loss = -(alpha * (log_prob.detach() + self.target_entropy).detach()).mean()
@@ -328,9 +407,8 @@ class SAC(TensorDictModuleBase):
         self.opt_actor.step()
         soft_copy_(self.actor, self.actor_target, tau=self.cfg.tau_actor)
 
-        entropy = -log_prob.detach()
         entropy_std = entropy.std()
-        return {
+        infos = {
             "actor/loss": actor_loss.item(),
             "actor/grad_norm": actor_grad_norm.item(),
             "actor/alpha": alpha.detach().item(),
@@ -338,6 +416,8 @@ class SAC(TensorDictModuleBase):
             "actor/entropy_std": entropy_std.item(),
             "actor/feature_norm": feature.detach().norm(dim=-1).mean().item(),
         }
+        infos.update(actor_diagnostics)
+        return infos
 
     def train_v(self):
         """On-policy-style V update: last `v_trace_steps` ring-buffer rows + GAE (ppo.common layout [N, T, …])."""
@@ -395,6 +475,7 @@ class SAC(TensorDictModuleBase):
         state_dict["opt_V"] = self.opt_V.state_dict()
         state_dict["opt_alpha"] = self.opt_alpha.state_dict()
         state_dict["log_alpha"] = self.log_alpha.detach()
+        state_dict["vecnorm_obs"] = self.vecnorm_obs.state_dict()
         return state_dict
 
     def load_state_dict(self, state_dict: dict, strict: bool = True):
@@ -408,3 +489,5 @@ class SAC(TensorDictModuleBase):
         self.opt_V.load_state_dict(state_dict["opt_V"])
         self.opt_alpha.load_state_dict(state_dict["opt_alpha"])
         self.log_alpha.data = state_dict["log_alpha"].to(self.device)
+        self.vecnorm_obs.load_state_dict(state_dict["vecnorm_obs"])
+
