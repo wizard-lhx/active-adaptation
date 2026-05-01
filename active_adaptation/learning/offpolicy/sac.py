@@ -49,8 +49,8 @@ class SACConfig:
     _target_: str = "active_adaptation.learning.offpolicy.sac.SAC"
     name: str = "sac"
     train_every: int = 4
-    buffer_size: int = 10000
-    warm_up_steps: int = 100
+    buffer_size: int = 5000
+    warm_up_steps: int = 200
     lr: float = 5e-4
     # TD learning
     n_steps: int = 4
@@ -133,6 +133,9 @@ class TanhNormalActor(nn.Module):
         self.trunk.apply(_init_sac_linear)
         self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
         
+        # self.action_scales: torch.Tensor
+        # self.register_buffer("action_scales", torch.ones(act_dim))
+        
         if not std_max > 0.0:
             raise ValueError("std_max must be positive")
         self.log_std_max = math.log(std_max)
@@ -141,7 +144,7 @@ class TanhNormalActor(nn.Module):
         feat = self.trunk(obs)
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
-        dist = TanhNormal(mean, torch.exp(log_std), upscale=1.0)
+        dist = TanhNormal(mean, torch.exp(log_std), upscale=1.0, tanh_loc=True)
         return dist, feat
 
 
@@ -290,7 +293,7 @@ class SAC(TensorDictModuleBase):
             self.rb.push(td.cpu())
 
         infos: dict = {"rb_size": len(self.rb), "critic/neg_rew_ratio": neg_rew_ratio}
-        if len(self.rb) < self.cfg.warm_up_steps:
+        if self.global_step < self.cfg.warm_up_steps:
             return infos
 
         for _ in range(self.cfg.train_every * self.cfg.utd_ratio):
@@ -375,13 +378,15 @@ class SAC(TensorDictModuleBase):
             qs = self.Q(obs, action_update)
 
         actor_diagnostics = {}
-        if isinstance(self.actor, TanhNormalActor):
+        if isinstance(dist, TanhNormal):
             eps = 0.05
             with torch.no_grad():
                 tanh_grad = 1.0 - action_update.detach().square()
-                saturation = (1.0 - action_update.detach().abs() < eps).float().mean()
+                action_saturation = (1.0 - action_update.detach().abs() < eps).float().mean()
+                mean_saturation = (1.0 - dist.deterministic_sample.detach().abs() < eps).float().mean()
             actor_diagnostics = {
-                "actor/saturation": saturation.item(),
+                "actor/action_saturation": action_saturation.item(),
+                "actor/mean_saturation": mean_saturation.item(),
                 "actor/tanh_grad": tanh_grad.mean().item(),
                 "actor/tanh_grad_min": tanh_grad.min().item(),
             }
