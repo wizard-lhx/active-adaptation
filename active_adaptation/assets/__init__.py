@@ -8,6 +8,7 @@ from .asset_cfg import (
     get_output_body_indexing,
 )
 from . import quadruped
+from . import quadrupeds
 from . import humanoid
 from . import quadruped_manipulator
 
@@ -40,4 +41,3 @@ __all__ = [
 #     for actuator_name, actuator in asset.actuators.items():
 #         meta["actuators"][actuator_name] = actuator.cfg.to_dict()
 #     return meta
-

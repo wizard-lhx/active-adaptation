@@ -20,31 +20,65 @@ class max_episode_length(Termination):
         super().__init__(env, is_timeout=True)
 
     def compute(self, termination: torch.Tensor):
-        return self.env.episode_length_buf[:, None] >= self.env.max_episode_length
+        cur_length = self.env.episode_length_buf.reshape(self.num_envs, 1)
+        max_length = self.env.max_episode_length
+        return cur_length >= max_length
+
 
 class crash(Termination):
     """
-    Hard termination given by undesired contact forces on the specified body names.
+    Terminate when a monitored link has been in **contact** long enough, optionally with random gating.
+
+    Uses the scene ``contact_forces`` sensor.  For each link resolved from
+    ``body_names_expr`` (see :func:`~active_adaptation.envs.utils.find_sensor_bodies`),
+    ``current_contact_time`` is read.  If *any* such value exceeds ``t_thres`` for an
+    environment, that environment is a **candidate** to terminate on this step.
+
+    Candidates are then filtered by an i.i.d. per-environment draw:
+    ``rand < prob``.  The episode only terminates when both the time condition and
+    that draw are true, so for ``prob < 1`` not every contact-over-threshold step
+    ends the episode.
+
+    The returned per-environment ``discount`` is ``1.0 - prob`` where
+    ``terminated`` is true, and ``1.0`` elsewhere (a multiplicative return factor
+    paired with this stochastic rule).
     """
 
-    def __init__(self, env, body_names_expr: str, t_thres: float = 0.0):
+    def __init__(
+        self,
+        env,
+        body_names_expr: str,
+        t_thres: float = 0.0,
+        prob: float = 1.0
+    ):
         super().__init__(env)
+        self.body_names_expr = body_names_expr
         self.t_thres = t_thres
+        self.prob = min(max(prob, 0.0), 1.0)
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
         self.body_indices, self.body_names = find_sensor_bodies(
             self.asset, self.contact_sensor, body_names_expr
         )
         self.body_indices = torch.tensor(self.body_indices, device=self.env.device)
+        self.data = self.contact_sensor.data
 
     def __repr__(self) -> str:
-        return f"crash(body_names={self.body_names}, body_indices={self.body_indices.tolist()}, t_thres={self.t_thres})"
+        return (
+            f"crash(expr={self.body_names_expr!r}, t_thres={self.t_thres}, "
+            f"prob={self.prob}, bodies={self.body_names!r}, "
+            f"indices={self.body_indices.tolist()})"
+        )
 
     def compute(self, termination: torch.Tensor):
-        contact_time = self.contact_sensor.data.current_contact_time[
-            :, self.body_indices
-        ]
-        return (contact_time > self.t_thres).any(1, True)
+        contact_time = self.data.current_contact_time[:, self.body_indices]
+        terminated = (contact_time > self.t_thres).any(1, True)
+        if self.prob < 1.0:
+            terminated = terminated & (torch.rand(self.num_envs, 1, device=self.env.device) <= self.prob)
+            discount = torch.where(terminated, 1.0 - self.prob, 1.0)
+            return terminated, discount
+        else:
+            return terminated
 
 
 class undesired_contact(Termination):

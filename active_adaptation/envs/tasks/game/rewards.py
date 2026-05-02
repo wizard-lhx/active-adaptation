@@ -8,7 +8,7 @@ from .command import Game
 
 class chase_distance(Reward[Game]):
     def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+        super().__init__(env, weight, enabled=enabled)
         self.last_distance = torch.zeros(self.num_envs, 1, device=self.device)
         self.distance_change = torch.zeros(self.num_envs, 1, device=self.device)
 
@@ -27,7 +27,7 @@ class chase_distance(Reward[Game]):
 
 class chase_velocity(Reward[Game]):
     def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+        super().__init__(env, weight, enabled=enabled)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -41,7 +41,7 @@ class chase_velocity(Reward[Game]):
 
 class evade(Reward[Game]):
     def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+        super().__init__(env, weight, enabled=enabled)
 
     def _compute(self) -> tuple[torch.Tensor, torch.Tensor]:
         is_active = torch.arange(self.num_envs, device=self.device) % 2 == 1
@@ -53,7 +53,7 @@ class evade(Reward[Game]):
 
 class target_in_sight(Reward[Game]):
     def __init__(self, env, weight: float, enabled: bool = True):
-        super().__init__(env, weight, enabled)
+        super().__init__(env, weight, enabled=enabled)
         self.asset = self.command_manager.asset
 
     def _compute(self) -> torch.Tensor:

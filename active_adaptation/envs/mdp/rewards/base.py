@@ -25,6 +25,8 @@ class Reward(Generic[CT], MDPComponent, RegistryMixin):
         ema_decay: The decay rate of the EMA.
     """
 
+    _ema_decay: float = 0.99
+
     def __init__(
         self,
         env,

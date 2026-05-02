@@ -142,8 +142,15 @@ class feet_clearance(Reward):
 
 
 class feet_air_time(Reward):
-    def __init__(self, env, body_names: str, thres: float, weight: float):
-        super().__init__(env, weight)
+    def __init__(
+        self,
+        env,
+        body_names: str,
+        thres: float,
+        weight: float,
+        track_var: bool = False,
+    ):
+        super().__init__(env, weight, track_var=track_var)
         self.thres = thres
         self.asset: Articulation = self.env.scene.articulations["robot"]
 
@@ -188,3 +195,30 @@ class feet_contact_count(Reward):
             self.env.step_dt
         )[:, self.body_ids]
         return self.first_contact.sum(1, keepdim=True)
+
+
+class single_foot_contact(Reward):
+    """Reward for single foot contact. Useful for bi-pedal locomotion."""
+
+    def __init__(
+        self,
+        env,
+        body_names: str,
+        margin: float,
+        weight: float,
+        track_var: bool = False,
+    ):
+        super().__init__(env, weight, track_var=track_var)
+        self.asset: Articulation = self.env.scene.articulations["robot"]
+        self.contact_sensor: IsaacContactSensor = self.env.scene.sensors["contact_forces"]
+        self.body_ids, self.body_names = find_sensor_bodies(self.asset, self.contact_sensor, body_names)
+        self.body_ids = torch.tensor(self.body_ids, device=self.device)
+        self.margin = margin
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        in_contact = self.contact_sensor.data.current_contact_time[:, self.body_ids] > self.margin
+        single_contact = torch.where(torch.sum(in_contact, dim=1) == 1, 0., -1.)
+        valid = ~self.command_manager.is_standing_env
+        return single_contact.reshape(self.num_envs, 1), valid.reshape(self.num_envs, 1)
+

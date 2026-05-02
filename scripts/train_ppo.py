@@ -124,10 +124,10 @@ class BufferCollector:
 
 @hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
 def main(cfg: DictConfig):
+    aa.init(cfg, auto_rank=True)
+
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
-
-    aa.init(cfg, auto_rank=True)
 
     print(
         f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"
@@ -171,7 +171,8 @@ def main(cfg: DictConfig):
     checkpoint_interval = cfg.checkpoint_interval
     upload_interval = cfg.upload_interval
 
-    log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
+    max_episode_length = cfg.task.max_episode_length
+    log_interval = (max_episode_length // cfg.algo.train_every) + 1
     logging.info(f"Log interval: {log_interval} steps")
 
     stats_keys = [

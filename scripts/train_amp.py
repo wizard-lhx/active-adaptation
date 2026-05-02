@@ -84,7 +84,7 @@ def main(cfg: DictConfig):
         if isinstance(k, tuple) and k[0] == "stats"
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
-    log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
+    log_interval = (cfg.task.max_episode_length // cfg.algo.train_every) + 1
     print(f"Log interval: {log_interval} steps")
 
     def save(policy, checkpoint_name: str):

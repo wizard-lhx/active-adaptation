@@ -47,8 +47,8 @@ class angvel_xy_l2(Reward):
     def _compute(self) -> torch.Tensor:
         if self.body_ids is not None:
             angvel = quat_rotate_inverse(
-                self.asset.data.body_quat_w[:, self.body_ids],
-                self.asset.data.body_ang_vel_w[:, self.body_ids]
+                self.asset.data.body_link_quat_w[:, self.body_ids],
+                self.asset.data.body_com_ang_vel_w[:, self.body_ids]
             )
             reward = - angvel[:, :, :2].square().sum((1, 2))
         else:
@@ -282,23 +282,6 @@ class base_height_exp(Reward[Twist]):
         return rew.reshape(self.num_envs, 1)
 
 
-class single_foot_contact(Reward):
-    def __init__(self, env, body_names: str, margin: float, weight: float, track_var: bool = False):
-        super().__init__(env, weight, track_var=track_var)
-        # self.asset: Articulation = self.env.scene.articulations["robot"]
-        self.contact_sensor: ContactSensor = self.env.scene.sensors["contact_forces"]
-        self.body_ids, self.body_names = self.contact_sensor.find_bodies(body_names)
-        self.body_ids = torch.tensor(self.body_ids, device=self.env.device)
-        self.margin = margin
-
-    @override
-    def _compute(self) -> torch.Tensor:
-        in_contact = self.contact_sensor.data.current_contact_time[:, self.body_ids] > self.margin
-        single_contact = torch.where(torch.sum(in_contact, dim=1) == 1, 0., -1.)
-        valid = ~self.command_manager.is_standing_env
-        return single_contact.reshape(self.num_envs, 1), valid.reshape(self.num_envs, 1)
-
-
 class is_standing_env(Reward):
     def __init__(self, env, weight: float, track_var: bool = False):
         super().__init__(env, weight, track_var=track_var)
@@ -497,7 +480,7 @@ class lateral_swing_height(Reward):
 class action_rate_l2(Reward):
     """Penalize the rate of change of the action"""
     def __init__(self, env, weight: float, key: str="action", enabled: bool = True, track_var: bool = False):
-        super().__init__(env, weight, enabled, track_var=track_var)
+        super().__init__(env, weight, enabled=enabled, track_var=track_var)
         self.action_manager = self.env.input_managers[key]
         assert self.action_manager.action_buf.shape[-1] == self.action_manager.action_dim
     
@@ -511,7 +494,7 @@ class action_rate_l2(Reward):
 class action_rate2_l2(Reward):
     """Penalize the second order rate of change of the action"""
     def __init__(self, env, weight: float, key: str="action", enabled: bool = True, track_var: bool = False):
-        super().__init__(env, weight, enabled, track_var=track_var)
+        super().__init__(env, weight, enabled=enabled, track_var=track_var)
         self.action_manager = self.env.input_managers[key]
         assert self.action_manager.action_buf.shape[-1] == self.action_manager.action_dim
     
