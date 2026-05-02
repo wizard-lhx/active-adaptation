@@ -414,16 +414,16 @@ class SAC(TensorDictModuleBase):
                 mean_squashed = torch.tanh(dist.loc.detach() / dist.upscale) * dist.upscale
                 mean_saturation = (1.0 - mean_squashed.abs() / dist.upscale < eps)
                 # mean saturation per action dimension
-                dim_saturation = mean_saturation.float().mean(dim=0).max()
+                dim_saturation = mean_saturation.float().mean(dim=0)
             actor_diagnostics = {
                 "actor/action_saturation": action_saturation.float().mean().item(),
                 "actor/mean_saturation": mean_saturation.float().mean().item(),
-                "actor/max_saturation": dim_saturation.item(),
+                "actor/max_saturation": dim_saturation.max().item(),
                 "actor/tanh_grad": tanh_grad.mean().item(),
                 "actor/tanh_grad_min": tanh_grad.min().item(),
                 "actor/upscale": dist.upscale.mean().item(),
             }
-            # self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
+            self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
         infos.update(actor_diagnostics)
         return infos
 
