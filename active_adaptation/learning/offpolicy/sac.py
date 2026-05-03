@@ -14,7 +14,6 @@ from tensordict.nn import (
 )
 
 from torchrl.data import Composite, TensorSpec
-from torchrl.objectives import hold_out_net
 
 from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm
 from active_adaptation.learning.modules.distributions import IndependentNormal
@@ -33,11 +32,21 @@ from active_adaptation.learning.offpolicy.distributional import (
     ValueDistribution,
     expected_q_from_logits,
 )
-from active_adaptation.learning.offpolicy.objectives import MultiStepReturn
+from active_adaptation.learning.offpolicy.objectives import MultiStepReturn, SACLoss
 from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
 
 
 cs = ConfigStore.instance()
+
+
+def gaussian_target_entropy(act_dim: int, sigma: float) -> float:
+    """Differential entropy of independent \\mathcal N(0, \\sigma^2) in \\mathbb R^d (FlashSAC-style).
+
+    H = (d/2) * log(2 * pi * e * sigma^2). Used as SAC log-alpha target when ``target_entropy_sigma`` is set.
+    """
+    if sigma <= 0:
+        raise ValueError("target_entropy_sigma must be positive for principled entropy.")
+    return 0.5 * float(act_dim) * math.log(2.0 * math.pi * math.e * sigma * sigma)
 
 
 def _init_sac_linear(m: nn.Module, gain: float = 1.0):
@@ -55,7 +64,7 @@ class SACConfig:
     warm_up_steps: int = 200
     lr: float = 5e-4
     # TD learning
-    n_steps: int = 4
+    n_steps: int = 3
     gamma: float = 0.99
     utd_ratio: int = 4
     # architecture
@@ -70,6 +79,9 @@ class SACConfig:
     target_action_noise: float = 0.01
     # sac specific
     entropy_bonus: float = 0.0
+    # If set: H_target = (d/2)*log(2*pi*e*sigma^2) for N(0,sigma^2)^d (FlashSAC).
+    # If None: use -dim(A) (common heuristic for tanh-squashed SAC).
+    target_entropy_sigma: float | None = 0.15
 
     tau_actor: float = 0.1 # a relatively large value for faster convergence
     tau_Q: float = 0.2  # a relatively large value for faster convergence
@@ -229,7 +241,7 @@ class TanhNormalActor(nn.Module):
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
         dist = ScaledTanhNormal(mean, torch.exp(log_std), upscale=self.upscale)
-        return dist, feat
+        return dist
 
 
 class NormalActor(nn.Module):
@@ -264,7 +276,7 @@ class NormalActor(nn.Module):
             mean = self.action(feat)
             log_std = torch.exp(self.log_std) * torch.ones_like(mean)
             dist = IndependentNormal(mean, log_std)
-        return dist, feat
+        return dist
 
 
 class SAC(TensorDictModuleBase):
@@ -329,7 +341,12 @@ class SAC(TensorDictModuleBase):
         self.Q_target.requires_grad_(False)
         self.actor_target.requires_grad_(False)
 
-        self.target_entropy = -float(act_dim)
+        if self.cfg.target_entropy_sigma is not None:
+            self.target_entropy = gaussian_target_entropy(
+                act_dim, self.cfg.target_entropy_sigma
+            )
+        else:
+            self.target_entropy = -float(act_dim)
         self.log_alpha = nn.Parameter(torch.tensor(0.0, device=device))
         self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=self.cfg.lr_alpha)
         self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=self.cfg.lr)
@@ -353,12 +370,13 @@ class SAC(TensorDictModuleBase):
             if self.cfg.n_steps > 1
             else None
         )
+        self.sac_actor_loss = SACLoss()
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         """Train mode stochastic exploration; eval/deploy use deterministic Tanh-normal mean."""
         def policy(tensordict: TensorDict):
             obs = self.vecnorm_obs(tensordict[OBS_KEY])
-            dist, _ = self.actor(obs)
+            dist = self.actor(obs)
             action = dist.sample()
             tensordict[ACTION_KEY] = action
             tensordict["loc"] = dist.loc
@@ -443,7 +461,7 @@ class SAC(TensorDictModuleBase):
         next_obs = self.vecnorm_obs(next_obs)
 
         with torch.no_grad():
-            dist, _ = self.actor_target(next_obs)
+            dist = self.actor_target(next_obs)
             next_action = dist.sample()
             next_log_prob = dist.log_prob(next_action)
             target_action = next_action + torch.randn_like(next_action) * self.cfg.target_action_noise
@@ -533,25 +551,15 @@ class SAC(TensorDictModuleBase):
         obs = batch[OBS_KEY]
         obs = self.vecnorm_obs(obs)
 
-        with hold_out_net(self.Q):
-            dist, feature = self.actor(obs)
-            action_update = dist.rsample()
-            log_prob = dist.log_prob(action_update)
-            qs = self.Q(obs, action_update)
-
-        if self.cfg.distributional:
-            q_value = self.Q.expected_values(qs).mean(dim=-1)
-        else:
-            q_value = torch.mean(qs, dim=-1)
-        if isinstance(dist, IndependentNormal):
-            entropy = dist.entropy()
-        else:
-            entropy = -log_prob
+        td_actor = TensorDict({OBS_KEY: obs}, batch_size=batch.batch_size)
+        q_term, entropy_est, dist, action_update = self.sac_actor_loss.compute(
+            td_actor, self.actor, self.Q
+        )
         alpha = self.log_alpha.exp()
-        actor_loss = (alpha.detach() * - entropy.reshape_as(q_value) - q_value).mean()
+        actor_loss = (alpha.detach() * (-entropy_est.reshape_as(q_term)) + q_term).mean()
 
         self.opt_alpha.zero_grad(set_to_none=True)
-        alpha_loss = -(alpha * (log_prob.detach() + self.target_entropy).detach()).mean()
+        alpha_loss = -(alpha * (-entropy_est.detach() + self.target_entropy)).mean()
         alpha_loss.backward()
         self.opt_alpha.step()
 
@@ -563,7 +571,6 @@ class SAC(TensorDictModuleBase):
         self.opt_actor.step()
         soft_copy_(self.actor, self.actor_target, tau=self.cfg.tau_actor)
 
-        entropy_std = entropy.std()
         # how much the action mean changes compared to that in the replay buffer
         mean_change = (dist.loc.detach() - batch["loc"]).abs().mean()
         infos = {
@@ -571,9 +578,7 @@ class SAC(TensorDictModuleBase):
             "actor/mean_change": mean_change.item(),
             "actor/grad_norm": actor_grad_norm.item(),
             "actor/alpha": alpha.detach().item(),
-            "actor/entropy": entropy.mean().item(),
-            "actor/entropy_std": entropy_std.item(),
-            "actor/feature_norm": feature.detach().norm(dim=-1).mean().item(),
+            "actor/entropy": entropy_est.mean().item(),
         }
         actor_diagnostics = {}
         if isinstance(dist, ScaledTanhNormal):
