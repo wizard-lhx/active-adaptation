@@ -39,6 +39,7 @@ from active_adaptation.learning.offpolicy.objectives import (
     SACLoss,
 )
 from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
+from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 
 
 cs = ConfigStore.instance()
@@ -68,6 +69,9 @@ class SACConfig:
     buffer_size: int = 5000
     warm_up_steps: int = 200
     lr: float = 5e-4
+    # If True, actor/Q use :class:`~active_adaptation.learning.utils.opt.MuonAdamWWrapper` (see ``ppo_symaug``).
+    muon: bool = False
+    weight_decay: float = 0.02
     # TD learning
     n_steps: int = 3
     gamma: float = 0.99
@@ -134,6 +138,8 @@ class TwinQNetwork(nn.Module):
             ResidualMLP([critic_input_dim, 512, 512, 512], activation),
             nn.Linear(512, 1),
         )
+        for c in (self.critic_1, self.critic_2):
+            c[-1].weight._non_muon = True
         self.reset_parameters()
     
     def reset_parameters(self):
@@ -167,14 +173,16 @@ class TwinDistributionalQNetwork(nn.Module):
         self.num_atoms = num_atoms
 
         critic_input_dim = obs_dim + act_dim
-        self.critic_1 = nn.Sequential(
-            ResidualMLP([critic_input_dim, 512, 512, 512], activation),
-            nn.Linear(512, num_atoms),
-        )
-        self.critic_2 = nn.Sequential(
-            ResidualMLP([critic_input_dim, 512, 512, 512], activation),
-            nn.Linear(512, num_atoms),
-        )
+    
+        def make_critic():
+            head = nn.Linear(512, num_atoms)
+            head.weight._non_muon = True
+            return nn.Sequential(
+                ResidualMLP([critic_input_dim, 512, 512, 512], activation),
+                head,
+            )
+        self.critic_1 = make_critic()
+        self.critic_2 = make_critic()
 
         self.register_buffer(
             "q_support",
@@ -233,6 +241,7 @@ class TanhNormalActor(nn.Module):
 
         self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
         self.action = nn.Linear(256, act_dim * 2)
+        self.action.weight._non_muon = True
         self.trunk.apply(_init_sac_linear)
         
         if action_init == "orthogonal":
@@ -329,8 +338,20 @@ class SAC(TensorDictModuleBase):
             self.target_entropy = -float(act_dim)
         self.log_alpha = nn.Parameter(torch.tensor(0.0, device=device))
         self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=self.cfg.lr_alpha)
-        self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=self.cfg.lr)
-        self.opt_Q = torch.optim.Adam(self.Q.parameters(), lr=self.cfg.lr)
+        if self.cfg.muon:
+            self.opt_actor = MuonAdamWWrapper(
+                [self.actor],
+                lr=self.cfg.lr,
+                weight_decay=self.cfg.weight_decay,
+            )
+            self.opt_Q = MuonAdamWWrapper(
+                [self.Q],
+                lr=self.cfg.lr,
+                weight_decay=self.cfg.weight_decay,
+            )
+        else:
+            self.opt_actor = torch.optim.AdamW(self.actor.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+            self.opt_Q = torch.optim.AdamW(self.Q.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
         # self.opt_V = torch.optim.Adam(self.V.parameters(), lr=self.cfg.lr)
 
         self.global_step = 0
@@ -687,10 +708,9 @@ class SAC(TensorDictModuleBase):
         state_dict["Q"] = self.Q.state_dict()
         state_dict["V"] = self.V.state_dict()
         state_dict["actor"] = self.actor.state_dict()
-        state_dict["Q_target"] = self.Q_target.state_dict()
-        state_dict["actor_target"] = self.actor_target.state_dict()
-        state_dict["opt_actor"] = self.opt_actor.state_dict()
-        state_dict["opt_Q"] = self.opt_Q.state_dict()
+        # do not store opt states as they make the ckpt very large
+        # state_dict["opt_actor"] = self.opt_actor.state_dict()
+        # state_dict["opt_Q"] = self.opt_Q.state_dict()
         # state_dict["opt_V"] = self.opt_V.state_dict()
         state_dict["opt_alpha"] = self.opt_alpha.state_dict()
         state_dict["log_alpha"] = self.log_alpha.detach()
@@ -701,10 +721,12 @@ class SAC(TensorDictModuleBase):
         self.Q.load_state_dict(state_dict["Q"], strict=strict)
         self.V.load_state_dict(state_dict["V"], strict=strict)
         self.actor.load_state_dict(state_dict["actor"], strict=strict)
-        self.Q_target.load_state_dict(state_dict["Q_target"], strict=strict)
-        self.actor_target.load_state_dict(state_dict["actor_target"], strict=strict)
-        self.opt_actor.load_state_dict(state_dict["opt_actor"])
-        self.opt_Q.load_state_dict(state_dict["opt_Q"])
+        # reuse the same state dict for target networks
+        self.Q_target.load_state_dict(state_dict["Q"], strict=strict)
+        self.actor_target.load_state_dict(state_dict["actor"], strict=strict)
+        # do not store opt states as they make the ckpt very large
+        # self.opt_actor.load_state_dict(state_dict["opt_actor"])
+        # self.opt_Q.load_state_dict(state_dict["opt_Q"])
         # self.opt_V.load_state_dict(state_dict["opt_V"])
         self.opt_alpha.load_state_dict(state_dict["opt_alpha"])
         self.log_alpha.data = state_dict["log_alpha"].to(self.device)
