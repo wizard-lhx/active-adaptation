@@ -7,6 +7,13 @@ from tensordict import TensorDictBase
 from torchrl.objectives import hold_out_net
 from jaxtyping import Float
 from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY
+from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
+
+
+def _policy_dist(actor: nn.Module, obs: torch.Tensor) -> Any:
+    """Gaussian in pre-tanh space + tanh upscale (same as rollout :class:`ScaledTanhNormal`)."""
+    loc, scale = actor(obs)
+    return ScaledTanhNormal(loc, scale, upscale=actor.upscale)
 
 
 class MultiStepReturn(nn.Module):
@@ -52,12 +59,6 @@ class MultiStepReturn(nn.Module):
         )
 
         return next_observations, rewards, discount
-
-
-def _policy_dist(actor: nn.Module, obs: torch.Tensor) -> torch.distributions.Distribution:
-    """Actor forward returns a ``Distribution`` (legacy code may return ``(dist, ...)``)."""
-    out = actor(obs)
-    return out[0] if isinstance(out, tuple) else out
 
 
 def _actor_q_per_sample(critic: nn.Module, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:

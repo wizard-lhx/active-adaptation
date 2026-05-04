@@ -82,13 +82,16 @@ class SACConfig:
     actor_batch_size: int = 2048
     # target smoothing: this should help Q(s_t, a_t) to generalize locally around a_t
     target_action_noise: float = 0.01
+    # AR(1) pre-tanh exploration noise on rollout only: eps_t = rho * eps_{t-1} + sqrt(1-rho^2) * N(0,I).
+    # 0 disables correlation (standard :meth:`ScaledTanhNormal.sample`-equivalent path). Critic/actor still use iid.
+    use_correlated: bool = True
     # actor objective: ``sac`` = :class:`SACLoss`; ``advantage_weighted_regression`` = :class:`AdvantageWeightedRegression` (linear A weighting, no softmax).
     actor_loss: str = "sac"
     wr_num_candidates: int = 8
     wr_temperature: float = 0.05  # AWR beta in exp(A / beta)
     wr_normalize_advantage: bool = False
     # BC-style anchor on replay actions; curbs Q exploitation (SAC and AWR).
-    actor_behavior_coef: float = 0.5
+    actor_behavior_coef: float = 0.0
     # sac specific
     entropy_bonus: float = 0.0
     # If set: H_target = (d/2)*log(2*pi*e*sigma^2) for N(0,sigma^2)^d (FlashSAC).
@@ -252,44 +255,7 @@ class TanhNormalActor(nn.Module):
         feat = self.trunk(obs)
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
-        dist = ScaledTanhNormal(mean, torch.exp(log_std), upscale=self.upscale)
-        return dist
-
-
-class NormalActor(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        act_dim: int,
-        layer_norm: str = None,
-        pred_std: bool = False,
-    ):
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-        self.pred_std = pred_std
-        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
-        if self.pred_std:
-            self.action = nn.Linear(256, act_dim * 2)
-            self.log_std_max = math.log(1.0)
-        else:
-            self.action = nn.Linear(256, act_dim)
-            self.log_std = nn.Parameter(torch.zeros(act_dim))
-        self.trunk.apply(_init_sac_linear)
-        self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
-    
-    def forward(self, obs: torch.Tensor):
-        feat = self.trunk(obs)
-        if self.pred_std:
-            mean, raw = self.action(feat).chunk(2, dim=-1)
-            log_std = self.log_std_max - F.softplus(raw)
-            dist = IndependentNormal(mean, torch.exp(log_std))
-        else:
-            mean = self.action(feat)
-            mean = torch.tanh(mean / 2.0) * 2.0
-            log_std = torch.exp(self.log_std) * torch.ones_like(mean)
-            dist = IndependentNormal(mean, log_std)
-        return dist
+        return mean, torch.exp(log_std)
 
 
 class SAC(TensorDictModuleBase):
@@ -341,6 +307,7 @@ class SAC(TensorDictModuleBase):
             self.V_quantile = 0.7
 
         self.gae = GAE(self.cfg.gamma, self.cfg.gae_lambda).to(device)
+        self.dist_class = ScaledTanhNormal
         self.actor = TanhNormalActor(
             obs_dim,
             act_dim,
@@ -394,15 +361,54 @@ class SAC(TensorDictModuleBase):
         else:
             raise ValueError(f"Unknown actor_loss: {self.cfg.actor_loss!r}")
 
+    def make_tensordict_primer(self):
+        """Instance hook (e.g. tooling); prefer :meth:`build_rollout_noise_primer` before SAC init in training scripts."""
+        if self.cfg.use_correlated:
+            """Register correlated-noise state **before** constructing :class:`SAC` so replay ``fake_tensordict`` matches rollouts."""
+            from torchrl.envs import TensorDictPrimer
+            from torchrl.data import UnboundedContinuous, BoundedContinuous, Composite
+
+            shape = tuple(self.action_spec.shape)
+            dev = torch.device(self.device)
+            spec = {
+                "prev_noise": UnboundedContinuous(shape, device=dev),
+                "rho": BoundedContinuous(low=0.0, high=1.0, shape=[shape[0], 1], device=dev)
+            }
+            return TensorDictPrimer(
+                Composite(spec, shape=[shape[0]], device=dev),
+                random=True,
+                reset_key="done",
+                expand_specs=False,
+            )
+        else:
+            return None
+
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
-        """Train mode stochastic exploration; eval/deploy use deterministic Tanh-normal mean."""
+        """Train: optional AR(1) pre-tanh rollout noise; eval/deploy: deterministic squash of the Gaussian mean."""
+
         def policy(tensordict: TensorDict):
             obs = self.vecnorm_obs(tensordict[OBS_KEY])
-            dist = self.actor(obs)
-            action = dist.sample()
-            tensordict[ACTION_KEY] = action
-            tensordict["loc"] = dist.loc
+            loc, scale = self.actor(obs)
+            dist = self.dist_class(loc, scale, upscale=self.actor.upscale)
+
+            if self.cfg.use_correlated:
+                prev_noise = tensordict["prev_noise"]
+                rho = tensordict["rho"]
+                noise = (
+                    rho * prev_noise 
+                    + torch.sqrt((1.0 - rho.square())) * torch.randn_like(loc)
+                )
+                sample = loc + noise * scale
+                tensordict["next", "prev_noise"] = noise
+                for transform in dist.transforms:
+                    sample = transform(sample)
+            else:
+                sample = dist.sample()
+
+            tensordict[ACTION_KEY] = sample
+            tensordict["loc"] = loc
             return tensordict
+
         return policy
 
     def on_stage_start(self, stage: str):
@@ -483,8 +489,11 @@ class SAC(TensorDictModuleBase):
         next_obs = self.vecnorm_obs(next_obs)
 
         with torch.no_grad():
-            dist = self.actor_target(next_obs)
+            # actions are sampled with uncorrelated noise
+            loc, scale = self.actor_target(next_obs)
+            dist = self.dist_class(loc, scale, upscale=self.actor.upscale)
             next_action = dist.sample()
+
             next_log_prob = dist.log_prob(next_action)
             target_action = next_action + torch.randn_like(next_action) * self.cfg.target_action_noise
             alpha = self.log_alpha.exp()
@@ -582,7 +591,7 @@ class SAC(TensorDictModuleBase):
         )
         alpha = self.log_alpha.exp()
         actor_loss = (
-            0.002 * (-entropy_est.reshape_as(policy_term)) + policy_term
+            alpha.detach() * (-entropy_est.reshape_as(policy_term)) + policy_term
         ).mean()
 
         self.opt_alpha.zero_grad(set_to_none=True)
