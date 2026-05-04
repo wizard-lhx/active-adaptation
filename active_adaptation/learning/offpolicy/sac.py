@@ -14,9 +14,8 @@ from tensordict.nn import (
 )
 
 from torchrl.data import Composite, TensorSpec
-from torchrl.modules.distributions import TruncatedNormal
 
-from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm
+from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm, SimbaMLP
 from active_adaptation.learning.modules.distributions import IndependentNormal
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
@@ -175,11 +174,15 @@ class TwinDistributionalQNetwork(nn.Module):
         critic_input_dim = obs_dim + act_dim
     
         def make_critic():
-            head = nn.Linear(512, num_atoms)
-            head.weight._non_muon = True
+            in_layer = nn.Linear(critic_input_dim, 512)
+            in_layer.weight._non_muon = True
+            out_layer = nn.Linear(512, num_atoms)
+            out_layer.weight._non_muon = True
             return nn.Sequential(
-                ResidualMLP([critic_input_dim, 512, 512, 512], activation),
-                head,
+                in_layer,
+                SimbaMLP(512, 2, activation),
+                nn.LayerNorm(512),
+                out_layer,
             )
         self.critic_1 = make_critic()
         self.critic_2 = make_critic()
@@ -239,7 +242,12 @@ class TanhNormalActor(nn.Module):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
 
-        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
+        self.trunk = MLP(
+            [obs_dim, 256, 256, 256],
+            nn.SiLU,
+            layer_norm=layer_norm,
+            first_non_muon=True,
+        )
         self.action = nn.Linear(256, act_dim * 2)
         self.action.weight._non_muon = True
         self.trunk.apply(_init_sac_linear)
@@ -383,26 +391,22 @@ class SAC(TensorDictModuleBase):
             raise ValueError(f"Unknown actor_loss: {self.cfg.actor_loss!r}")
 
     def make_tensordict_primer(self):
-        """Instance hook (e.g. tooling); prefer :meth:`build_rollout_noise_primer` before SAC init in training scripts."""
-        if self.cfg.use_correlated:
-            """Register correlated-noise state **before** constructing :class:`SAC` so replay ``fake_tensordict`` matches rollouts."""
-            from torchrl.envs import TensorDictPrimer
-            from torchrl.data import UnboundedContinuous, BoundedContinuous, Composite
+        """Register correlated-noise state **before** constructing :class:`SAC` so replay ``fake_tensordict`` matches rollouts."""
+        from torchrl.envs import TensorDictPrimer
+        from torchrl.data import UnboundedContinuous, BoundedContinuous, Composite
 
-            shape = tuple(self.action_spec.shape)
-            dev = torch.device(self.device)
-            spec = {
-                "prev_noise": UnboundedContinuous(shape, device=dev),
-                "rho": BoundedContinuous(low=0.0, high=1.0, shape=[shape[0], 1], device=dev)
-            }
-            return TensorDictPrimer(
-                Composite(spec, shape=[shape[0]], device=dev),
-                random=True,
-                reset_key="done",
-                expand_specs=False,
-            )
-        else:
-            return None
+        shape = tuple(self.action_spec.shape)
+        dev = torch.device(self.device)
+        spec = {
+            "prev_noise": UnboundedContinuous(shape, device=dev),
+            "rho": BoundedContinuous(low=0.0, high=1.0, shape=[shape[0], 1], device=dev)
+        }
+        return TensorDictPrimer(
+            Composite(spec, shape=[shape[0]], device=dev),
+            random=True,
+            reset_key="done",
+            expand_specs=False,
+        )
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         """Train: optional AR(1) pre-tanh rollout noise; eval/deploy: deterministic squash of the Gaussian mean."""

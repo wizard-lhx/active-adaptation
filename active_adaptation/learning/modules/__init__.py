@@ -3,7 +3,7 @@ from .distributions import *
 from .common import SymmetryWrapper
 from .rnn import GRUCore
 from .fusion import FiLM, CrossAttention
-from .common import MLP, ResidualMLP, DtypeConversion, FlattenBatch
+from .common import MLP, ResidualMLP, DtypeConversion, FlattenBatch, SimbaMLP
 
 __all__ = [
     "VecNorm",
@@ -16,4 +16,5 @@ __all__ = [
     "ResidualMLP",
     "DtypeConversion",
     "FlattenBatch",
+    "SimbaMLP",
 ]

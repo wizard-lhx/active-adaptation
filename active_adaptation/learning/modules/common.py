@@ -56,7 +56,7 @@ class MLP(nn.Module):
             if layer_norm == "post":
                 layers.append(nn.LayerNorm(num_units[i + 1]))
         self.layers = nn.Sequential(*layers)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the MLP.
 
@@ -67,7 +67,7 @@ class MLP(nn.Module):
             Output tensor of shape (..., output_dim) where output_dim is num_units[-1].
         """
         return self.layers(x)
-    
+
     def orth(self, gain: float = 1.0) -> "MLP":
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -100,16 +100,18 @@ class ResidualMLP(nn.Module):
         >>> x = torch.randn(10, 128)
         >>> output = res_mlp(x)  # Shape: (10, 32)
     """
-    
+
     def __init__(
         self,
         num_units: List[int],
         activation: nn.Module = nn.Mish,
+        first_non_muon: bool = False,
     ):
         super().__init__()
         self.num_units = num_units
         self.activation = activation
-        
+        self.first_non_muon = first_non_muon
+
         layers = []
         skip_layers = []
 
@@ -118,10 +120,14 @@ class ResidualMLP(nn.Module):
             out_features = num_units[i + 1]
             if in_features != out_features:
                 skip_layer = nn.Linear(in_features, out_features)
+                skip_layer.weight._non_muon = True
             else:
                 skip_layer = nn.Identity()
+            linear = nn.Linear(in_features, out_features)
+            if self.first_non_muon and i == 0:
+                linear.weight._non_muon = True
             layer = nn.Sequential(
-                nn.Linear(in_features, out_features),
+                linear,
                 nn.LayerNorm(out_features),
                 activation(),
             )
@@ -129,7 +135,7 @@ class ResidualMLP(nn.Module):
             skip_layers.append(skip_layer)
         self.layers = nn.ModuleList(layers)
         self.skip_layers = nn.ModuleList(skip_layers)
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the residual MLP.
 
@@ -141,6 +147,31 @@ class ResidualMLP(nn.Module):
         """
         for layer, skip_layer in zip(self.layers, self.skip_layers):
             x = layer(x) + skip_layer(x)
+        return x
+
+
+class SimbaMLP(nn.Module):
+    """The architecture described in https://arxiv.org/pdf/2410.09754."""
+
+    def __init__(self, num_units: int, num_blocks: int, activation=nn.SiLU):
+        super().__init__()
+        self.num_units = num_units
+        self.num_blocks = num_blocks
+        blocks = []
+
+        for i in range(num_blocks):
+            block = nn.Sequential(
+                nn.LayerNorm(num_units),
+                nn.Linear(num_units, num_units),
+                activation(),
+                nn.Linear(num_units, num_units),
+            )
+            blocks.append(block)
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = x + block(x)
         return x
 
 
@@ -180,6 +211,7 @@ class SymmetryWrapper(TensorDictModuleBase):
         input_transform: The input transform to apply.
         output_transform: The output transform to apply.
     """
+
     def __init__(
         self,
         module: TensorDictModuleBase,
@@ -192,7 +224,7 @@ class SymmetryWrapper(TensorDictModuleBase):
         self.out_keys = self.module.out_keys
         self.input_transform = input_transform
         self.output_transform = output_transform
-    
+
     def forward(self, td: TensorDictBase):
         input = td.select(*self.in_keys)
         input_mirrored = input.empty()
@@ -202,4 +234,3 @@ class SymmetryWrapper(TensorDictModuleBase):
         output = (output_mirrored[0] + self.output_transform(output_mirrored[1])) * 0.5
         td.update(output)
         return td
-
