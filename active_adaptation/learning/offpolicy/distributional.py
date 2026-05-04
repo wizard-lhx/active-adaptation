@@ -43,8 +43,8 @@ def project_categorical_bellman(
         Projected target probabilities [B, num_atoms] (non-negative, row-stochastic).
     """
     num_atoms = support.shape[0]
-    if num_atoms < 2:
-        raise ValueError("support must contain at least two atoms.")
+    if num_atoms < 3:
+        raise ValueError("support must contain more than two atoms (num_atoms > 2).")
 
     device = next_logits.device
     dtype = next_logits.dtype
@@ -57,7 +57,12 @@ def project_categorical_bellman(
 
     v_lo = support[0]
     v_hi = support[-1]
-    delta_z = (v_hi - v_lo) / (num_atoms - 1)
+    delta_raw = (v_hi - v_lo) / (num_atoms - 1)
+    # Extremely small spans or dtype noise could make delta_z degenerate / unstable.
+    min_delta = torch.finfo(dtype).tiny * torch.tensor(
+        256.0, device=device, dtype=dtype
+    )
+    delta_z = torch.clamp(delta_raw, min=min_delta)
 
     rewards = rewards.reshape(batch_size, 1).to(dtype=dtype)
     if not isinstance(discount, torch.Tensor):
@@ -69,6 +74,11 @@ def project_categorical_bellman(
     target_z = target_z.clamp(v_lo, v_hi)
 
     b = (target_z - v_lo) / delta_z
+    # FP error can yield ceil(b)==num_atoms or floor(b)==-1; index_add_ then goes OOB on CUDA.
+    b_max = float(num_atoms - 1)
+    b = torch.nan_to_num(b, nan=0.0, neginf=0.0, posinf=b_max)
+    b = b.clamp(0.0, b_max)
+
     lower = torch.floor(b).long()
     upper = torch.ceil(b).long()
 
@@ -77,6 +87,9 @@ def project_categorical_bellman(
     upper_mask = torch.logical_and(lower < (num_atoms - 1), same)
     lower = torch.where(lower_mask, lower - 1, lower)
     upper = torch.where(upper_mask, upper + 1, upper)
+    lower = lower.clamp(0, num_atoms - 1)
+    upper = upper.clamp(0, num_atoms - 1)
+    lower, upper = torch.minimum(lower, upper), torch.maximum(lower, upper)
 
     next_dist = F.softmax(next_logits, dim=-1)
     proj_dist = torch.zeros_like(next_dist)

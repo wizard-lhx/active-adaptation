@@ -145,8 +145,8 @@ class TwinDistributionalQNetwork(nn.Module):
         activation: type[nn.Module] = nn.SiLU,
     ):
         super().__init__()
-        if num_atoms < 2:
-            raise ValueError("num_atoms must be >= 2 for distributional Q.")
+        if num_atoms < 3:
+            raise ValueError("num_atoms must be > 2 for distributional Q.")
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_atoms = num_atoms
@@ -598,7 +598,7 @@ class SAC(TensorDictModuleBase):
                 "actor/tanh_grad_min": tanh_grad.min().item(),
                 "actor/upscale": dist.upscale.mean().item(),
             }
-            self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
+            # self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
         infos.update(actor_diagnostics)
         return infos
 
