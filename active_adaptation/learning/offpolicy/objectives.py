@@ -71,21 +71,45 @@ def _actor_q_per_sample(critic: nn.Module, obs: torch.Tensor, act: torch.Tensor)
     return q.reshape(obs.shape[0])
 
 
+def _per_row_action_nll(dist: Any, act: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Negative log-density of ``act`` under ``dist``, one scalar per batch row."""
+    lp = dist.log_prob(act)
+    assert lp.shape == act.shape[:-1], (lp.shape, act.shape)
+    nll = -lp.reshape(batch_size, -1).sum(dim=-1)
+    return nll
+
+
 class SACLoss:
     """Vanilla SAC actor loss on Q only: minimize ``-E[Q(s,a)]`` for ``a = rsample()`` from ``actor``. Entropy / ``alpha`` is added outside.
 
-    Returns per-batch ``q_term`` (``-Q``), ``entropy_est`` = ``-log pi(a|s)``, the policy ``dist``, and the reparameterized ``act``.
+    Optional **behavior anchoring**: when ``behavior_coef > 0`` and ``tensordict`` contains
+    :data:`~active_adaptation.learning.ppo.common.ACTION_KEY` (replay actions), adds
+    ``behavior_coef * (-log pi(a_buf|s))``. That penalizes moving mass away from behavioral
+    actions and curbs exploiting a miscalibrated Q (AWAC / BC-regularized actor style).
+
+    Returns per-batch ``q_term`` (``-Q`` plus behavior term if enabled), ``entropy_est`` =
+    ``-log pi(a|s)`` for the reparameterized sample, the policy ``dist``, and ``act``.
     """
+
+    def __init__(self, behavior_coef: float = 0.0):
+        if behavior_coef < 0:
+            raise ValueError("behavior_coef must be >= 0.")
+        self.behavior_coef = behavior_coef
 
     def compute(
         self, tensordict: TensorDictBase, actor: nn.Module, critic: nn.Module
     ) -> tuple[torch.Tensor, torch.Tensor, Any, torch.Tensor]:
         obs = tensordict[OBS_KEY]
+        b = obs.shape[0]
         dist = _policy_dist(actor, obs)
         act = dist.rsample()
         q = _actor_q_per_sample(critic, obs, act)
         entropy_est = -dist.log_prob(act)
-        return -q, entropy_est, dist, act
+        q_term = -q
+        if self.behavior_coef > 0 and ACTION_KEY in tensordict:
+            act_buf = tensordict[ACTION_KEY]
+            q_term = q_term + self.behavior_coef * _per_row_action_nll(dist, act_buf, b)
+        return q_term, entropy_est, dist, act
 
 
 class RatioLoss:
@@ -108,34 +132,80 @@ class RatioLoss:
         return -(adv * logp), entropy_est
 
 
-class WeightedRegression:
-    """Draw ``num_candidates`` actions per state from ``actor``; ``w_k = softmax(Q(s,a_k)/temp)``; loss ``-sum_k w_k log pi(a_k|s)``.
+class AdvantageWeightedRegression:
+    """AWR-style advantage-weighted log-likelihood (sample MC baseline, no learned ``V``).
 
-    Returns per-batch loss and ``entropy_est`` = mean over candidates of ``-log pi(a_k|s)`` (MC NLL, same notion as :class:`SACLoss`).
+    Draw ``num_candidates`` actions from ``\\pi(\\cdot|s)``. Estimate **sample-based**
+    ``\\hat V(s)``: mean of ``Q(s,a_k)`` over candidates, and if replay ``ACTION_KEY`` is
+    present, include ``Q(s, a_{buf})`` in that mean.
+
+    Let ``A(s,a_k) = Q(s,a_k) - \\hat V(s)`` (stopgrad). The policy term matches the usual
+    AWR form (up to Monte Carlo samples from ``\\pi``)::
+
+        ``E_k [ \\exp(A_k / \\beta) \\log \\pi(a_k|s) ]``
+
+    minimized as ``-mean_k [ \\exp(A_k / \\beta) \\log \\pi(a_k|s) ]``.
+
+    Here ``\\beta`` is the constructor arg ``temperature`` (Hydra: ``wr_temperature``).
+    ``\\exp`` is stabilized by subtracting ``\\max_k A_k/\\beta`` per state before exponentiation
+    (constant factor across ``k``; unchanged relative weighting).
+
+    Optional per-state standardization of ``A`` across ``k`` (``normalize_advantage``) is applied
+    before scaling by ``\\beta``.
+
+    Same optional behavior anchoring as :class:`SACLoss` when ``behavior_coef > 0``.
+
+    Returns ``policy_term``, ``entropy_est`` = mean over ``k`` of ``-log \\pi(a_k|s)``, ``dist``,
+    ``act_diag`` = first candidate.
     """
 
-    def __init__(self, num_candidates: int = 8, temperature: float = 1.0):
-        if num_candidates < 2:
-            raise ValueError("num_candidates must be >= 2 for softmax weights.")
+    def __init__(
+        self,
+        num_candidates: int = 8,
+        temperature: float = 1.0,
+        normalize_advantage: bool = False,
+    ):
+        if num_candidates < 1:
+            raise ValueError("num_candidates must be >= 1.")
+        if temperature <= 0:
+            raise ValueError("temperature (AWR beta) must be > 0.")
         self.num_candidates = num_candidates
         self.temperature = temperature
+        self.normalize_advantage = normalize_advantage
 
     def compute(
         self, tensordict: TensorDictBase, actor: nn.Module, critic: nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Any, torch.Tensor]:
         obs = tensordict[OBS_KEY]
         dist = _policy_dist(actor, obs)
         k = self.num_candidates
+        if k == 1 and ACTION_KEY not in tensordict:
+            raise ValueError(
+                "AdvantageWeightedRegression with num_candidates=1 requires replay "
+                f"{ACTION_KEY!r} on the tensordict (for a non-trivial MC baseline)."
+            )
+
         cand_act = dist.rsample((k,))  # [K, N, act_dim]
         logp = dist.log_prob(cand_act)
         assert logp.shape == cand_act.shape[:-1]
         logp = einops.rearrange(logp, "sample batch -> batch sample")
         act_flat = einops.rearrange(cand_act, "sample batch act -> (batch sample) act")
-        obs_flat = einops.repeat(obs, "batch obs -> (batch sample) obs")
+        obs_flat = einops.repeat(obs, "batch obs -> (batch sample) obs", sample=k)
         q_flat = _actor_q_per_sample(critic, obs_flat, act_flat)
-        q = einops.rearrange(q_flat, "(batch sample) -> batch sample")
-        w = torch.softmax(q / self.temperature, dim=-1)
-        loss = -(w * logp).sum(dim=-1)
-        entropy_est = (-logp).mean(dim=-1)
-        return loss, entropy_est
+        q = einops.rearrange(q_flat, "(batch sample) -> batch sample", sample=k)
 
+        baseline = q.mean(dim=-1)
+        adv = (q - baseline.unsqueeze(-1)).detach()
+        if self.normalize_advantage:
+            adv = adv / adv.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        scaled = adv / self.temperature
+        scaled = scaled - scaled.max(dim=-1, keepdim=True).values
+        w = torch.exp(scaled)
+        policy_term = -(w * logp).mean(dim=-1) - q_flat.mean(dim=-1)
+        entropy_est = (-logp).mean(dim=-1)
+        act_diag = cand_act[0]
+        return policy_term, entropy_est, dist, act_diag
+
+
+# Backward-compatible alias.
+WeightedRegression = AdvantageWeightedRegression

@@ -14,6 +14,7 @@ from tensordict.nn import (
 )
 
 from torchrl.data import Composite, TensorSpec
+from torchrl.modules.distributions import TruncatedNormal
 
 from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm
 from active_adaptation.learning.modules.distributions import IndependentNormal
@@ -32,7 +33,11 @@ from active_adaptation.learning.offpolicy.distributional import (
     ValueDistribution,
     expected_q_from_logits,
 )
-from active_adaptation.learning.offpolicy.objectives import MultiStepReturn, SACLoss
+from active_adaptation.learning.offpolicy.objectives import (
+    AdvantageWeightedRegression,
+    MultiStepReturn,
+    SACLoss,
+)
 from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
 
 
@@ -74,9 +79,16 @@ class SACConfig:
     distributional: bool = True
     # batch sizes
     critic_batch_size: int = 2048
-    actor_batch_size: int = 1024
+    actor_batch_size: int = 2048
     # target smoothing: this should help Q(s_t, a_t) to generalize locally around a_t
     target_action_noise: float = 0.01
+    # actor objective: ``sac`` = :class:`SACLoss`; ``advantage_weighted_regression`` = :class:`AdvantageWeightedRegression` (linear A weighting, no softmax).
+    actor_loss: str = "sac"
+    wr_num_candidates: int = 8
+    wr_temperature: float = 0.05  # AWR beta in exp(A / beta)
+    wr_normalize_advantage: bool = False
+    # BC-style anchor on replay actions; curbs Q exploitation (SAC and AWR).
+    actor_behavior_coef: float = 0.5
     # sac specific
     entropy_bonus: float = 0.0
     # If set: H_target = (d/2)*log(2*pi*e*sigma^2) for N(0,sigma^2)^d (FlashSAC).
@@ -274,6 +286,7 @@ class NormalActor(nn.Module):
             dist = IndependentNormal(mean, torch.exp(log_std))
         else:
             mean = self.action(feat)
+            mean = torch.tanh(mean / 2.0) * 2.0
             log_std = torch.exp(self.log_std) * torch.ones_like(mean)
             dist = IndependentNormal(mean, log_std)
         return dist
@@ -370,7 +383,16 @@ class SAC(TensorDictModuleBase):
             if self.cfg.n_steps > 1
             else None
         )
-        self.sac_actor_loss = SACLoss()
+        if self.cfg.actor_loss == "sac":
+            self.actor_loss_fn = SACLoss(behavior_coef=self.cfg.actor_behavior_coef)
+        elif self.cfg.actor_loss in ("advantage_weighted_regression", "weighted_regression"):
+            self.actor_loss_fn = AdvantageWeightedRegression(
+                num_candidates=self.cfg.wr_num_candidates,
+                temperature=self.cfg.wr_temperature,
+                normalize_advantage=self.cfg.wr_normalize_advantage,
+            )
+        else:
+            raise ValueError(f"Unknown actor_loss: {self.cfg.actor_loss!r}")
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
         """Train mode stochastic exploration; eval/deploy use deterministic Tanh-normal mean."""
@@ -551,12 +573,17 @@ class SAC(TensorDictModuleBase):
         obs = batch[OBS_KEY]
         obs = self.vecnorm_obs(obs)
 
-        td_actor = TensorDict({OBS_KEY: obs}, batch_size=batch.batch_size)
-        q_term, entropy_est, dist, action_update = self.sac_actor_loss.compute(
+        td_actor = TensorDict(
+            {OBS_KEY: obs, ACTION_KEY: batch[ACTION_KEY]},
+            batch_size=batch.batch_size,
+        )
+        policy_term, entropy_est, dist, action_update = self.actor_loss_fn.compute(
             td_actor, self.actor, self.Q
         )
         alpha = self.log_alpha.exp()
-        actor_loss = (alpha.detach() * (-entropy_est.reshape_as(q_term)) + q_term).mean()
+        actor_loss = (
+            0.002 * (-entropy_est.reshape_as(policy_term)) + policy_term
+        ).mean()
 
         self.opt_alpha.zero_grad(set_to_none=True)
         alpha_loss = -(alpha * (-entropy_est.detach() + self.target_entropy)).mean()
