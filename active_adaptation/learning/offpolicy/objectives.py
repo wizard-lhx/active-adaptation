@@ -62,13 +62,10 @@ class MultiStepReturn(nn.Module):
 
 
 def _actor_q_per_sample(critic: nn.Module, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
-    """Scalar Q per batch row for actor objectives (twin mean, or expected Q if distributional)."""
+    """Scalar Q(twin mean) per leading batch row via :meth:`~TwinQNetwork.get_values`."""
     with hold_out_net(critic):
-        qs = critic(obs, act)
-        if hasattr(critic, "expected_values"):
-            q = critic.expected_values(qs).mean(dim=-1)
-        else:
-            q = qs.mean(dim=-1)
+        v = critic.get_values(obs, act)
+        q = v.mean(dim=-1)
     return q.reshape(obs.shape[0])
 
 
