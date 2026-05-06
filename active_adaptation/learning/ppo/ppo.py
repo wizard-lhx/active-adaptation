@@ -267,6 +267,7 @@ class PPOPolicy(PPOBase):
         infos["actor/pg_loss_raw_before"] = pg_loss_before.mean().item()
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_std"] = tensordict["ret"].std().item()
+        infos["critic/value_max"] = tensordict["ret"].max().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
         infos["critic/valid_ratio"] = valid_ratio.item()
         

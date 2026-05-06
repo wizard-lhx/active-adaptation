@@ -2,7 +2,7 @@ import copy
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Tuple, Any
+from typing import Any, Literal, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,10 +14,8 @@ from tensordict.nn import (
 )
 
 from torchrl.data import Composite, TensorSpec
-from torchrl.objectives import hold_out_net
 
-from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm
-from active_adaptation.learning.modules.distributions import IndependentNormal
+from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm, SimbaMLP
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     DONE_KEY,
@@ -29,11 +27,27 @@ from active_adaptation.learning.ppo.common import (
 )
 
 from active_adaptation.learning.offpolicy.buffer import ReplayBuffer
-from active_adaptation.learning.offpolicy.objectives import MultiStepReturn
+from active_adaptation.learning.offpolicy.distributional import (
+    ValueDistribution,
+    expected_q_from_logits,
+)
+from active_adaptation.learning.offpolicy.objectives import MultiStepReturn, SACLoss
 from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
+from active_adaptation.learning.utils.opt import MuonAdamWWrapper
+from active_adaptation.learning.utils.dormancy import DormancyTracker
 
 
 cs = ConfigStore.instance()
+
+
+def gaussian_target_entropy(act_dim: int, sigma: float) -> float:
+    """Differential entropy of independent \\mathcal N(0, \\sigma^2) in \\mathbb R^d (FlashSAC-style).
+
+    H = (d/2) * log(2 * pi * e * sigma^2). Used as SAC log-alpha target when ``target_entropy_sigma`` is set.
+    """
+    if sigma <= 0:
+        raise ValueError("target_entropy_sigma must be positive for principled entropy.")
+    return 0.5 * float(act_dim) * math.log(2.0 * math.pi * math.e * sigma * sigma)
 
 
 def _init_sac_linear(m: nn.Module, gain: float = 1.0):
@@ -50,20 +64,34 @@ class SACConfig:
     buffer_size: int = 5000
     warm_up_steps: int = 200
     lr: float = 5e-4
+    # If True, actor/Q use :class:`~active_adaptation.learning.utils.opt.MuonAdamWWrapper` (see ``ppo_symaug``).
+    muon: bool = False
+    weight_decay: float = 0.02
     # TD learning
-    n_steps: int = 4
+    n_steps: int = 3
     gamma: float = 0.99
     utd_ratio: int = 4
     # architecture
-    actor_vecnorm: Any = "pre"
-    critic_vecnorm: Any = "pre"
+    actor_init: str = "zeros"
+    actor_layer_norm: Any = "pre"
+    critic_layer_norm: Any = "pre"
+    distributional: bool = True
     # batch sizes
     critic_batch_size: int = 2048
-    actor_batch_size: int = 1024
+    actor_batch_size: int = 2048
+    sym_aug: bool = False
     # target smoothing: this should help Q(s_t, a_t) to generalize locally around a_t
     target_action_noise: float = 0.01
+    # AR(1) pre-tanh exploration noise on rollout only: eps_t = rho * eps_{t-1} + sqrt(1-rho^2) * N(0,I).
+    # 0 disables correlation (standard :meth:`ScaledTanhNormal.sample`-equivalent path). Critic/actor still use iid.
+    use_correlated: bool = True
+    # BC-style anchor on replay actions; curbs Q exploitation (:class:`SACLoss`).
+    actor_behavior_coef: float = 0.0
     # sac specific
     entropy_bonus: float = 0.0
+    # If set: H_target = (d/2)*log(2*pi*e*sigma^2) for N(0,sigma^2)^d (FlashSAC).
+    # If None: use -dim(A) (common heuristic for tanh-squashed SAC).
+    target_entropy_sigma: float | None = 0.15
 
     tau_actor: float = 0.1 # a relatively large value for faster convergence
     tau_Q: float = 0.2  # a relatively large value for faster convergence
@@ -89,7 +117,7 @@ class TwinQNetwork(nn.Module):
         obs_dim: int,
         act_dim: int,
         activation: type[nn.Module] = nn.SiLU,
-        layer_norm = "pre"
+        layer_norm: Literal["pre", "post", None] = "pre"
     ):
         super().__init__()
         critic_input_dim = obs_dim + act_dim
@@ -101,6 +129,8 @@ class TwinQNetwork(nn.Module):
             ResidualMLP([critic_input_dim, 512, 512, 512], activation),
             nn.Linear(512, 1),
         )
+        for c in (self.critic_1, self.critic_2):
+            c[-1].weight._non_muon = True
         self.reset_parameters()
     
     def reset_parameters(self):
@@ -112,6 +142,158 @@ class TwinQNetwork(nn.Module):
         q1 = self.critic_1(x)
         q2 = self.critic_2(x)
         return torch.cat([q1, q2], dim=-1)
+    
+    def get_values(
+        self,
+        obs: torch.Tensor,  # [B, obs_dim]
+        act: torch.Tensor,  # [B, act_dim] or [B, K, act_dim] for multiple actions
+    ) -> torch.Tensor:
+        """Twin Q-head scalars: shape ``[..., 2]`` (broadcast same as :meth:`forward`)."""
+        if act.dim() == 2:
+            return self(obs, act)
+        if act.dim() == 3:
+            b, k, _ = act.shape
+            obs_exp = obs.unsqueeze(1).expand(b, k, obs.shape[-1]).reshape(b * k, obs.shape[-1])
+            act_flat = act.reshape(b * k, act.shape[-1])
+            qs = self.forward(obs_exp, act_flat)
+            return qs.reshape(b, k, 2)
+        raise ValueError(f"act must be rank 2 or 3, got shape {tuple(act.shape)}")
+    
+    def compute_loss(
+        self,
+        qs: torch.Tensor,
+        q_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Twin Q regression to scalar Bellman target (mean over batch)."""
+        return (qs - q_target).square().sum(dim=-1).mean()
+
+
+class TwinDistributionalQNetwork(nn.Module):
+    """Twin C51-style critics: logits per atom, shared discrete support (see td3dist / FastSAC)."""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        num_atoms: int,
+        v_min: float,
+        v_max: float,
+        activation: type[nn.Module] = nn.SiLU,
+        simba_mlp: bool = False,
+    ):
+        super().__init__()
+        if num_atoms < 3:
+            raise ValueError("num_atoms must be > 2 for distributional Q.")
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.num_atoms = num_atoms
+
+        critic_input_dim = obs_dim + act_dim
+    
+        def make_critic():
+            if simba_mlp:
+                in_layer = nn.Linear(critic_input_dim, 512)
+                in_layer.weight._non_muon = True
+                out_layer = nn.Linear(512, num_atoms)
+                out_layer.weight._non_muon = True
+                return nn.Sequential(
+                    in_layer,
+                    SimbaMLP(512, 2, activation),
+                    nn.LayerNorm(512),
+                    out_layer,
+                )
+            else:
+                out_layer = nn.Linear(512, num_atoms)
+                out_layer.weight._non_muon = True
+                return nn.Sequential(
+                    MLP([critic_input_dim, 512, 512, 512], activation, first_non_muon=True),
+                    out_layer,
+                )
+
+        self.critic_1 = make_critic()
+        self.critic_2 = make_critic()
+
+        self.register_buffer(
+            "q_support",
+            torch.linspace(v_min, v_max, num_atoms),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.critic_1.apply(_init_sac_linear)
+        self.critic_2.apply(_init_sac_linear)
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([obs, act], dim=-1)
+        z1 = self.critic_1(x)
+        z2 = self.critic_2(x)
+        return torch.cat([z1, z2], dim=-1)
+
+    def get_values(
+        self,
+        obs: torch.Tensor,  # [B, obs_dim]
+        act: torch.Tensor,  # [B, act_dim] or [B, K, act_dim] for multiple actions
+    ) -> torch.Tensor:
+        """Expected Q per twin head: shape ``[..., 2]`` (from logits / categorical support)."""
+        if act.dim() == 2:
+            return self.expected_values(self(obs, act))
+        if act.dim() == 3:
+            b, k, _ = act.shape
+            obs_exp = obs.unsqueeze(1).expand(b, k, obs.shape[-1]).reshape(b * k, obs.shape[-1])
+            act_flat = act.reshape(b * k, act.shape[-1])
+            logits = self.forward(obs_exp, act_flat)
+            ev = self.expected_values(logits)
+            return ev.reshape(b, k, 2)
+        raise ValueError(f"act must be rank 2 or 3, got shape {tuple(act.shape)}")
+
+    def compute_loss(
+        self,
+        qs_logits: torch.Tensor,
+        target_dist: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum of categorical cross-entropies for both twins versus ``target_dist`` (mean over batch)."""
+        q1, q2 = qs_logits.chunk(2, dim=-1)
+        log_p1 = F.log_softmax(q1, dim=-1).clamp(min=-30.0)
+        log_p2 = F.log_softmax(q2, dim=-1).clamp(min=-30.0)
+        return -(
+            (target_dist * log_p1).sum(-1) + (target_dist * log_p2).sum(-1)
+        ).mean()
+
+    def expected_values(self, logits_pair: torch.Tensor) -> torch.Tensor:
+        """Expected Q under softmax for each twin: logits_pair [B, 2 * num_atoms] -> [B, 2]."""
+        log1, log2 = logits_pair.chunk(2, dim=-1)
+        e1 = expected_q_from_logits(log1, self.q_support)
+        e2 = expected_q_from_logits(log2, self.q_support)
+        return torch.cat([e1, e2], dim=-1)
+
+    def bellman_projection(
+        self,
+        next_logits: torch.Tensor,
+        rewards: torch.Tensor,
+        discount: torch.Tensor | float,
+    ) -> torch.Tensor:
+        """Categorical projection (Bellman backup onto the fixed support)."""
+        return ValueDistribution(next_logits, self.q_support).project(rewards, discount)
+
+
+
+class _SACDormancyScope(nn.Module):
+    """Modules exercised during SAC rollout + learner forwards (:class:`DormancyTracker` hooks)."""
+
+    def __init__(
+        self,
+        vecnorm_obs: nn.Module,
+        actor: nn.Module,
+        actor_target: nn.Module,
+        q_online: nn.Module,
+        q_target: nn.Module,
+    ):
+        super().__init__()
+        self.vecnorm_obs = vecnorm_obs
+        self.actor = actor
+        self.actor_target = actor_target
+        self.Q = q_online
+        self.Q_target = q_target
 
 
 class TanhNormalActor(nn.Module):
@@ -123,13 +305,31 @@ class TanhNormalActor(nn.Module):
         act_dim: int,
         layer_norm: str = None,
         std_max: float = 0.5,
-        std_min: float | None = None,
+        std_min: float | None = None, # keep for future use
+        action_init: Literal["zeros", "orthogonal"] = "zeros",
     ):
         super().__init__()
-        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+
+        self.trunk = MLP(
+            [obs_dim, 256, 256, 256],
+            nn.SiLU,
+            layer_norm=layer_norm,
+            first_non_muon=True,
+        )
         self.action = nn.Linear(256, act_dim * 2)
+        self.action.weight._non_muon = True
         self.trunk.apply(_init_sac_linear)
-        self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
+        
+        if action_init == "orthogonal":
+            self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
+        elif action_init == "zeros":
+            # zero-init following FastSAC
+            nn.init.constant_(self.action.weight, 0.0) # zero-init the weight
+            nn.init.constant_(self.action.bias, 0.0) # zero-init the bias
+        else:
+            raise ValueError(f"Invalid action_init: {action_init}")
         
         self.upscale: torch.Tensor
         self.register_buffer("upscale", torch.ones(act_dim))
@@ -142,41 +342,7 @@ class TanhNormalActor(nn.Module):
         feat = self.trunk(obs)
         mean, raw = self.action(feat).chunk(2, dim=-1)
         log_std = self.log_std_max - F.softplus(raw)
-        dist = ScaledTanhNormal(mean, torch.exp(log_std), upscale=self.upscale)
-        return dist, feat
-
-
-class NormalActor(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        act_dim: int,
-        layer_norm: str = None,
-        pred_std: bool = False,
-    ):
-        super().__init__()
-        self.pred_std = pred_std
-        self.trunk = MLP([obs_dim, 256, 256, 256], nn.SiLU, layer_norm=layer_norm)
-        if self.pred_std:
-            self.action = nn.Linear(256, act_dim * 2)
-            self.log_std_max = math.log(1.0)
-        else:
-            self.action = nn.Linear(256, act_dim)
-            self.log_std = nn.Parameter(torch.zeros(act_dim))
-        self.trunk.apply(_init_sac_linear)
-        self.action.apply(lambda m: _init_sac_linear(m, gain=0.01))
-    
-    def forward(self, obs: torch.Tensor):
-        feat = self.trunk(obs)
-        if self.pred_std:
-            mean, raw = self.action(feat).chunk(2, dim=-1)
-            log_std = self.log_std_max - F.softplus(raw)
-            dist = IndependentNormal(mean, torch.exp(log_std))
-        else:
-            mean = self.action(feat)
-            log_std = torch.exp(self.log_std) * torch.ones_like(mean)
-            dist = IndependentNormal(mean, log_std)
-        return dist, feat
+        return mean, torch.exp(log_std)
 
 
 class SAC(TensorDictModuleBase):
@@ -205,20 +371,45 @@ class SAC(TensorDictModuleBase):
             self.vecnorm_obs = VecNorm(obs_dim, decay=1.0).to(device)
         else:
             self.vecnorm_obs = nn.Identity()
+        
+        try:
+            self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transform().to(device)
+            self.act_transform = env.action_manager.symmetry_transform().to(device)
+            self.has_symmetry = True
+        except NotImplementedError as e:
+            if self.cfg.sym_aug:
+                raise ValueError(f"Symmetry augmentation is not supported for this environment: {e}")
+            self.has_symmetry = False
 
-        self.Q = TwinQNetwork(obs_dim, act_dim, layer_norm=self.cfg.critic_vecnorm).to(device)
-        self.V = nn.Sequential(
-            MLP([obs_dim, 512, 512], nn.SiLU),
-            nn.Linear(512, 1),
-        ).to(device)
-        self.V.apply(_init_sac_linear)
+        if self.cfg.distributional:
+            v_min, v_max = -1.0, 9.0
+            num_atoms = int((v_max - v_min) / 0.05) + 1
+            self.Q = TwinDistributionalQNetwork(
+                obs_dim,
+                act_dim,
+                num_atoms=num_atoms,
+                v_min=v_min, # we actually do not have negative values, but it is a good idea to have a small margin
+                v_max=v_max 
+            ).to(device)
+            self.V = nn.Identity()  # unused; keeps optim / checkpoint layout stable
+            self.V_quantile = 0.7
+        else:
+            self.Q = TwinQNetwork(obs_dim, act_dim, layer_norm=self.cfg.critic_layer_norm).to(device)
+            self.V = nn.Sequential(
+                MLP([obs_dim, 512, 512], nn.SiLU),
+                nn.Linear(512, 1),
+            ).to(device)
+            self.V.apply(_init_sac_linear)
+            self.V_quantile = 0.7
 
         self.gae = GAE(self.cfg.gamma, self.cfg.gae_lambda).to(device)
+        self.dist_class = ScaledTanhNormal
         self.actor = TanhNormalActor(
             obs_dim,
             act_dim,
-            layer_norm=self.cfg.actor_vecnorm,
-            std_max=0.5,
+            layer_norm=self.cfg.actor_layer_norm,
+            std_max=0.9,
+            action_init=self.cfg.actor_init,
         ).to(device)
 
         self.Q_target = copy.deepcopy(self.Q).to(device)
@@ -226,12 +417,29 @@ class SAC(TensorDictModuleBase):
         self.Q_target.requires_grad_(False)
         self.actor_target.requires_grad_(False)
 
-        self.target_entropy = -float(act_dim)
+        if self.cfg.target_entropy_sigma is not None:
+            self.target_entropy = gaussian_target_entropy(
+                act_dim, self.cfg.target_entropy_sigma
+            )
+        else:
+            self.target_entropy = -float(act_dim)
         self.log_alpha = nn.Parameter(torch.tensor(0.0, device=device))
         self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=self.cfg.lr_alpha)
-        self.opt_actor = torch.optim.Adam(self.actor.parameters(), lr=self.cfg.lr)
-        self.opt_Q = torch.optim.Adam(self.Q.parameters(), lr=self.cfg.lr)
-        self.opt_V = torch.optim.Adam(self.V.parameters(), lr=self.cfg.lr)
+        if self.cfg.muon:
+            self.opt_actor = MuonAdamWWrapper(
+                [self.actor],
+                lr=self.cfg.lr,
+                weight_decay=self.cfg.weight_decay,
+            )
+            self.opt_Q = MuonAdamWWrapper(
+                [self.Q],
+                lr=self.cfg.lr,
+                weight_decay=self.cfg.weight_decay,
+            )
+        else:
+            self.opt_actor = torch.optim.AdamW(self.actor.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+            self.opt_Q = torch.optim.AdamW(self.Q.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        # self.opt_V = torch.optim.Adam(self.V.parameters(), lr=self.cfg.lr)
 
         self.global_step = 0
 
@@ -243,22 +451,75 @@ class SAC(TensorDictModuleBase):
             .detach()
             .cpu()
         )
+        fake_rb["loc"] = torch.zeros(fake_rb.shape[0], self.actor.act_dim)
         self.rb = ReplayBuffer(self.cfg.buffer_size, fake_rb)
         self.msr = (
             MultiStepReturn(self.cfg.gamma, self.cfg.n_steps).to(device)
             if self.cfg.n_steps > 1
             else None
         )
+        self.sac_actor_loss = SACLoss(behavior_coef=self.cfg.actor_behavior_coef)
+
+        scope = _SACDormancyScope(
+            self.vecnorm_obs,
+            self.actor,
+            self.actor_target,
+            self.Q,
+            self.Q_target,
+        )
+        self._dormancy_tracker = DormancyTracker(scope)
+
+    def _flush_dormancy(self, infos: dict) -> None:
+        dormancy = self._dormancy_tracker.compute_dormancy(0.02)
+        for module_name, value in dormancy.items():
+            infos[f"dormancy/{module_name}"] = value
+        self._dormancy_tracker.reset()
+
+    def make_tensordict_primer(self):
+        """Register correlated-noise state **before** constructing :class:`SAC` so replay ``fake_tensordict`` matches rollouts."""
+        from torchrl.envs import TensorDictPrimer
+        from torchrl.data import UnboundedContinuous, BoundedContinuous, Composite
+
+        shape = tuple(self.action_spec.shape)
+        dev = torch.device(self.device)
+        spec = {
+            "prev_noise": UnboundedContinuous(shape, device=dev),
+            "rho": BoundedContinuous(low=0.0, high=1.0, shape=[shape[0], 1], device=dev)
+        }
+        return TensorDictPrimer(
+            Composite(spec, shape=[shape[0]], device=dev),
+            random=self.cfg.use_correlated,
+            reset_key="done",
+            expand_specs=False,
+        )
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
-        """Train mode stochastic exploration; eval/deploy use deterministic Tanh-normal mean."""
+        """Train: optional AR(1) pre-tanh rollout noise; eval/deploy: deterministic squash of the Gaussian mean."""
+
         def policy(tensordict: TensorDict):
             obs = self.vecnorm_obs(tensordict[OBS_KEY])
-            dist, _ = self.actor(obs)
-            action = dist.sample()
-            tensordict[ACTION_KEY] = action
+            loc, scale = self.actor(obs)
+            dist = self.dist_class(loc, scale, upscale=self.actor.upscale)
+
+            if self.cfg.use_correlated:
+                prev_noise = tensordict["prev_noise"]
+                rho = tensordict["rho"]
+                noise = (
+                    rho * prev_noise 
+                    + torch.sqrt((1.0 - rho.square())) * torch.randn_like(loc)
+                )
+                sample = loc + noise * scale
+                tensordict["next", "prev_noise"] = noise
+                for transform in dist.transforms:
+                    sample = transform(sample)
+            else:
+                sample = dist.sample()
+
+            tensordict[ACTION_KEY] = sample
+            tensordict["loc"] = loc
             return tensordict
-        return policy
+
+        return self._dormancy_tracker.wrap(policy)
 
     def on_stage_start(self, stage: str):
         self.enable_actor = True
@@ -267,7 +528,7 @@ class SAC(TensorDictModuleBase):
     def train_op(self, tensordict: TensorDict):
         self.global_step += self.cfg.train_every
 
-        td = tensordict.exclude(("next", "stats"), "collector").detach()
+        td = tensordict.exclude(("next", "stats"), "collector")
         reward = td[REWARD_KEY]
         # KEEP THIS FOR DEBUGGING
         if self.cfg.debug:
@@ -292,30 +553,31 @@ class SAC(TensorDictModuleBase):
 
         infos: dict = {"rb_size": len(self.rb), "critic/neg_rew_ratio": neg_rew_ratio}
         if self.global_step < self.cfg.warm_up_steps:
+            self._flush_dormancy(infos)
             return infos
 
-        for _ in range(self.cfg.train_every * self.cfg.utd_ratio):
-            infos.update(self.train_critic())
+        with self._dormancy_tracker.track():
+            for _ in range(self.cfg.train_every * self.cfg.utd_ratio):
+                infos.update(self.train_critic())
 
-        if self.enable_actor:
-            for _ in range(self.cfg.train_every):
-                infos.update(self.train_actor())
+            if self.enable_actor:
+                for _ in range(self.cfg.train_every):
+                    infos.update(self.train_actor())
 
-        if self.global_step % self.cfg.v_update_every == 0:
-            for _ in range(self.cfg.v_inner):
-                infos.update(self.train_v())
+        # if self.global_step % self.cfg.v_update_every == 0:
+        #     for _ in range(self.cfg.v_inner):
+        #         infos.update(self.train_v())
 
+        self._flush_dormancy(infos)
         return dict(sorted(infos.items()))
 
     def train_critic(self):
         batch = self.rb.sample(
             batch_size=self.cfg.critic_batch_size,
             steps=self.cfg.n_steps
-        ).to(self.device)
+        ).to(self.device) # [T, N]
 
         reward = batch[REWARD_KEY]
-        if not isinstance(reward, torch.Tensor):
-            reward = sum(reward.values())
 
         if self.cfg.n_steps == 1:
             obs = batch[OBS_KEY]
@@ -338,53 +600,121 @@ class SAC(TensorDictModuleBase):
         next_obs = self.vecnorm_obs(next_obs)
 
         with torch.no_grad():
-            dist, _ = self.actor_target(next_obs)
+            # actions are sampled with uncorrelated noise
+            loc, scale = self.actor_target(next_obs)
+            dist = self.dist_class(loc, scale, upscale=self.actor.upscale)
             next_action = dist.sample()
+
             next_log_prob = dist.log_prob(next_action)
             target_action = next_action + torch.randn_like(next_action) * self.cfg.target_action_noise
-            target_qs = self.Q_target(next_obs, target_action)
-            target_q = target_qs.mean(dim=-1, keepdim=True)
             alpha = self.log_alpha.exp()
-            entropy_bonus = - alpha * next_log_prob.reshape_as(target_q)
-            td_target: torch.Tensor = reward + discount * (target_q + self.cfg.entropy_bonus * entropy_bonus)
+            lp = next_log_prob
+            if lp.dim() == 1:
+                lp = lp.unsqueeze(-1)
+            if lp.shape != reward.shape:
+                lp = lp.reshape_as(reward)
+
+            if self.cfg.distributional:
+                assert isinstance(self.Q, TwinDistributionalQNetwork)
+                # Fold soft Bellman entropy into rewards, then categorical projection (FastSAC-style).
+                adjusted_reward = reward + discount * self.cfg.entropy_bonus * (-alpha * lp)
+                next_logits = self.Q_target(next_obs, target_action)
+                n1, n2 = next_logits.chunk(2, dim=-1)
+                p1 = self.Q_target.bellman_projection(n1, adjusted_reward, discount)
+                p2 = self.Q_target.bellman_projection(n2, adjusted_reward, discount)
+                z = self.Q_target.q_support.to(
+                    device=p1.device, dtype=p1.dtype
+                ).view(1, -1)
+                ev1 = (p1 * z).sum(-1, keepdim=True)
+                ev2 = (p2 * z).sum(-1, keepdim=True)
+                q_target = torch.where(ev1 < ev2, p1, p2)
+            else:
+                entropy_bonus = -alpha * lp
+                if entropy_bonus.shape != reward.shape:
+                    entropy_bonus = entropy_bonus.reshape_as(reward)
+                target_qs = self.Q_target(next_obs, target_action)
+                target_q = target_qs.mean(dim=-1, keepdim=True)
+                q_target = reward + discount * (
+                    target_q + self.cfg.entropy_bonus * entropy_bonus
+                )
+
+        if self.cfg.sym_aug:
+            # Q(s, a) = Q(s_mirror, a_mirror)
+            obs_mirror = self.obs_transform(obs)
+            act_mirror = self.act_transform(act)
+            obs = torch.cat([obs, obs_mirror], dim=0)
+            act = torch.cat([act, act_mirror], dim=0)
+            q_target = torch.cat([q_target, q_target], dim=0)
 
         qs: torch.Tensor = self.Q(obs, act)
-        critic_loss = (qs - td_target).square().sum(-1).mean()
+        q_loss = self.Q.compute_loss(qs, q_target)
 
         self.opt_Q.zero_grad(set_to_none=True)
-        critic_loss.backward()
+        q_loss.backward()
         self.opt_Q.step()
         soft_copy_(self.Q, self.Q_target, tau=self.cfg.tau_Q)
 
+        # Optional: use expectile regression to estimate the value
+        # v_pred = self.V(obs)
+        # q_pred = qs.detach().max(dim=-1, keepdim=True).values
+        # assert q_pred.shape == v_pred.shape
+        # v_err = q_pred - v_pred
+        # vf_sign = (v_err < 0).float()
+        # vf_weight = (1 - vf_sign) * self.V_quantile + vf_sign * (1 - self.V_quantile)
+        # vf_loss = (vf_weight * (v_err ** 2)).mean()
+
+        # self.opt_V.zero_grad(set_to_none=True)
+        # vf_loss.backward()
+        # self.opt_V.step()
+
+        with torch.no_grad():
+            q_h = self.Q.get_values(obs.detach(), act.detach())
+        q_val_mean = q_h.mean().item()
+        q_val_max = q_h.max().item()
+        q_val_std = q_h.std(dim=-1).mean().item()
+
         return {
-            "critic/q_loss": critic_loss.item(),
-            "critic/q_value": qs.detach().mean().item(),
-            "critic/q_std": qs.detach().std(dim=-1).mean().item(),
+            "critic/q_loss": q_loss.item(),
+            "critic/q_value": q_val_mean,
+            "critic/q_max": q_val_max, # check if hitting the bound in distributional case
+            "critic/q_std": q_val_std,
+            # "critic/v_loss": vf_loss.item(),
+            # "critic/v_value": v_pred.mean().item(),
+            # "critic/v_err": v_err.mean().item(),
         }
 
     def train_actor(self):
         batch = self.rb.sample(batch_size=self.cfg.actor_batch_size, steps=1).to(
             self.device
-        )
+        ) # [N,]
+
         obs = batch[OBS_KEY]
         obs = self.vecnorm_obs(obs)
+        act = batch[ACTION_KEY]
 
-        with hold_out_net(self.Q):
-            dist, feature = self.actor(obs)
-            action_update = dist.rsample()
-            log_prob = dist.log_prob(action_update)
-            qs = self.Q(obs, action_update)
-
-        q_value = torch.mean(qs, dim=-1)
-        if isinstance(dist, IndependentNormal):
-            entropy = dist.entropy()
+        if self.cfg.sym_aug:
+            obs_mirror = self.obs_transform(obs)
+            act_mirror = self.act_transform(act)
+            obs = torch.cat([obs, obs_mirror], dim=0)
+            act = torch.cat([act, act_mirror], dim=0)
+            batch_size = [batch.shape[0] * 2]
         else:
-            entropy = -log_prob
+            batch_size = [batch.shape[0]]
+
+        td_actor = TensorDict(
+            {OBS_KEY: obs, ACTION_KEY: act},
+            batch_size=batch_size,
+        )
+        policy_term, entropy_est, dist, action_update = self.sac_actor_loss.compute(
+            td_actor, self.actor, self.Q
+        )
         alpha = self.log_alpha.exp()
-        actor_loss = (alpha.detach() * - entropy.reshape_as(q_value) - q_value).mean()
+        actor_loss = (
+            alpha.detach() * (-entropy_est.reshape_as(policy_term)) + policy_term
+        ).mean()
 
         self.opt_alpha.zero_grad(set_to_none=True)
-        alpha_loss = -(alpha * (log_prob.detach() + self.target_entropy).detach()).mean()
+        alpha_loss = -(alpha * (-entropy_est.detach() + self.target_entropy)).mean()
         alpha_loss.backward()
         self.opt_alpha.step()
 
@@ -396,14 +726,14 @@ class SAC(TensorDictModuleBase):
         self.opt_actor.step()
         soft_copy_(self.actor, self.actor_target, tau=self.cfg.tau_actor)
 
-        entropy_std = entropy.std()
+        # how much the action mean changes compared to that in the replay buffer
+        mean_change = (dist.loc[:batch.shape[0]].detach() - batch["loc"]).abs().mean()
         infos = {
             "actor/loss": actor_loss.item(),
+            "actor/mean_change": mean_change.item(),
             "actor/grad_norm": actor_grad_norm.item(),
             "actor/alpha": alpha.detach().item(),
-            "actor/entropy": entropy.mean().item(),
-            "actor/entropy_std": entropy_std.item(),
-            "actor/feature_norm": feature.detach().norm(dim=-1).mean().item(),
+            "actor/entropy": entropy_est.mean().item(),
         }
         actor_diagnostics = {}
         if isinstance(dist, ScaledTanhNormal):
@@ -423,7 +753,15 @@ class SAC(TensorDictModuleBase):
                 "actor/tanh_grad_min": tanh_grad.min().item(),
                 "actor/upscale": dist.upscale.mean().item(),
             }
-            self.actor.upscale.add_((dim_saturation > 0.1).float() * 3e-4)
+            self.actor.upscale.add_((dim_saturation > 0.15).float() * 3e-4)
+        
+        if self.has_symmetry:
+            with torch.no_grad():
+                _obs = obs[:batch.shape[0]]
+                mean_mirror_obs = self.actor(self.obs_transform(_obs))[0]
+                mean_mirrot_act = self.act_transform(self.actor(_obs)[0])
+            infos["actor/symmetry_loss"] = (mean_mirror_obs - mean_mirrot_act).square().mean().item()
+        
         infos.update(actor_diagnostics)
         return infos
 
@@ -476,11 +814,10 @@ class SAC(TensorDictModuleBase):
         state_dict["Q"] = self.Q.state_dict()
         state_dict["V"] = self.V.state_dict()
         state_dict["actor"] = self.actor.state_dict()
-        state_dict["Q_target"] = self.Q_target.state_dict()
-        state_dict["actor_target"] = self.actor_target.state_dict()
-        state_dict["opt_actor"] = self.opt_actor.state_dict()
-        state_dict["opt_Q"] = self.opt_Q.state_dict()
-        state_dict["opt_V"] = self.opt_V.state_dict()
+        # do not store opt states as they make the ckpt very large
+        # state_dict["opt_actor"] = self.opt_actor.state_dict()
+        # state_dict["opt_Q"] = self.opt_Q.state_dict()
+        # state_dict["opt_V"] = self.opt_V.state_dict()
         state_dict["opt_alpha"] = self.opt_alpha.state_dict()
         state_dict["log_alpha"] = self.log_alpha.detach()
         state_dict["vecnorm_obs"] = self.vecnorm_obs.state_dict()
@@ -490,11 +827,13 @@ class SAC(TensorDictModuleBase):
         self.Q.load_state_dict(state_dict["Q"], strict=strict)
         self.V.load_state_dict(state_dict["V"], strict=strict)
         self.actor.load_state_dict(state_dict["actor"], strict=strict)
-        self.Q_target.load_state_dict(state_dict["Q_target"], strict=strict)
-        self.actor_target.load_state_dict(state_dict["actor_target"], strict=strict)
-        self.opt_actor.load_state_dict(state_dict["opt_actor"])
-        self.opt_Q.load_state_dict(state_dict["opt_Q"])
-        self.opt_V.load_state_dict(state_dict["opt_V"])
+        # reuse the same state dict for target networks
+        self.Q_target.load_state_dict(state_dict["Q"], strict=strict)
+        self.actor_target.load_state_dict(state_dict["actor"], strict=strict)
+        # do not store opt states as they make the ckpt very large
+        # self.opt_actor.load_state_dict(state_dict["opt_actor"])
+        # self.opt_Q.load_state_dict(state_dict["opt_Q"])
+        # self.opt_V.load_state_dict(state_dict["opt_V"])
         self.opt_alpha.load_state_dict(state_dict["opt_alpha"])
         self.log_alpha.data = state_dict["log_alpha"].to(self.device)
         self.vecnorm_obs.load_state_dict(state_dict["vecnorm_obs"])

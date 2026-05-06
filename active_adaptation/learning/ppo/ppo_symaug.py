@@ -290,6 +290,7 @@ class PPOPolicy(TensorDictModuleBase):
         infos["critic/effective_rank"] = critic_effective_rank.item()
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
         infos["critic/value_std"] = tensordict["ret"].std().item()
+        infos["critic/value_max"] = tensordict["ret"].max().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
         
         if self.cfg.debug and self._rollout_dormancy_tracker is not None:
