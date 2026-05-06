@@ -180,12 +180,14 @@ class TwinDistributionalQNetwork(nn.Module):
         num_atoms: int,
         v_min: float,
         v_max: float,
-        activation: type[nn.Module] = nn.SiLU,
+        activation: str| type[nn.Module] = nn.SiLU,
         simba_mlp: bool = False,
     ):
         super().__init__()
         if num_atoms < 3:
             raise ValueError("num_atoms must be > 2 for distributional Q.")
+        if isinstance(activation, str):
+            activation = getattr(nn, activation)
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_atoms = num_atoms
@@ -379,7 +381,7 @@ class SAC(TensorDictModuleBase):
             self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transform().to(device)
             self.act_transform = env.action_manager.symmetry_transform().to(device)
             self.has_symmetry = True
-        except NotImplementedError as e:
+        except (NotImplementedError, AttributeError) as e:
             if self.cfg.sym_aug:
                 raise ValueError(f"Symmetry augmentation is not supported for this environment: {e}")
             self.has_symmetry = False
@@ -392,7 +394,8 @@ class SAC(TensorDictModuleBase):
                 act_dim,
                 num_atoms=num_atoms,
                 v_min=v_min, # we actually do not have negative values, but it is a good idea to have a small margin
-                v_max=v_max 
+                v_max=v_max,
+                simba_mlp=True
             ).to(device)
             self.V = nn.Identity()  # unused; keeps optim / checkpoint layout stable
             self.V_quantile = 0.7
@@ -707,6 +710,7 @@ class SAC(TensorDictModuleBase):
             loc, scale = self.actor(obs)
             dist = ScaledTanhNormal(loc, scale, upscale=self.actor.upscale)
             action_update = dist.rsample()
+            action_update.retain_grad()
             entropy_est = -dist.log_prob(action_update)
             q = self.Q.get_values(obs, action_update).mean(dim=-1)
             # if self.cfg.sym_aug:
@@ -757,8 +761,8 @@ class SAC(TensorDictModuleBase):
                 "actor/mean_saturation": mean_saturation.float().mean().item(),
                 "actor/max_saturation": dim_saturation.max().item(),
                 "actor/tanh_grad": tanh_grad.mean().item(),
-                "actor/tanh_grad_min": tanh_grad.min().item(),
                 "actor/upscale": dist.upscale.mean().item(),
+                "actor/action_grad_norm": action_update.grad.norm(dim=-1).mean().item(),
             }
             # self.actor.upscale.add_((dim_saturation > 0.15).float() * 5e-4)
         
