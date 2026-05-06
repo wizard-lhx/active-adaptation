@@ -14,6 +14,7 @@ from tensordict.nn import (
 )
 
 from torchrl.data import Composite, TensorSpec
+from torchrl.objectives import hold_out_net
 
 from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm, SimbaMLP
 from active_adaptation.learning.ppo.common import (
@@ -73,6 +74,7 @@ class SACConfig:
     utd_ratio: int = 4
     # architecture
     actor_init: str = "zeros"
+    init_upscale: float = 2.0
     actor_layer_norm: Any = "pre"
     critic_layer_norm: Any = "pre"
     distributional: bool = True
@@ -307,6 +309,7 @@ class TanhNormalActor(nn.Module):
         std_max: float = 0.5,
         std_min: float | None = None, # keep for future use
         action_init: Literal["zeros", "orthogonal"] = "zeros",
+        init_upscale: float = 1.0,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -332,7 +335,7 @@ class TanhNormalActor(nn.Module):
             raise ValueError(f"Invalid action_init: {action_init}")
         
         self.upscale: torch.Tensor
-        self.register_buffer("upscale", torch.ones(act_dim))
+        self.register_buffer("upscale", torch.ones(act_dim) * init_upscale)
         
         if not std_max > 0.0:
             raise ValueError("std_max must be positive")
@@ -410,6 +413,7 @@ class SAC(TensorDictModuleBase):
             layer_norm=self.cfg.actor_layer_norm,
             std_max=0.9,
             action_init=self.cfg.actor_init,
+            init_upscale=self.cfg.init_upscale,
         ).to(device)
 
         self.Q_target = copy.deepcopy(self.Q).to(device)
@@ -451,6 +455,7 @@ class SAC(TensorDictModuleBase):
             .detach()
             .cpu()
         )
+        fake_rb[REWARD_KEY] = fake_rb[REWARD_KEY].sum(-1, keepdim=True)
         fake_rb["loc"] = torch.zeros(fake_rb.shape[0], self.actor.act_dim)
         self.rb = ReplayBuffer(self.cfg.buffer_size, fake_rb)
         self.msr = (
@@ -697,17 +702,19 @@ class SAC(TensorDictModuleBase):
             act_mirror = self.act_transform(act)
             obs = torch.cat([obs, obs_mirror], dim=0)
             act = torch.cat([act, act_mirror], dim=0)
-            batch_size = [batch.shape[0] * 2]
-        else:
-            batch_size = [batch.shape[0]]
 
-        td_actor = TensorDict(
-            {OBS_KEY: obs, ACTION_KEY: act},
-            batch_size=batch_size,
-        )
-        policy_term, entropy_est, dist, action_update = self.sac_actor_loss.compute(
-            td_actor, self.actor, self.Q
-        )
+        with hold_out_net(self.Q):
+            loc, scale = self.actor(obs)
+            dist = ScaledTanhNormal(loc, scale, upscale=self.actor.upscale)
+            action_update = dist.rsample()
+            entropy_est = -dist.log_prob(action_update)
+            q = self.Q.get_values(obs, action_update).mean(dim=-1)
+            # if self.cfg.sym_aug:
+            #     q_mirror = self.Q.get_values(self.obs_transform(obs), self.act_transform(action_update)).mean(dim=-1)
+            #     policy_term = -0.5 * (q + q_mirror)
+            # else:
+            policy_term = -q
+
         alpha = self.log_alpha.exp()
         actor_loss = (
             alpha.detach() * (-entropy_est.reshape_as(policy_term)) + policy_term
@@ -753,7 +760,7 @@ class SAC(TensorDictModuleBase):
                 "actor/tanh_grad_min": tanh_grad.min().item(),
                 "actor/upscale": dist.upscale.mean().item(),
             }
-            self.actor.upscale.add_((dim_saturation > 0.15).float() * 3e-4)
+            # self.actor.upscale.add_((dim_saturation > 0.15).float() * 5e-4)
         
         if self.has_symmetry:
             with torch.no_grad():
