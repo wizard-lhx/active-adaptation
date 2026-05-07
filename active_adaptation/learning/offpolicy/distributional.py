@@ -73,47 +73,26 @@ def project_categorical_bellman(
     target_z = rewards + discount_t * support.view(1, -1)
     target_z = target_z.clamp(v_lo, v_hi)
 
+    # Continuous index on the support grid: b=0 -> v_lo, b=num_atoms-1 -> v_hi.
     b = (target_z - v_lo) / delta_z
-    # FP error can yield ceil(b)==num_atoms or floor(b)==-1; index_add_ then goes OOB on CUDA.
     b_max = float(num_atoms - 1)
     b = torch.nan_to_num(b, nan=0.0, neginf=0.0, posinf=b_max)
     b = b.clamp(0.0, b_max)
 
-    lower = torch.floor(b).long()
-    upper = torch.ceil(b).long()
-
-    same = upper == lower
-    lower_mask = torch.logical_and(lower > 0, same)
-    upper_mask = torch.logical_and(lower < (num_atoms - 1), same)
-    lower = torch.where(lower_mask, lower - 1, lower)
-    upper = torch.where(upper_mask, upper + 1, upper)
-    lower = lower.clamp(0, num_atoms - 1)
-    upper = upper.clamp(0, num_atoms - 1)
-    lower, upper = torch.minimum(lower, upper), torch.maximum(lower, upper)
+    # C51 projection: split each atom's mass between floor(b) and floor(b)+1 (Bellemare et al.).
+    # Using adjacent bins avoids the old ceil/floor "same bin" hack that doubled mass on interior
+    # grid points; at b = num_atoms-1, upper clamps to the same index and (1-frac)+frac preserves p.
+    lower = torch.floor(b).long().clamp(0, num_atoms - 1)
+    upper = (lower + 1).clamp(max=num_atoms - 1)
+    frac = b - lower.to(dtype=b.dtype)
 
     next_dist = F.softmax(next_logits, dim=-1)
-    proj_dist = torch.zeros_like(next_dist)
-    offset = (
-        torch.linspace(
-            0,
-            (batch_size - 1) * num_atoms,
-            batch_size,
-            device=device,
-        )
-        .long()
-        .view(batch_size, 1)
-        .expand(batch_size, num_atoms)
-    )
-    proj_dist.view(-1).index_add_(
-        0,
-        (lower + offset).reshape(-1),
-        (next_dist * (upper.float() - b)).reshape(-1),
-    )
-    proj_dist.view(-1).index_add_(
-        0,
-        (upper + offset).reshape(-1),
-        (next_dist * (b - lower.float())).reshape(-1),
-    )
+    m_l = next_dist * (1.0 - frac)
+    m_u = next_dist * frac
+
+    proj_dist = next_dist.new_zeros(batch_size, num_atoms)
+    proj_dist.scatter_add_(1, lower, m_l)
+    proj_dist.scatter_add_(1, upper, m_u)
     return proj_dist
 
 

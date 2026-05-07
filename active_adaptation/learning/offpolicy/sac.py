@@ -112,7 +112,7 @@ class SACConfig:
     # FP16 AMP (CUDA only); GradScaler for critic, V head, standalone train_v, and actor (alpha stays fp32).
     use_amp: bool = True
     # FlashSAC-style: scale learning rewards by running discounted-return stats (buffer stores raw).
-    normalize_reward: bool = True
+    normalize_reward: bool = False
     normalized_G_max: float = 5.0
     reward_norm_epsilon: float = 1e-8
 
@@ -133,11 +133,17 @@ class TwinQNetwork(nn.Module):
         super().__init__()
         critic_input_dim = obs_dim + act_dim
         self.critic_1 = nn.Sequential(
-            ResidualMLP([critic_input_dim, 512, 512, 512], activation),
+            nn.Linear(critic_input_dim, 512), activation(),
+            nn.Linear(512, 512), activation(),
+            nn.Linear(512, 512), activation(),
+            nn.RMSNorm(512),
             nn.Linear(512, 1),
         )
         self.critic_2 = nn.Sequential(
-            ResidualMLP([critic_input_dim, 512, 512, 512], activation),
+            nn.Linear(critic_input_dim, 512), activation(),
+            nn.Linear(512, 512), activation(),
+            nn.Linear(512, 512), activation(),
+            nn.RMSNorm(512),
             nn.Linear(512, 1),
         )
         for c in (self.critic_1, self.critic_2):
@@ -219,7 +225,10 @@ class TwinDistributionalQNetwork(nn.Module):
                 out_layer = nn.Linear(512, num_atoms)
                 out_layer.weight._non_muon = True
                 return nn.Sequential(
-                    MLP([critic_input_dim, 512, 512, 512], activation, first_non_muon=True),
+                    nn.Linear(critic_input_dim, 512), activation(),
+                    nn.Linear(512, 512), activation(),
+                    nn.Linear(512, 512), activation(),
+                    nn.RMSNorm(512),
                     out_layer,
                 )
 
@@ -619,8 +628,20 @@ class SAC(TensorDictModuleBase):
             return infos
 
         with self._dormancy_tracker.track():
+            last_indices = None
             for _ in range(self.cfg.train_every * self.cfg.utd_ratio):
-                infos.update(self.train_critic())
+                # batch, last_indices = self.rb.sample_sequential(
+                #     batch_size=self.cfg.critic_batch_size,
+                #     steps=self.cfg.n_steps,
+                #     last_indices=last_indices,
+                #     sequential_prob=0.6,
+                #     sequential_offset=-1,
+                # )
+                batch = self.rb.sample(
+                    batch_size=self.cfg.critic_batch_size,
+                    steps=self.cfg.n_steps
+                ).to(self.device)
+                infos.update(self.train_critic(batch.to(self.device)))
 
             if self.enable_actor:
                 for _ in range(self.cfg.train_every):
@@ -633,12 +654,7 @@ class SAC(TensorDictModuleBase):
         self._flush_dormancy(infos)
         return dict(sorted(infos.items()))
 
-    def train_critic(self):
-        batch = self.rb.sample(
-            batch_size=self.cfg.critic_batch_size,
-            steps=self.cfg.n_steps
-        ).to(self.device) # [T, N]
-
+    def train_critic(self, batch: TensorDict):
         reward = batch[REWARD_KEY]
         if self.reward_normalizer is not None:
             reward = self.reward_normalizer.normalize_rewards(reward)
