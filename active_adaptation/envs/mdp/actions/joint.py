@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 
 from typing import Dict, Optional, Tuple
 from typing_extensions import override
@@ -15,6 +16,64 @@ from active_adaptation.utils.symmetry import joint_space_symmetry
 from .base import Action
 
 
+class SoftBoundTracker(nn.Module):
+    """
+    Streaming soft bounds via online quantile (pinball) updates — fixed memory.
+
+    ``lower`` / ``upper`` are buffers with the given ``shape`` (e.g. ``D`` or
+    ``(D,)`` for per-feature bounds). Observations ``x`` must end with that
+    shape; leading dimensions are i.i.d. samples. Initialized to zero; call
+    ``reset()`` to zero again.
+
+    Args:
+        shape: Bound tensor shape; an ``int`` is treated as ``(int,)``.
+    """
+
+    tau: float
+    lr: float
+
+    def __init__(
+        self,
+        shape: torch.Size | Tuple[int, ...],
+        *,
+        tau: float = 0.9,
+        lr: float = 0.05,
+    ):
+        super().__init__()
+        if not 0.0 < tau < 1.0:
+            raise ValueError(f"tau must be in (0, 1), got {tau}")
+        self.p_lo = 1.0 - tau
+        self.p_hi = tau
+        self.lr = float(lr)
+        sz = torch.Size(shape)
+        self.register_buffer("lower", torch.zeros(sz),)
+        self.register_buffer("upper", torch.zeros(sz),)
+
+    def extra_repr(self) -> str:
+        return f"shape={tuple(self.lower.shape)}, tau={self.tau}, lr={self.lr}"
+
+    def reset(self) -> None:
+        self.lower.zero_()
+        self.upper.zero_()
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        """Incorporate a minibatch; refine ``lower`` / ``upper`` in place."""
+        dt = self.lower.dtype
+        ind_lo = (x < self.lower).to(dt)
+        ind_hi = (x < self.upper).to(dt)
+        g_lo = (self.p_lo - ind_lo).mean(dim=0)
+        g_hi = (self.p_hi - ind_hi).mean(dim=0)
+        lo = self.lower + self.lr * g_lo
+        hi = self.upper + self.lr * g_hi
+        self.lower.copy_(torch.minimum(lo, hi))
+        self.upper.copy_(torch.maximum(lo, hi))
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.update(x)
+        return self.lower, self.upper
+
+
 class _DelayedJointAction(Action):
     def __init__(
         self,
@@ -22,8 +81,12 @@ class _DelayedJointAction(Action):
         action_scaling: Dict[str, float] = 0.5,
         max_delay: int = 2,
         alpha_range: Tuple[float, float] = (0.5, 1.0),
+        track_pos_target_bounds: bool = False,
+        track_vel_target_bounds: bool = False,
     ):
         super().__init__(env)
+        self.track_pos_target_bounds = track_pos_target_bounds
+        self.track_vel_target_bounds = track_vel_target_bounds
 
         if isinstance(action_scaling, float):
             action_scaling = {".*": float(action_scaling)}
@@ -42,23 +105,37 @@ class _DelayedJointAction(Action):
         self.decimation = int(self.env.step_dt / self.env.physics_dt)
 
         with torch.device(self.device):
-            self.action_buf = torch.zeros(
-                self.num_envs, 4, self.action_dim, device=self.device
-            )
+            self.action_buf = torch.zeros(self.num_envs, 4, self.action_dim)
             self.action_queue = torch.zeros(
                 self.num_envs,
                 self.max_delay + self.decimation,
                 self.action_dim,
-                device=self.device,
             )
-            self.applied_action = torch.zeros(
-                self.num_envs, self.action_dim, device=self.device
-            )
-            self.alpha = torch.ones(self.num_envs, 1, device=self.device)
-            self.delay = torch.zeros(
-                self.num_envs, 1, dtype=torch.int64, device=self.device
-            )
+            self.applied_action = torch.zeros(self.num_envs, self.action_dim)
+            self.alpha = torch.ones(self.num_envs, 1)
+            self.delay = torch.zeros(self.num_envs, 1, dtype=torch.int64)
+        
+        if self.track_pos_target_bounds:
+            self.pos_target_bound_tracker = SoftBoundTracker(
+                shape=(self.action_dim,), tau=0.9
+            ).to(self.device)
+        if self.track_vel_target_bounds:
+            self.vel_target_bound_tracker = SoftBoundTracker(
+                shape=(self.action_dim,), tau=0.9
+            ).to(self.device)
 
+    def diagnostics(self) -> dict:
+        d = {}
+        if self.track_pos_target_bounds:
+            for i, jname in enumerate(self.joint_names):
+                d[f"diagnostics/pos_target_bound/{jname}_upper"] = self.pos_target_bound_tracker.upper[i]
+                d[f"diagnostics/pos_target_bound/{jname}_lower"] = self.pos_target_bound_tracker.lower[i]
+        if self.track_vel_target_bounds:
+            for i, jname in enumerate(self.joint_names):
+                d[f"diagnostics/vel_target_bound/{jname}_upper"] = self.vel_target_bound_tracker.upper[i]
+                d[f"diagnostics/vel_target_bound/{jname}_lower"] = self.vel_target_bound_tracker.lower[i]
+        return d
+    
     @property
     def action_dim(self):
         return len(self.joint_ids)
@@ -108,12 +185,15 @@ class JointPosition(_DelayedJointAction):
         action_scaling: Dict[str, float] = 0.5,
         max_delay: int = 2,
         alpha_range: Tuple[float, float] = (0.5, 1.0),
+        track_pos_target_bounds: bool = False,
     ):
         super().__init__(
             env,
             action_scaling=action_scaling,
             max_delay=max_delay,
             alpha_range=alpha_range,
+            track_pos_target_bounds=track_pos_target_bounds,
+            track_vel_target_bounds=False
         )
         self.default_joint_pos = self.asset.data.default_joint_pos[:, self.joint_ids]
         self.offset = torch.zeros_like(self.default_joint_pos)
@@ -135,6 +215,9 @@ class JointPosition(_DelayedJointAction):
         jpos_target = self.default_joint_pos + self.applied_action * self.action_scaling
         self.asset.set_joint_position_target(jpos_target, joint_ids=self.joint_ids)
 
+        if self.track_pos_target_bounds:
+            self.pos_target_bound_tracker.update(jpos_target)
+
 
 class JointPositionDelta(_DelayedJointAction):
     """Incremental (integrated) joint-position controller.
@@ -154,8 +237,16 @@ class JointPositionDelta(_DelayedJointAction):
         clamp_range: Tuple[float, float] = (-0.5 * torch.pi, 0.5 * torch.pi),
         max_delay: int = 2,
         alpha_range: Tuple[float, float] = (0.5, 1.0),
+        track_pos_target_bounds: bool = False
     ):
-        super().__init__(env, action_scaling, max_delay, alpha_range)
+        super().__init__(
+            env,
+            action_scaling,
+            max_delay,
+            alpha_range,
+            track_pos_target_bounds=track_pos_target_bounds,
+            track_vel_target_bounds=False
+        )
         self.default_joint_pos = self.asset.data.default_joint_pos[:, self.joint_ids].clone()
         self.clamp_range = tuple(clamp_range)
         self.jpos_target = self.default_joint_pos.clone()
@@ -174,8 +265,29 @@ class JointPositionDelta(_DelayedJointAction):
         self.jpos_target += torch.clamp(delta, self.clamp_range[0], self.clamp_range[1])
         self.asset.set_joint_position_target(self.jpos_target, joint_ids=self.joint_ids)
 
+        if self.track_pos_target_bounds:
+            self.pos_target_bound_tracker.update(self.jpos_target)
+
 
 class JointVelocity(_DelayedJointAction):
+
+    def __init__(
+        self,
+        env,
+        action_scaling: Dict[str, float] = 0.5,
+        max_delay: int = 2,
+        alpha_range: Tuple[float, float] = (0.5, 1.0),
+        track_vel_target_bounds: bool = False
+    ):
+        super().__init__(
+            env,
+            action_scaling,
+            max_delay,
+            alpha_range,
+            track_pos_target_bounds=False,
+            track_vel_target_bounds=track_vel_target_bounds
+        )
+    
     @override
     def apply_action(self, substep: int):
         self.applied_action.lerp_(self.action_queue[:, 0], self.alpha)
@@ -183,6 +295,9 @@ class JointVelocity(_DelayedJointAction):
 
         jvel_target = self.applied_action * self.action_scaling
         self.asset.set_joint_velocity_target(jvel_target, joint_ids=self.joint_ids)
+        
+        if self.track_vel_target_bounds:
+            self.vel_target_bound_tracker.update(jvel_target)
 
 
-__all__ = ["JointPosition", "JointPositionDelta", "JointVelocity"]
+__all__ = ["JointPosition", "JointPositionDelta", "JointVelocity", "SoftBoundTracker"]

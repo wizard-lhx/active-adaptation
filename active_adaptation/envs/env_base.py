@@ -667,8 +667,10 @@ class _EnvBase(EnvBase, RegistryMixin):
         state_dict["reward_spec"] = self.reward_spec
         return state_dict
 
-    def get_extra_state(self) -> dict:
-        return dict(self.extra)
+    def diagnostics(self) -> dict:
+        d = dict(self.extra)
+        d.update(self.action_manager.diagnostics())
+        return d
 
     def close(self, *, raise_if_closed: bool = True):
         if not self.is_closed:

@@ -249,7 +249,10 @@ class PPOPolicy(TensorDictModuleBase):
         action = tensordict[ACTION_KEY]
         adv_unnormalized = tensordict["adv"]
         log_probs_before = tensordict["action_log_prob"]
-        tensordict["adv"] = normalize(tensordict["adv"], subtract_mean=True)
+        adv = tensordict["adv"]
+        adv_mean = adv.mean()
+        adv_std = adv.std()
+        adv = (adv - adv_mean) / (adv_std + 1e-5)
 
         td = tensordict.select(*self.training_keys)
         for epoch in range(self.cfg.ppo_epochs):
@@ -292,7 +295,9 @@ class PPOPolicy(TensorDictModuleBase):
         infos["critic/value_std"] = tensordict["ret"].std().item()
         infos["critic/value_max"] = tensordict["ret"].max().item()
         infos["critic/neg_rew_ratio"] = (tensordict[REWARD_KEY].sum(-1) <= 0.).float().mean().item()
-        
+        infos["critic/adv_mean"] = adv_mean.item()
+        infos["critic/adv_std"] = adv_std.item()
+
         if self.cfg.debug and self._rollout_dormancy_tracker is not None:
             dormancy = self._rollout_dormancy_tracker.compute_dormancy()
             for module_name, value in dormancy.items():
