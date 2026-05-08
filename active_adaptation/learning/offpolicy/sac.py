@@ -18,7 +18,7 @@ from tensordict.nn import (
 from torchrl.data import Composite, TensorSpec
 from torchrl.objectives import hold_out_net
 
-from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm, SimbaMLP
+from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm, SimbaMLP, IndependentNormal
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
     DONE_KEY,
@@ -36,7 +36,11 @@ from active_adaptation.learning.offpolicy.distributional import (
 )
 from active_adaptation.learning.offpolicy.objectives import MultiStepReturn, SACLoss
 from active_adaptation.learning.offpolicy.reward_normalization import RewardNormalizer
-from active_adaptation.learning.offpolicy.distribution import ScaledTanhNormal
+from active_adaptation.learning.offpolicy.distribution import (
+    ScaledTanhNormal,
+    ScaledSymlogNormal,
+    FasterTransformedDistribution
+)
 from active_adaptation.learning.offpolicy.network import ConditionalBlock
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.learning.utils.dormancy import DormancyTracker
@@ -103,7 +107,7 @@ class SACConfig:
 
     tau_actor: float = 0.1 # a relatively large value for faster convergence
     tau_Q: float = 0.02  # a relatively large value for faster convergence
-    lr_alpha: float = 1e-3
+    lr_alpha: float = 5e-4
     max_grad_norm: float = 1.0
     v_update_every: int = 32
     v_trace_steps: int = 32  # on-policy GAE horizon from replay ring (like blade_runner last())
@@ -437,7 +441,8 @@ class SAC(TensorDictModuleBase):
             self.V_quantile = 0.7
 
         self.gae = GAE(self.cfg.gamma, self.cfg.gae_lambda).to(device)
-        self.dist_class = ScaledTanhNormal
+        # self.DistClass = ScaledTanhNormal
+        self.DistClass = lambda loc, scale, upscale: IndependentNormal(loc, scale)
         self.actor = TanhNormalActor(
             obs_dim,
             act_dim,
@@ -459,7 +464,8 @@ class SAC(TensorDictModuleBase):
             )
         else:
             self.target_entropy = -float(act_dim)
-        self.log_alpha = nn.Parameter(torch.tensor(math.log(0.01), device=device))
+        self.target_entropy = 0.0
+        self.log_alpha = nn.Parameter(torch.tensor(math.log(0.004), device=device))
         self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=self.cfg.lr_alpha)
         if self.cfg.muon:
             self.opt_actor = MuonAdamWWrapper(
@@ -557,7 +563,7 @@ class SAC(TensorDictModuleBase):
         def policy(tensordict: TensorDict):
             obs = self.vecnorm_obs(tensordict[OBS_KEY])
             loc, scale = self.actor(obs)
-            dist = self.dist_class(loc, scale, upscale=self.actor.upscale)
+            dist = self.DistClass(loc, scale, upscale=self.actor.upscale)
 
             if self.cfg.use_correlated:
                 prev_noise = tensordict["prev_noise"]
@@ -568,12 +574,13 @@ class SAC(TensorDictModuleBase):
                 )
                 sample = loc + noise * scale
                 tensordict["next", "prev_noise"] = noise
-                for transform in dist.transforms:
-                    sample = transform(sample)
+                if isinstance(dist, FasterTransformedDistribution):
+                    for transform in dist.transforms:
+                        sample = transform(sample)
             else:
                 sample = dist.sample()
 
-            tensordict[ACTION_KEY] = sample + 0.04 * torch.randn_like(sample)
+            tensordict[ACTION_KEY] = sample # + 0.04 * torch.randn_like(sample)
             tensordict["loc"] = loc
             return tensordict
 
@@ -691,7 +698,7 @@ class SAC(TensorDictModuleBase):
             with torch.no_grad():
                 # actions are sampled with uncorrelated noise
                 loc, scale = self.actor_target(next_obs)
-                dist = self.dist_class(loc, scale, upscale=self.actor.upscale)
+                dist = self.DistClass(loc, scale, upscale=self.actor.upscale)
                 next_action = dist.sample()
 
                 next_log_prob = dist.log_prob(next_action)
@@ -821,7 +828,7 @@ class SAC(TensorDictModuleBase):
 
         with hold_out_net(self.Q), self._autocast():
             loc, scale = self.actor(obs)
-            dist = ScaledTanhNormal(loc, scale, upscale=self.actor.upscale)
+            dist = self.DistClass(loc, scale, upscale=self.actor.upscale)
             action_update = dist.rsample((4,))  # [4, N, D]
             entropy_est = -dist.log_prob(action_update).mean(dim=0)
             q = self.Q.get_values(
@@ -833,6 +840,7 @@ class SAC(TensorDictModuleBase):
         actor_loss = (
             policy_term
             + alpha.detach() * (-entropy_est.reshape_as(policy_term))
+            + 0.01 * ((loc/2.5)**6).sum(-1).reshape_as(policy_term)
         ).mean()
 
         q_action_grad_norm: torch.Tensor | None = None
@@ -882,7 +890,8 @@ class SAC(TensorDictModuleBase):
             "actor/mean_change": mean_change.item(),
             "actor/q_std": q.std(dim=1).mean().item(),
             "actor/q_action_grad_norm": q_action_grad_norm.item(),
-
+            "actor/mean_loc": loc.abs().mean().item(),
+            "actor/mean_scale": scale.mean().item(),
         }
 
         actor_diagnostics = {}
