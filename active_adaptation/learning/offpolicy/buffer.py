@@ -6,12 +6,14 @@ from typing import Optional, Tuple
 class ReplayBuffer:
     def __init__(self, max_size: int, fake_tensordict: TensorDict):
         self.max_size = max_size
+        self.num_envs = fake_tensordict.shape[0]
+        self.device = fake_tensordict.device
         self._current_size = 0
         self._td = fake_tensordict.expand(max_size, *fake_tensordict.shape).clone()
         self._ptr = 0
 
     def push(self, tensordict: TensorDict):
-        self._td[self._ptr] = tensordict
+        self._td[self._ptr] = tensordict.to(self.device)
         self._ptr = (self._ptr + 1) % self._td.shape[0]
         self._current_size = min(self._current_size + 1, self.max_size)
     
