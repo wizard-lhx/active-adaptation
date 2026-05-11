@@ -37,7 +37,7 @@ from active_adaptation.learning.offpolicy.distributional import (
     ValueDistribution,
     expected_q_from_logits,
 )
-from active_adaptation.learning.offpolicy.objectives import MultiStepReturn, SACLoss
+from active_adaptation.learning.offpolicy.objectives import SACLoss
 from active_adaptation.learning.offpolicy.reward_normalization import RewardNormalizer
 from active_adaptation.learning.offpolicy.distribution import (
     ScaledTanhNormal,
@@ -108,17 +108,17 @@ class SACConfig:
     actor_behavior_coef: float = 0.0
     # Penalize large pre-tanh actor means. Defaults preserve 0.01 * ((loc / 2.5) ** 6).
     actor_loc_reg_weight: float = 0.01
-    actor_loc_reg_scale: float = 2.5
+    actor_loc_reg_scale: float = 8.0
     actor_loc_reg_power: float = 6.0
     # sac specific
     entropy_bonus: float = 1.0
     # If set: H_target = (d/2)*log(2*pi*e*sigma^2) for N(0,sigma^2)^d (FlashSAC).
     # If None: use -dim(A) (common heuristic for tanh-squashed SAC).
     target_entropy_sigma: float | None = None
-    target_entropy_sigma_start: float | None = None
-    target_entropy_sigma_end: float | None = None
-    target_entropy_decay_start: int = 0
-    target_entropy_decay_end: int = 0
+    target_entropy_sigma_start: float | None = 0.4
+    target_entropy_sigma_end: float | None = 0.25
+    target_entropy_decay_start: int = 2000
+    target_entropy_decay_end: int = 4000
 
     tau_actor: float = 0.1 # a relatively large value for faster convergence
     tau_Q: float = 0.02  # a relatively large value for faster convergence
@@ -131,7 +131,7 @@ class SACConfig:
 
     debug: bool = False
     vecnorm: bool = True
-    grad_sync_mode: str | None = "manual"
+    grad_sync_mode: str | None = "ddp"
     # FP16 AMP (CUDA only); GradScaler for critic, V head, standalone train_v, and actor (alpha stays fp32).
     use_amp: bool = True
     # FlashSAC-style: scale learning rewards by running discounted-return stats (buffer stores raw).
@@ -644,17 +644,12 @@ class SAC(TensorDictModuleBase):
             cfg.buffer_device = device
         fake_rb = (
             env.fake_tensordict()
-            .exclude(("next", "stats"), "collector")
+            .exclude(("next", "stats"), ("next", OBS_KEY), "collector")
             .detach()
         ).to(cfg.buffer_device)
         fake_rb[REWARD_KEY] = fake_rb[REWARD_KEY].sum(-1, keepdim=True)
-        fake_rb["loc"] = torch.zeros(fake_rb.shape[0], self.actor.act_dim)
-        self.rb = ReplayBuffer(self.cfg.buffer_size, fake_rb)
-        self.msr = (
-            MultiStepReturn(self.cfg.gamma, self.cfg.n_steps).to(device)
-            if self.cfg.n_steps > 1
-            else None
-        )
+        fake_rb["loc"] = torch.zeros(fake_rb.shape[0], self.actor.act_dim, device=cfg.buffer_device)
+        self.rb = ReplayBuffer(self.cfg.buffer_size, fake_rb, gamma=self.cfg.gamma)
         self.sac_actor_loss = SACLoss(behavior_coef=self.cfg.actor_behavior_coef)
 
         self.reward_normalizer: RewardNormalizer | None = None
@@ -852,7 +847,7 @@ class SAC(TensorDictModuleBase):
     def train_op(self, tensordict: TensorDict):
         self.global_step += self.cfg.train_every
 
-        td = tensordict.exclude(("next", "stats"), "collector")
+        td = tensordict.exclude(("next", "stats"), ("next", OBS_KEY), "collector")
         reward = td[REWARD_KEY]
         # KEEP THIS FOR DEBUGGING
         if self.cfg.debug:
@@ -925,10 +920,7 @@ class SAC(TensorDictModuleBase):
                 # )
                 s = i * self.cfg.critic_batch_size
                 e = s + self.cfg.critic_batch_size
-                if self.cfg.n_steps == 1:
-                    batch = critic_batch[s:e]
-                else:
-                    batch = critic_batch[:, s:e]
+                batch = critic_batch[s:e]
                 critic_info = self.train_critic(
                     batch, diagnostics=(i == iters - 1)
                 )
@@ -963,22 +955,10 @@ class SAC(TensorDictModuleBase):
         if self.reward_normalizer is not None:
             reward = self.reward_normalizer.normalize_rewards(reward)
 
-        if self.cfg.n_steps == 1:
-            obs = batch[OBS_KEY]
-            act = batch[ACTION_KEY]
-            next_obs = batch["next", OBS_KEY]
-            discount = self.cfg.gamma * (1.0 - batch[TERM_KEY].float())
-        else:
-            assert self.msr is not None
-            obs = batch[OBS_KEY][0]
-            act = batch[ACTION_KEY][0]
-            next_obs, reward, discount = self.msr(
-                batch["next", OBS_KEY],
-                batch[ACTION_KEY],
-                reward,
-                batch[TERM_KEY],
-                batch[DONE_KEY],
-            )
+        obs = batch[OBS_KEY]
+        act = batch[ACTION_KEY]
+        next_obs = batch["next", OBS_KEY]
+        discount = batch["next", "discount"]
 
         obs = self.vecnorm_obs(obs)
         next_obs = self.vecnorm_obs(next_obs)
@@ -1192,22 +1172,23 @@ class SAC(TensorDictModuleBase):
             return 
 
         assert q_action_grad_norm is not None
-        mean_change = (
-            (dist.loc[: batch.shape[0]].detach() - batch["loc"]).abs().mean()
-        )
         infos = {
             "actor/loss": actor_loss.item(),
             "actor/grad_norm": actor_grad_norm.item(),
             "actor/alpha": alpha.detach().item(),
             "actor/entropy": entropy_est.mean().item(),
             "actor/target_entropy": float(self.target_entropy),
-            "actor/mean_change": mean_change.item(),
             "actor/q_std": q.std(dim=1).mean().item(),
             "actor/q_action_grad_norm": q_action_grad_norm.item(),
             "actor/mean_loc": loc.abs().mean().item(),
             "actor/mean_scale": scale.mean().item(),
             "actor/loc_reg": loc_reg.mean().item(),
         }
+        if "loc" in batch.keys():
+            mean_change = (
+                (dist.loc[: batch.shape[0]].detach() - batch["loc"]).abs().mean()
+            )
+            infos["actor/mean_change"] = mean_change.item()
         if self.target_entropy_sigma is not None:
             infos["actor/target_entropy_sigma"] = self.target_entropy_sigma
 
@@ -1244,7 +1225,8 @@ class SAC(TensorDictModuleBase):
         """On-policy-style V update: last `v_trace_steps` ring-buffer rows + GAE (ppo.common layout [N, T, …])."""
         if len(self.rb) <= self.cfg.v_trace_steps:
             return {}
-        batch = self.rb.last(steps=self.cfg.v_trace_steps).to(self.device)
+        trace = self.rb.last(steps=self.cfg.v_trace_steps + 1).to(self.device)
+        batch = trace[:-1]
 
         reward = batch[REWARD_KEY]
         if self.reward_normalizer is not None:
@@ -1252,7 +1234,12 @@ class SAC(TensorDictModuleBase):
 
         # Ring buffer layout: [T, N, …]. GAE expects [N, T, …].
         obs_tn = batch[OBS_KEY]
-        next_obs_tn = batch["next", OBS_KEY]
+        shifted_next_obs_tn = trace[1:][OBS_KEY]
+        next_obs_tn = torch.where(
+            batch[DONE_KEY].bool(),
+            obs_tn,
+            shifted_next_obs_tn,
+        )
         T, N = obs_tn.shape[:2]
         flat = T * N
 

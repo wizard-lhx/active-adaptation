@@ -2,18 +2,33 @@ import torch
 from tensordict import TensorDict
 from typing import Optional, Tuple
 
+from active_adaptation.learning.ppo.common import (
+    ACTION_KEY,
+    DONE_KEY,
+    OBS_KEY,
+    REWARD_KEY,
+    TERM_KEY,
+)
+
+DISCOUNT_KEY = ("next", "discount")
+
 
 class ReplayBuffer:
-    def __init__(self, max_size: int, fake_tensordict: TensorDict):
+    def __init__(self, max_size: int, fake_tensordict: TensorDict, gamma: float):
         self.max_size = max_size
         self.num_envs = fake_tensordict.shape[0]
         self.device = fake_tensordict.device
+        self.gamma = float(gamma)
         self._current_size = 0
         self._td = fake_tensordict.expand(max_size, *fake_tensordict.shape).clone()
+        self._storage_keys = tuple(fake_tensordict.keys(True, True))
         self._ptr = 0
 
     def push(self, tensordict: TensorDict):
-        self._td[self._ptr] = tensordict.to(self.device)
+        self._td[self._ptr] = tensordict.select(
+            *self._storage_keys,
+            strict=False,
+        ).to(self.device)
         self._ptr = (self._ptr + 1) % self._td.shape[0]
         self._current_size = min(self._current_size + 1, self.max_size)
     
@@ -23,8 +38,8 @@ class ReplayBuffer:
         """
         Returns the last `steps` samples from the buffer.
         """
-        assert len(self) > steps, "Not enough samples in buffer"
-        if self._ptr > steps:
+        assert len(self) >= steps, "Not enough samples in buffer"
+        if self._ptr >= steps:
             samples = self._td[self._ptr - steps:self._ptr].clone()
         else:
             part1 = self._td[-(steps - self._ptr):]
@@ -37,17 +52,100 @@ class ReplayBuffer:
     def num_samples(self):
         return self._td.shape[1] * len(self)
 
+    def _valid_start_rows(self, steps: int) -> torch.Tensor:
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1, got {steps}.")
+        size = len(self)
+        if size <= steps:
+            return torch.empty(0, dtype=torch.long, device=self._td.device)
+        if size < self.max_size:
+            return torch.arange(size - steps, device=self._td.device)
+        return (self._ptr + torch.arange(size - steps, device=self._td.device)) % size
+
+    def _sample_rows_envs(self, batch_size: int, steps: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        start_rows = self._valid_start_rows(steps)
+        if start_rows.numel() == 0:
+            raise RuntimeError(
+                "Cannot sample replay transitions with bootstrap observations: "
+                f"len={len(self)}, steps={steps}."
+            )
+        start_idx = torch.randint(
+            0,
+            start_rows.numel(),
+            (batch_size,),
+            device=self._td.device,
+        )
+        starts = start_rows[start_idx]
+        envs = torch.randint(0, self.num_envs, (batch_size,), device=self._td.device)
+        offsets = torch.arange(steps + 1, device=self._td.device).unsqueeze(1)
+        rows = (starts.unsqueeze(0) + offsets) % self.max_size
+        return rows, envs
+
+    def _build_training_batch(
+        self,
+        rows: torch.Tensor,
+        envs: torch.Tensor,
+        steps: int,
+    ) -> TensorDict:
+        transitions = self._td[rows[:-1], envs]
+        rewards = transitions[REWARD_KEY]
+        done = transitions[DONE_KEY].bool()
+        terminated = transitions[TERM_KEY].bool()
+
+        batch_size = envs.shape[0]
+        batch_indices = torch.arange(batch_size, device=self._td.device)
+        done_flat = done.squeeze(-1)
+        terminated_flat = terminated.squeeze(-1)
+
+        has_done = done_flat.any(dim=0)
+        first_done = done_flat.float().argmax(dim=0)
+        last_transition = torch.where(
+            has_done,
+            first_done,
+            torch.full_like(first_done, steps - 1),
+        )
+
+        gamma = torch.as_tensor(self.gamma, device=rewards.device, dtype=rewards.dtype)
+        gammas = gamma ** torch.arange(steps, device=rewards.device, dtype=rewards.dtype)
+        reward_shape = (steps,) + (1,) * (rewards.ndim - 1)
+        cumulative_rewards = (rewards * gammas.reshape(reward_shape)).cumsum(dim=0)
+        reward = cumulative_rewards[last_transition, batch_indices]
+
+        terminated_at_bootstrap = terminated_flat[last_transition, batch_indices]
+        discount = gamma.pow(last_transition.to(rewards.dtype) + 1.0).reshape(
+            batch_size,
+            1,
+        )
+        discount = discount * (~terminated_at_bootstrap).to(rewards.dtype).reshape(
+            batch_size,
+            1,
+        )
+
+        boundary_rows = rows.gather(0, last_transition.reshape(1, batch_size)).squeeze(0)
+        next_rows = torch.where(has_done, boundary_rows, rows[-1])
+        next_obs = self._td[next_rows, envs][OBS_KEY]
+
+        data = {
+            OBS_KEY: transitions[0][OBS_KEY].clone(),
+            ACTION_KEY: transitions[0][ACTION_KEY].clone(),
+            "next": {
+                OBS_KEY: next_obs.clone(),
+                "reward": reward,
+                "discount": discount,
+            },
+        }
+        if "loc" in transitions.keys():
+            data["loc"] = transitions[0]["loc"].clone()
+
+        return TensorDict(
+            data,
+            batch_size=[batch_size],
+            device=self._td.device,
+        )
+
     def sample(self, batch_size: int, steps: int=1) -> TensorDict:
-        if steps == 1:
-            indices = torch.randint(0, self.num_samples, (batch_size,), device=self._td.device)
-            samples = self._td.view(-1)[indices]
-        else:
-            indices = torch.randint(0, self.num_samples, (batch_size,), device=self._td.device)
-            t, e = torch.unravel_index(indices, (len(self), self._td.shape[1]))
-            t = (t.unsqueeze(0) + torch.arange(steps, device=self._td.device).unsqueeze(1)) % len(self)
-            samples = self._td[t, e]
-            assert samples.shape[:2] == (steps, batch_size)
-        return samples
+        rows, envs = self._sample_rows_envs(batch_size, steps)
+        return self._build_training_batch(rows, envs, steps)
     
     def sample_sequential(
         self,
@@ -68,9 +166,8 @@ class ReplayBuffer:
         ``(t, e)`` back as ``last_indices`` on the next call to chain segments.
 
         Args:
-            batch_size: Number of transitions (or sequences when ``steps > 1``).
-            steps: If ``> 1``, return length-``steps`` segments starting at each
-                chosen ``t`` (forward along the ring from that start).
+            batch_size: Number of processed training transitions.
+            steps: Number of rewards to fold into each sampled transition.
             last_indices: Previous ``(t, e)`` tensors from this method, same length
                 as ``batch_size``, or ``None`` for independent draws only.
             sequential_prob: In ``(0, 1]``, fraction of elements (in expectation)
@@ -80,27 +177,25 @@ class ReplayBuffer:
                 ``-1`` is one step **backward** in ring time (reward backup direction).
 
         Returns:
-            ``(samples, (t, e))`` — batch/sequence tensordict and the time/env indices
+            ``(samples, (t, e))`` — processed training batch and the time/env indices
             used for each row (for feeding back as ``last_indices``).
         """
-        # sample new indices
-        indices_flat = torch.randint(0, self.num_samples, (batch_size,), device=self._td.device)
-        t, e = torch.unravel_index(indices_flat, (len(self), self._td.shape[1]))
+        rows, e = self._sample_rows_envs(batch_size, steps)
+        t = rows[0]
         
         if last_indices is not None and sequential_prob > 0.0:
-            use_new = torch.rand(batch_size, device=self._td.device) > sequential_prob
-            t = torch.where(use_new, t, (last_indices[0] + sequential_offset) % len(self))
-            e = torch.where(use_new, e, last_indices[1])
+            candidate_t = (last_indices[0] + sequential_offset) % self.max_size
+            valid_rows = self._valid_start_rows(steps)
+            candidate_valid = (candidate_t.unsqueeze(-1) == valid_rows).any(dim=-1)
+            use_seq = (
+                torch.rand(batch_size, device=self._td.device) <= sequential_prob
+            ) & candidate_valid
+            t = torch.where(use_seq, candidate_t, t)
+            e = torch.where(use_seq, last_indices[1], e)
+            offsets = torch.arange(steps + 1, device=self._td.device).unsqueeze(1)
+            rows = (t.unsqueeze(0) + offsets) % self.max_size
         
-        if steps == 1:
-            samples = self._td[t, e].squeeze(0)
-        else:
-            ts = (t.unsqueeze(0) + torch.arange(steps, device=self._td.device).unsqueeze(1)) % len(self)
-            samples = self._td[ts, e]
-            assert samples.shape[:2] == (steps, batch_size)
-        
-        return samples, (t, e)
+        return self._build_training_batch(rows, e, steps), (t, e)
 
     def __len__(self):
         return self._current_size
-
