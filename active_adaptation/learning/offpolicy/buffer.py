@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
-    DONE_KEY,
     OBS_KEY,
+    DONE_KEY,
     REWARD_KEY,
     TERM_KEY,
 )
@@ -14,11 +14,18 @@ DISCOUNT_KEY = ("next", "discount")
 
 
 class ReplayBuffer:
-    def __init__(self, max_size: int, fake_tensordict: TensorDict, gamma: float):
+    def __init__(
+        self,
+        max_size: int,
+        fake_tensordict: TensorDict,
+        gamma: float,
+        obs_keys: Tuple[str, ...] = (OBS_KEY,),
+    ):
         self.max_size = max_size
         self.num_envs = fake_tensordict.shape[0]
         self.device = fake_tensordict.device
         self.gamma = float(gamma)
+        self.obs_keys = tuple(obs_keys)
         self._current_size = 0
         self._td = fake_tensordict.expand(max_size, *fake_tensordict.shape).clone()
         self._storage_keys = tuple(fake_tensordict.keys(True, True))
@@ -123,17 +130,20 @@ class ReplayBuffer:
 
         boundary_rows = rows.gather(0, last_transition.reshape(1, batch_size)).squeeze(0)
         next_rows = torch.where(has_done, boundary_rows, rows[-1])
-        next_obs = self._td[next_rows, envs][OBS_KEY]
-
         data = {
-            OBS_KEY: transitions[0][OBS_KEY].clone(),
+            key: transitions[0][key].clone()
+            for key in self.obs_keys
+        }
+        data.update({
             ACTION_KEY: transitions[0][ACTION_KEY].clone(),
             "next": {
-                OBS_KEY: next_obs.clone(),
+                key: self._td[next_rows, envs][key].clone()
+                for key in self.obs_keys
+            } | {
                 "reward": reward,
                 "discount": discount,
             },
-        }
+        })
         if "loc" in transitions.keys():
             data["loc"] = transitions[0]["loc"].clone()
 
