@@ -1,17 +1,27 @@
 #!/bin/bash
 
-# Usage: ./launch_ddp.sh <gpu_ids> <script.py> [additional args...]
-# Example: ./launch_ddp.sh 0,1 train.py --epochs 10
+# Usage: ./launch_ddp.sh <gpu_ids> <script.py> [<uv_project_path>] [additional args...]
+# Example: ./launch_ddp.sh 0,1 train.py venv/mjlab --epochs 10
 
 if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <gpu_ids> <script.py> [additional args...]"
+    echo "Usage: $0 <gpu_ids> <script.py> [<uv_project_path>] [additional args...]"
     exit 1
 fi
 
 GPU_IDS=$1
 SCRIPT=$2
 shift 2
-EXTRA_ARGS="$@"
+UV_PROJECT=$(pwd)
+
+if [ "$#" -gt 0 ]; then
+    CANDIDATE_UV_PROJECT=$1
+    if [ -d "$CANDIDATE_UV_PROJECT" ] || [[ "$CANDIDATE_UV_PROJECT" == */* && "$CANDIDATE_UV_PROJECT" != *=* ]]; then
+        UV_PROJECT=$CANDIDATE_UV_PROJECT
+        shift
+    fi
+fi
+
+EXTRA_ARGS=("$@")
 
 # Count number of GPUs
 IFS=',' read -ra GPUS <<< "$GPU_IDS"
@@ -32,7 +42,7 @@ FREE_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(
 
 # set CUDA_VISIBLE_DEVICES
 # and launch torchrun
-CUDA_VISIBLE_DEVICES=$GPU_IDS torchrun \
-    --nproc_per_node=$NUM_GPUS \
-    --master_port=$FREE_PORT \
-    $SCRIPT $EXTRA_ARGS
+CUDA_VISIBLE_DEVICES="$GPU_IDS" uv --project "$UV_PROJECT" run torchrun \
+    --nproc_per_node="$NUM_GPUS" \
+    --master_port="$FREE_PORT" \
+    "$SCRIPT" "${EXTRA_ARGS[@]}"

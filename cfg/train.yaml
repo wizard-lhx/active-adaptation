@@ -19,8 +19,8 @@ total_frames: 150_000_000
 max_iters: -1
 eval_interval: -1
 eval_render: false
-checkpoint_interval: 4
-upload_interval: 100
+checkpoint_interval: 1000
+upload_interval: 1000
 render_interval: -1
 render_decimation: 4
 seed: 42

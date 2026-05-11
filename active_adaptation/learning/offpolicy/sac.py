@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -14,10 +15,12 @@ from tensordict import TensorDict
 from tensordict.nn import (
     TensorDictModuleBase,
 )
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torchrl.data import Composite, TensorSpec
 from torchrl.objectives import hold_out_net
 
+import active_adaptation as aa
 from active_adaptation.learning.modules import ResidualMLP, MLP, VecNorm, SimbaMLP, IndependentNormal
 from active_adaptation.learning.ppo.common import (
     ACTION_KEY,
@@ -73,6 +76,7 @@ class SACConfig:
     name: str = "sac"
     train_every: int = 4
     buffer_size: int = 2000
+    buffer_device: str = "cpu"
     warm_up_steps: int = 200
     lr: float = 5e-4
     # If True, actor/Q use :class:`~active_adaptation.learning.utils.opt.MuonAdamWWrapper` (see ``ppo_symaug``).
@@ -82,10 +86,13 @@ class SACConfig:
     n_steps: int = 3
     gamma: float = 0.99
     utd_ratio: int = 4
+    policy_frequency: int = 4
     # architecture
     actor_init: str = "zeros"
     init_upscale: float = 2.0
     actor_layer_norm: Any = "pre"
+    actor_hidden_dims: Tuple[int, ...] = (384, 384, 384)
+    critic_hidden_dims: Tuple[int, ...] = (512, 512, 512)
     critic_layer_norm: Any = "pre"
     distributional: bool = True
     # batch sizes
@@ -99,11 +106,19 @@ class SACConfig:
     use_correlated: bool = True
     # BC-style anchor on replay actions; curbs Q exploitation (:class:`SACLoss`).
     actor_behavior_coef: float = 0.0
+    # Penalize large pre-tanh actor means. Defaults preserve 0.01 * ((loc / 2.5) ** 6).
+    actor_loc_reg_weight: float = 0.01
+    actor_loc_reg_scale: float = 2.5
+    actor_loc_reg_power: float = 6.0
     # sac specific
     entropy_bonus: float = 1.0
     # If set: H_target = (d/2)*log(2*pi*e*sigma^2) for N(0,sigma^2)^d (FlashSAC).
     # If None: use -dim(A) (common heuristic for tanh-squashed SAC).
-    target_entropy_sigma: float | None = 0.15
+    target_entropy_sigma: float | None = None
+    target_entropy_sigma_start: float | None = None
+    target_entropy_sigma_end: float | None = None
+    target_entropy_decay_start: int = 0
+    target_entropy_decay_end: int = 0
 
     tau_actor: float = 0.1 # a relatively large value for faster convergence
     tau_Q: float = 0.02  # a relatively large value for faster convergence
@@ -116,6 +131,7 @@ class SACConfig:
 
     debug: bool = False
     vecnorm: bool = True
+    grad_sync_mode: str | None = "manual"
     # FP16 AMP (CUDA only); GradScaler for critic, V head, standalone train_v, and actor (alpha stays fp32).
     use_amp: bool = True
     # FlashSAC-style: scale learning rewards by running discounted-return stats (buffer stores raw).
@@ -125,8 +141,92 @@ class SACConfig:
 
     in_keys: Tuple[str, ...] = (OBS_KEY, ACTION_KEY)
 
+    def __post_init__(self):
+        self.utd_ratio = int(self.utd_ratio)
+        if self.utd_ratio < 1:
+            raise ValueError(f"utd_ratio must be >= 1, got {self.utd_ratio}.")
+        self.policy_frequency = int(self.policy_frequency)
+        if self.policy_frequency < 1:
+            raise ValueError(
+                f"policy_frequency must be >= 1, got {self.policy_frequency}."
+            )
+        self.actor_hidden_dims = tuple(int(x) for x in self.actor_hidden_dims)
+        self.critic_hidden_dims = tuple(int(x) for x in self.critic_hidden_dims)
+        if not self.actor_hidden_dims:
+            raise ValueError("actor_hidden_dims must be non-empty.")
+        if not self.critic_hidden_dims:
+            raise ValueError("critic_hidden_dims must be non-empty.")
+        if self.actor_loc_reg_weight < 0:
+            raise ValueError(
+                f"actor_loc_reg_weight must be >= 0, got {self.actor_loc_reg_weight}."
+            )
+        if self.actor_loc_reg_scale <= 0:
+            raise ValueError(
+                f"actor_loc_reg_scale must be > 0, got {self.actor_loc_reg_scale}."
+            )
+        if self.actor_loc_reg_power <= 0:
+            raise ValueError(
+                f"actor_loc_reg_power must be > 0, got {self.actor_loc_reg_power}."
+            )
+        if self.target_entropy_decay_end < self.target_entropy_decay_start:
+            raise ValueError(
+                "target_entropy_decay_end must be >= target_entropy_decay_start."
+            )
+
+
+def _same_width_residual_stack(
+    input_dim: int,
+    hidden_dims: Tuple[int, ...],
+    output_dim: int,
+    *,
+    norm_cls: type[nn.Module],
+    activation: type[nn.Module],
+    output_non_muon: bool = True,
+) -> nn.Sequential:
+    width = hidden_dims[0]
+    if any(dim != width for dim in hidden_dims):
+        raise ValueError(
+            "SAC residual trunks require all hidden dims to match; "
+            f"got {hidden_dims}."
+        )
+    layers: list[nn.Module] = [nn.Linear(input_dim, width)]
+    layers.extend(
+        ConditionalBlock(hidden_dim=width)
+        for _ in range(max(0, len(hidden_dims) - 1))
+    )
+    layers.append(norm_cls(width))
+    out_layer = nn.Linear(width, output_dim)
+    if output_non_muon:
+        out_layer.weight._non_muon = True
+    layers.append(out_layer)
+    return nn.Sequential(*layers)
+
 
 cs.store(name="sac", node=SACConfig, group="algo")
+
+
+def _normalize_grad_sync_mode(mode: str | None) -> str | None:
+    if isinstance(mode, str):
+        mode = mode.lower()
+        if mode in {"none", "null"}:
+            mode = None
+    if mode not in {"manual", "ddp", None}:
+        raise ValueError(
+            "grad_sync_mode must be one of {'manual', 'ddp', None}, "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+class DDPWithAttr(DDP):
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            module = self.__dict__.get("_modules", {}).get("module")
+            if module is not None and hasattr(module, name):
+                return getattr(module, name)
+            raise
 
 
 class TwinQNetwork(nn.Module):
@@ -134,27 +234,26 @@ class TwinQNetwork(nn.Module):
         self,
         obs_dim: int,
         act_dim: int,
+        hidden_dims: Tuple[int, ...] = (512, 512, 512),
         activation: type[nn.Module] = nn.SiLU,
         layer_norm: Literal["pre", "post", None] = "pre"
     ):
         super().__init__()
         critic_input_dim = obs_dim + act_dim
-        self.critic_1 = nn.Sequential(
-            nn.Linear(critic_input_dim, 512), activation(),
-            nn.Linear(512, 512), activation(),
-            nn.Linear(512, 512), activation(),
-            nn.RMSNorm(512),
-            nn.Linear(512, 1),
+        self.critic_1 = _same_width_residual_stack(
+            critic_input_dim,
+            hidden_dims,
+            1,
+            norm_cls=nn.RMSNorm,
+            activation=activation,
         )
-        self.critic_2 = nn.Sequential(
-            nn.Linear(critic_input_dim, 512), activation(),
-            nn.Linear(512, 512), activation(),
-            nn.Linear(512, 512), activation(),
-            nn.RMSNorm(512),
-            nn.Linear(512, 1),
+        self.critic_2 = _same_width_residual_stack(
+            critic_input_dim,
+            hidden_dims,
+            1,
+            norm_cls=nn.RMSNorm,
+            activation=activation,
         )
-        for c in (self.critic_1, self.critic_2):
-            c[-1].weight._non_muon = True
         self.reset_parameters()
     
     def reset_parameters(self):
@@ -202,6 +301,7 @@ class TwinDistributionalQNetwork(nn.Module):
         num_atoms: int,
         v_min: float,
         v_max: float,
+        hidden_dims: Tuple[int, ...] = (512, 512, 512),
         activation: str| type[nn.Module] = nn.SiLU,
         simba_mlp: bool = False,
     ):
@@ -217,26 +317,30 @@ class TwinDistributionalQNetwork(nn.Module):
         critic_input_dim = obs_dim + act_dim
     
         def make_critic():
+            hidden_dim = hidden_dims[0]
+            if any(dim != hidden_dim for dim in hidden_dims):
+                raise ValueError(
+                    "SAC distributional critic requires all hidden dims to match; "
+                    f"got {hidden_dims}."
+                )
             if simba_mlp:
-                in_layer = nn.Linear(critic_input_dim, 512)
+                in_layer = nn.Linear(critic_input_dim, hidden_dim)
                 in_layer.weight._non_muon = True
-                out_layer = nn.Linear(512, num_atoms)
+                out_layer = nn.Linear(hidden_dim, num_atoms)
                 out_layer.weight._non_muon = True
                 return nn.Sequential(
                     in_layer,
-                    SimbaMLP(512, 2, activation),
-                    nn.LayerNorm(512),
+                    SimbaMLP(hidden_dim, max(1, len(hidden_dims) - 1), activation),
+                    nn.LayerNorm(hidden_dim),
                     out_layer,
                 )
             else:
-                out_layer = nn.Linear(512, num_atoms)
-                out_layer.weight._non_muon = True
-                return nn.Sequential(
-                    nn.Linear(critic_input_dim, 512),
-                    ConditionalBlock(hidden_dim=512),
-                    ConditionalBlock(hidden_dim=512),
-                    nn.RMSNorm(512),
-                    out_layer,
+                return _same_width_residual_stack(
+                    critic_input_dim,
+                    hidden_dims,
+                    num_atoms,
+                    norm_cls=nn.RMSNorm,
+                    activation=activation,
                 )
 
         self.critic_1 = make_critic()
@@ -331,24 +435,26 @@ class TanhNormalActor(nn.Module):
         std_min: float = 0.001,
         action_init: Literal["zeros", "orthogonal"] = "zeros",
         init_upscale: float = 1.0,
+        hidden_dims: Tuple[int, ...] = (384, 384, 384),
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.act_dim = act_dim
 
-        # self.trunk = MLP(
-        #     [obs_dim, 256, 256, 256],
-        #     nn.SiLU,
-        #     layer_norm=layer_norm,
-        #     first_non_muon=True,
-        # )
-        self.trunk = nn.Sequential(
-            nn.Linear(obs_dim, 384),
-            ConditionalBlock(hidden_dim=384, condition_dim=0),
-            ConditionalBlock(hidden_dim=384, condition_dim=0),
-            nn.LayerNorm(384),
+        width = hidden_dims[0]
+        if any(dim != width for dim in hidden_dims):
+            raise ValueError(
+                "SAC actor requires all hidden dims to match; "
+                f"got {hidden_dims}."
+            )
+        trunk_layers: list[nn.Module] = [nn.Linear(obs_dim, width)]
+        trunk_layers.extend(
+            ConditionalBlock(hidden_dim=width, condition_dim=0)
+            for _ in range(max(0, len(hidden_dims) - 1))
         )
-        self.action = nn.Linear(384, act_dim * 2)
+        trunk_layers.append(nn.LayerNorm(width))
+        self.trunk = nn.Sequential(*trunk_layers)
+        self.action = nn.Linear(width, act_dim * 2)
         self.action.weight._non_muon = True
         self.trunk.apply(_init_sac_linear)
         
@@ -390,6 +496,40 @@ class SAC(TensorDictModuleBase):
         super().__init__()
         self.cfg = cfg
         self.device = device
+        self.actor_hidden_dims = tuple(int(x) for x in self.cfg.actor_hidden_dims)
+        self.critic_hidden_dims = tuple(int(x) for x in self.cfg.critic_hidden_dims)
+        if not self.actor_hidden_dims:
+            raise ValueError("actor_hidden_dims must be non-empty.")
+        if not self.critic_hidden_dims:
+            raise ValueError("critic_hidden_dims must be non-empty.")
+        self.policy_frequency = int(getattr(self.cfg, "policy_frequency", 4))
+        if self.policy_frequency < 1:
+            raise ValueError(
+                f"policy_frequency must be >= 1, got {self.policy_frequency}."
+            )
+        if self.cfg.actor_loc_reg_weight < 0:
+            raise ValueError(
+                f"actor_loc_reg_weight must be >= 0, got {self.cfg.actor_loc_reg_weight}."
+            )
+        if self.cfg.actor_loc_reg_scale <= 0:
+            raise ValueError(
+                f"actor_loc_reg_scale must be > 0, got {self.cfg.actor_loc_reg_scale}."
+            )
+        if self.cfg.actor_loc_reg_power <= 0:
+            raise ValueError(
+                f"actor_loc_reg_power must be > 0, got {self.cfg.actor_loc_reg_power}."
+            )
+        if self.cfg.target_entropy_decay_end < self.cfg.target_entropy_decay_start:
+            raise ValueError(
+                "target_entropy_decay_end must be >= target_entropy_decay_start."
+            )
+        self.grad_sync_mode = _normalize_grad_sync_mode(
+            getattr(self.cfg, "grad_sync_mode", "manual")
+        )
+        self.world_size = aa.get_world_size()
+        self._distributed = aa.is_distributed()
+        if self._distributed and not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("Distributed training is enabled but torch.distributed is not initialized.")
         self.observation_spec = observation_spec
         self.action_spec = action_spec
         self.reward_spec = reward_spec
@@ -427,15 +567,21 @@ class SAC(TensorDictModuleBase):
                 num_atoms=num_atoms,
                 v_min=v_min, # we actually do not have negative values, but it is a good idea to have a small margin
                 v_max=v_max,
+                hidden_dims=self.critic_hidden_dims,
                 simba_mlp=False
             ).to(device)
             self.V = None  # unused; keeps optim / checkpoint layout stable
             self.V_quantile = 0.7
         else:
-            self.Q = TwinQNetwork(obs_dim, act_dim, layer_norm=self.cfg.critic_layer_norm).to(device)
+            self.Q = TwinQNetwork(
+                obs_dim,
+                act_dim,
+                hidden_dims=self.critic_hidden_dims,
+                layer_norm=self.cfg.critic_layer_norm,
+            ).to(device)
             self.V = nn.Sequential(
-                MLP([obs_dim, 512, 512], nn.SiLU),
-                nn.Linear(512, 1),
+                MLP([obs_dim, *self.critic_hidden_dims], nn.SiLU),
+                nn.Linear(self.critic_hidden_dims[-1], 1),
             ).to(device)
             self.V.apply(_init_sac_linear)
             self.V_quantile = 0.7
@@ -451,6 +597,7 @@ class SAC(TensorDictModuleBase):
             std_min=0.001,
             action_init=self.cfg.actor_init,
             init_upscale=self.cfg.init_upscale,
+            hidden_dims=self.actor_hidden_dims,
         ).to(device)
 
         self.Q_target = copy.deepcopy(self.Q).to(device)
@@ -458,14 +605,16 @@ class SAC(TensorDictModuleBase):
         self.Q_target.requires_grad_(False)
         self.actor_target.requires_grad_(False)
 
-        if self.cfg.target_entropy_sigma is not None:
-            self.target_entropy = gaussian_target_entropy(
-                act_dim, self.cfg.target_entropy_sigma
-            )
-        else:
-            self.target_entropy = -float(act_dim)
+        self.act_dim = act_dim
+        self.target_entropy_sigma: float | None = None
         self.target_entropy = 0.0
+        self._set_target_entropy_sigma(self._scheduled_target_entropy_sigma(0))
         self.log_alpha = nn.Parameter(torch.tensor(math.log(0.004), device=device))
+        if self._distributed:
+            if self.grad_sync_mode == "ddp":
+                self._wrap_ddp(local_rank=aa.get_local_rank())
+            self._broadcast_parameters()
+
         self.opt_alpha = torch.optim.Adam([self.log_alpha], lr=self.cfg.lr_alpha)
         if self.cfg.muon:
             self.opt_actor = MuonAdamWWrapper(
@@ -486,15 +635,18 @@ class SAC(TensorDictModuleBase):
             self.opt_V = torch.optim.Adam(self.V.parameters(), lr=self.cfg.lr)
 
         self.global_step = 0
+        self.gradient_step = 0
+        self.schedule_iter = 0
 
         if env is None:
             raise ValueError("SAC requires env for ReplayBuffer layout (fake_tensordict).")
+        if cfg.buffer_device == "cuda":
+            cfg.buffer_device = device
         fake_rb = (
             env.fake_tensordict()
             .exclude(("next", "stats"), "collector")
             .detach()
-            # .cpu()
-        )
+        ).to(cfg.buffer_device)
         fake_rb[REWARD_KEY] = fake_rb[REWARD_KEY].sum(-1, keepdim=True)
         fake_rb["loc"] = torch.zeros(fake_rb.shape[0], self.actor.act_dim)
         self.rb = ReplayBuffer(self.cfg.buffer_size, fake_rb)
@@ -525,6 +677,113 @@ class SAC(TensorDictModuleBase):
         self._amp_device_type = _dev.type
         self._amp_enabled = bool(self.cfg.use_amp and _dev.type == "cuda")
         self.grad_scaler = GradScaler(self._amp_device_type, enabled=self._amp_enabled)
+
+    def _unwrap_module(self, module: nn.Module) -> nn.Module:
+        return module.module if isinstance(module, DDP) else module
+
+    def _wrap_ddp(self, local_rank: int) -> None:
+        device = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+        ddp_kwargs: dict[str, Any] = {
+            "broadcast_buffers": True,
+            "find_unused_parameters": False,
+        }
+        if device.type == "cuda":
+            ddp_kwargs.update(device_ids=[local_rank], output_device=local_rank)
+
+        self.actor = DDPWithAttr(self.actor, **ddp_kwargs)
+        self.Q = DDPWithAttr(self.Q, **ddp_kwargs)
+        if self.V is not None:
+            self.V = DDPWithAttr(self.V, **ddp_kwargs)
+
+    @torch.no_grad()
+    def _broadcast_parameters(self) -> None:
+        if not self._distributed:
+            return
+        dist.broadcast(self.log_alpha.data, src=0)
+        modules = [
+            self.vecnorm_obs,
+            self.actor,
+            self.actor_target,
+            self.Q,
+            self.Q_target,
+        ]
+        if self.V is not None:
+            modules.append(self.V)
+
+        for module in modules:
+            for param in module.parameters():
+                dist.broadcast(param.data, src=0)
+            for buffer in module.buffers():
+                dist.broadcast(buffer.data, src=0)
+
+    @torch.no_grad()
+    def _broadcast_buffers(self, *modules: nn.Module) -> None:
+        if not self._distributed:
+            return
+        for module in modules:
+            for buffer in module.buffers():
+                dist.broadcast(buffer.data, src=0)
+
+    @torch.no_grad()
+    def _all_reduce_grads(self, *modules: nn.Module) -> None:
+        if not self._distributed:
+            return
+        for module in modules:
+            for param in module.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG)
+
+    @torch.no_grad()
+    def _all_reduce_param_grad(self, param: nn.Parameter) -> None:
+        if self._distributed and param.grad is not None:
+            dist.all_reduce(param.grad.data, op=dist.ReduceOp.AVG)
+
+    def _sync_vecnorms(self) -> None:
+        if not self._distributed or not self.cfg.vecnorm:
+            return
+        if hasattr(self.vecnorm_obs, "synchronize"):
+            self.vecnorm_obs.synchronize(mode="broadcast")
+        else:
+            self._broadcast_buffers(self.vecnorm_obs)
+
+    def _scheduled_target_entropy_sigma(self, iteration: int) -> float | None:
+        start = self.cfg.target_entropy_sigma_start
+        end = self.cfg.target_entropy_sigma_end
+        base = self.cfg.target_entropy_sigma
+        if start is None and end is None:
+            return base
+        if start is None:
+            start = base if base is not None else end
+        if end is None:
+            end = base if base is not None else start
+        assert start is not None and end is not None
+        decay_start = int(self.cfg.target_entropy_decay_start)
+        decay_end = int(self.cfg.target_entropy_decay_end)
+        if iteration <= decay_start:
+            return float(start)
+        if iteration >= decay_end:
+            return float(end)
+        if decay_end <= decay_start:
+            return float(end)
+        progress = (iteration - decay_start) / (decay_end - decay_start)
+        return float(start + (end - start) * progress)
+
+    def _set_target_entropy_sigma(self, sigma: float | None) -> None:
+        self.target_entropy_sigma = None if sigma is None else float(sigma)
+        if self.target_entropy_sigma is None:
+            # Preserve the pre-schedule SAC behavior in this file: alpha targets
+            # zero entropy unless a sigma or sigma schedule is explicitly set.
+            self.target_entropy = 0.0
+        else:
+            self.target_entropy = gaussian_target_entropy(
+                self.act_dim, self.target_entropy_sigma
+            )
+
+    def step_schedule(self, progress: float):
+        self._set_target_entropy_sigma(
+            self._scheduled_target_entropy_sigma(self.schedule_iter)
+        )
+        self.schedule_iter += 1
 
     def _autocast(self):
         return autocast(
@@ -635,8 +894,27 @@ class SAC(TensorDictModuleBase):
             return infos
 
         with self._dormancy_tracker.track():
-            last_indices = None
             iters = self.cfg.train_every * self.cfg.utd_ratio
+            critic_batch = self.rb.sample(
+                batch_size=self.cfg.critic_batch_size * iters,
+                steps=self.cfg.n_steps,
+            ).to(self.device)
+            actor_update_count = 0
+            if self.enable_actor:
+                actor_update_count = sum(
+                    1
+                    for j in range(iters)
+                    if (self.gradient_step + j) % self.policy_frequency == 0
+                )
+            actor_batch = None
+            if actor_update_count:
+                actor_batch = self.rb.sample(
+                    batch_size=self.cfg.actor_batch_size * actor_update_count,
+                    steps=1,
+                ).to(self.device)
+            actor_update_idx = 0
+            critic_info = {}
+            actor_info = {}
             for i in range(iters):
                 # batch, last_indices = self.rb.sample_sequential(
                 #     batch_size=self.cfg.critic_batch_size,
@@ -645,26 +923,37 @@ class SAC(TensorDictModuleBase):
                 #     sequential_prob=0.6,
                 #     sequential_offset=-1,
                 # )
-                batch = self.rb.sample(
-                    batch_size=self.cfg.critic_batch_size,
-                    steps=self.cfg.n_steps,
-                ).to(self.device)
-                info = self.train_critic(
+                s = i * self.cfg.critic_batch_size
+                e = s + self.cfg.critic_batch_size
+                if self.cfg.n_steps == 1:
+                    batch = critic_batch[s:e]
+                else:
+                    batch = critic_batch[:, s:e]
+                critic_info = self.train_critic(
                     batch, diagnostics=(i == iters - 1)
                 )
-            infos.update(info)
 
-            if self.enable_actor:
-                for j in range(self.cfg.train_every):
-                    info = self.train_actor(
-                        diagnostics=(j == self.cfg.train_every - 1)
+                if (
+                    self.enable_actor
+                    and actor_batch is not None
+                    and self.gradient_step % self.policy_frequency == 0
+                ):
+                    s = actor_update_idx * self.cfg.actor_batch_size
+                    e = s + self.cfg.actor_batch_size
+                    actor_info = self.train_actor(
+                        batch=actor_batch[s:e],
+                        diagnostics=(actor_update_idx == actor_update_count - 1),
                     )
-                infos.update(info)
+                    actor_update_idx += 1
+                self.gradient_step += 1
+            infos.update(critic_info)
+            infos.update(actor_info)
 
         # if self.global_step % self.cfg.v_update_every == 0:
         #     for _ in range(self.cfg.v_inner):
         #         infos.update(self.train_v())
 
+        self._sync_vecnorms()
         self._flush_dormancy(infos)
         return dict(sorted(infos.items()))
 
@@ -711,7 +1000,8 @@ class SAC(TensorDictModuleBase):
                     lp = lp.reshape_as(reward)
 
                 if self.cfg.distributional:
-                    assert isinstance(self.Q, TwinDistributionalQNetwork)
+                    Q = self._unwrap_module(self.Q)
+                    assert isinstance(Q, TwinDistributionalQNetwork)
                     # Fold soft Bellman entropy into rewards, then categorical projection (FastSAC-style).
                     adjusted_reward = reward + discount * self.cfg.entropy_bonus * (-alpha * lp)
                     next_logits = self.Q_target(next_obs, target_action)
@@ -748,6 +1038,9 @@ class SAC(TensorDictModuleBase):
         self.opt_Q.zero_grad(set_to_none=True)
         if self._amp_enabled:
             self.grad_scaler.scale(q_loss).backward()
+            if self.grad_sync_mode == "manual":
+                # Match DDP+AMP ordering: reduce scaled grads before GradScaler checks them.
+                self._all_reduce_grads(self.Q)
             # Must unscale before clip / grad norm: clip_grad_norm_ and the logged norm are only
             # meaningful on the physical (unscaled) gradients; grad_scaler.step still runs Inf/NaN checks.
             self.grad_scaler.unscale_(self.opt_Q)
@@ -758,6 +1051,8 @@ class SAC(TensorDictModuleBase):
             self.grad_scaler.update()
         else:
             q_loss.backward()
+            if self.grad_sync_mode == "manual":
+                self._all_reduce_grads(self.Q)
             critic_grad_norm = clip_grad_norm_(self.Q.parameters(), max_norm=self.cfg.max_grad_norm)
             self.opt_Q.step()
 
@@ -795,10 +1090,15 @@ class SAC(TensorDictModuleBase):
             self.opt_V.zero_grad(set_to_none=True)
             if self._amp_enabled:
                 self.grad_scaler.scale(vf_loss).backward()
+                if self.grad_sync_mode == "manual":
+                    self._all_reduce_grads(self.V)
+                self.grad_scaler.unscale_(self.opt_V)
                 self.grad_scaler.step(self.opt_V)
                 self.grad_scaler.update()
             else:
                 vf_loss.backward()
+                if self.grad_sync_mode == "manual":
+                    self._all_reduce_grads(self.V)
                 self.opt_V.step()
 
             if diagnostics:
@@ -811,11 +1111,11 @@ class SAC(TensorDictModuleBase):
                 )
         return infos
 
-    def train_actor(self, diagnostics: bool = False):
-        batch = self.rb.sample(batch_size=self.cfg.actor_batch_size, steps=1).to(
-            self.device
-        ) # [N,]
-
+    def train_actor(
+        self,
+        batch: TensorDict,
+        diagnostics: bool = False,
+    ):
         obs = batch[OBS_KEY]
         obs = self.vecnorm_obs(obs)
         act = batch[ACTION_KEY]
@@ -837,10 +1137,17 @@ class SAC(TensorDictModuleBase):
             policy_term = -q.mean(dim=1)
 
         alpha = self.log_alpha.exp()
+        loc_reg = (
+            self.cfg.actor_loc_reg_weight
+            * (loc.abs() / self.cfg.actor_loc_reg_scale)
+            .pow(self.cfg.actor_loc_reg_power)
+            .sum(-1)
+            .reshape_as(policy_term)
+        )
         actor_loss = (
             policy_term
             + alpha.detach() * (-entropy_est.reshape_as(policy_term))
-            + 0.01 * ((loc/2.5)**6).sum(-1).reshape_as(policy_term)
+            + loc_reg
         ).mean()
 
         q_action_grad_norm: torch.Tensor | None = None
@@ -856,11 +1163,15 @@ class SAC(TensorDictModuleBase):
         self.opt_alpha.zero_grad(set_to_none=True)
         alpha_loss = -(alpha * (-entropy_est.detach() + self.target_entropy)).mean()
         alpha_loss.backward()
+        if self.grad_sync_mode in {"manual", "ddp"}:
+            self._all_reduce_param_grad(self.log_alpha)
         self.opt_alpha.step()
 
         self.opt_actor.zero_grad(set_to_none=True)
         if self._amp_enabled:
             self.grad_scaler.scale(actor_loss).backward()
+            if self.grad_sync_mode == "manual":
+                self._all_reduce_grads(self.actor)
             self.grad_scaler.unscale_(self.opt_actor)
             actor_grad_norm = nn.utils.clip_grad_norm_(
                 self.actor.parameters(), max_norm=self.cfg.max_grad_norm
@@ -869,6 +1180,8 @@ class SAC(TensorDictModuleBase):
             self.grad_scaler.update()
         else:
             actor_loss.backward()
+            if self.grad_sync_mode == "manual":
+                self._all_reduce_grads(self.actor)
             actor_grad_norm = nn.utils.clip_grad_norm_(
                 self.actor.parameters(), max_norm=self.cfg.max_grad_norm
             )
@@ -887,12 +1200,16 @@ class SAC(TensorDictModuleBase):
             "actor/grad_norm": actor_grad_norm.item(),
             "actor/alpha": alpha.detach().item(),
             "actor/entropy": entropy_est.mean().item(),
+            "actor/target_entropy": float(self.target_entropy),
             "actor/mean_change": mean_change.item(),
             "actor/q_std": q.std(dim=1).mean().item(),
             "actor/q_action_grad_norm": q_action_grad_norm.item(),
             "actor/mean_loc": loc.abs().mean().item(),
             "actor/mean_scale": scale.mean().item(),
+            "actor/loc_reg": loc_reg.mean().item(),
         }
+        if self.target_entropy_sigma is not None:
+            infos["actor/target_entropy_sigma"] = self.target_entropy_sigma
 
         actor_diagnostics = {}
         if isinstance(dist, ScaledTanhNormal):
@@ -967,10 +1284,15 @@ class SAC(TensorDictModuleBase):
         self.opt_V.zero_grad(set_to_none=True)
         if self._amp_enabled:
             self.grad_scaler.scale(v_loss).backward()
+            if self.grad_sync_mode == "manual":
+                self._all_reduce_grads(self.V)
+            self.grad_scaler.unscale_(self.opt_V)
             self.grad_scaler.step(self.opt_V)
             self.grad_scaler.update()
         else:
             v_loss.backward()
+            if self.grad_sync_mode == "manual":
+                self._all_reduce_grads(self.V)
             self.opt_V.step()
 
         return {
@@ -980,9 +1302,11 @@ class SAC(TensorDictModuleBase):
 
     def state_dict(self):
         state_dict = OrderedDict()
-        state_dict["Q"] = self.Q.state_dict()
+        Q = self._unwrap_module(self.Q)
+        actor = self._unwrap_module(self.actor)
+        state_dict["Q"] = Q.state_dict()
         # state_dict["V"] = self.V.state_dict()
-        state_dict["actor"] = self.actor.state_dict()
+        state_dict["actor"] = actor.state_dict()
         # do not store opt states as they make the ckpt very large
         # state_dict["opt_actor"] = self.opt_actor.state_dict()
         # state_dict["opt_Q"] = self.opt_Q.state_dict()
@@ -993,9 +1317,11 @@ class SAC(TensorDictModuleBase):
         return state_dict
 
     def load_state_dict(self, state_dict: dict, strict: bool = True):
-        self.Q.load_state_dict(state_dict["Q"], strict=strict)
+        Q = self._unwrap_module(self.Q)
+        actor = self._unwrap_module(self.actor)
+        Q.load_state_dict(state_dict["Q"], strict=strict)
         # self.V.load_state_dict(state_dict["V"], strict=strict)
-        self.actor.load_state_dict(state_dict["actor"], strict=strict)
+        actor.load_state_dict(state_dict["actor"], strict=strict)
         # reuse the same state dict for target networks
         self.Q_target.load_state_dict(state_dict["Q"], strict=strict)
         self.actor_target.load_state_dict(state_dict["actor"], strict=strict)
@@ -1006,4 +1332,3 @@ class SAC(TensorDictModuleBase):
         self.opt_alpha.load_state_dict(state_dict["opt_alpha"])
         self.log_alpha.data = state_dict["log_alpha"].to(self.device)
         self.vecnorm_obs.load_state_dict(state_dict["vecnorm_obs"])
-

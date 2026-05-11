@@ -82,7 +82,7 @@ def main(cfg: DictConfig):
     video_path = video_dir / f"{cfg.task.name}-{time_str}.mp4"
 
     with env.get_recorder(video_path, enabled=record_enabled)as rec, \
-        torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
+        torch.inference_mode(), set_exploration_type(ExplorationType.DETERMINISTIC):
         try:
             for i in itertools.count():
                 carry = rollout_policy(carry)
