@@ -3,6 +3,7 @@ from .env_base import _EnvBase
 from .backends.isaac import IsaacBackendEnv
 from .backends.mjlab import MjlabBackendEnv
 from .backends.mujoco import MujocoBackendEnv
+from .backends.motrixsim import MotrixsimBackendEnv
 from . import terrain
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "IsaacBackendEnv",
     "MujocoBackendEnv",
     "MjlabBackendEnv",
+    "MotrixsimBackendEnv",
     "terrain",
 ]

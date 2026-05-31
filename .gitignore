@@ -194,3 +194,7 @@ scripts/rollout
 checkpoint*.pt
 test/
 *.csv
+
+# motrixsim generated viz assets
+active_adaptation/assets/Go2/mjcf/mxcam_*.xml
+active_adaptation/assets/Go2/mjcf/scene_viz.xml

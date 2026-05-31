@@ -28,7 +28,7 @@ class energy_l1(Reward):
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)
         self.joint_ids = torch.tensor(self.joint_ids, device=self.device)
-        if self.env.backend in ("isaac", "mujoco"):
+        if self.env.backend in ("isaac", "mujoco", "motrixsim"):
             self.get_torques = lambda: self.asset.data.applied_torque[:, self.joint_ids]
         elif self.env.backend == "mjlab":
             self.get_torques = lambda: self.asset.data.actuator_force[:, self.joint_ids]
@@ -224,7 +224,7 @@ class joint_torques_l2(Reward):
         self.asset: Articulation = self.env.scene.articulations["robot"]
         self.joint_ids = self.asset.find_joints(joint_names)[0]
         self.joint_ids = torch.tensor(self.joint_ids, device=self.device)
-        if self.env.backend in ("isaac", "mujoco"):
+        if self.env.backend in ("isaac", "mujoco", "motrixsim"):
             self.get_torques = lambda: self.asset.data.applied_torque[:, self.joint_ids]
         elif self.env.backend == "mjlab":
             self.get_torques = lambda: self.asset.data.actuator_force[:, self.joint_ids]

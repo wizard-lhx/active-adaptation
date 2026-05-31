@@ -67,8 +67,14 @@ def main(cfg: DictConfig):
 
     from active_adaptation.helpers import make_env_policy, evaluate
     from active_adaptation.utils.helpers import EpisodeStats
+    from active_adaptation.utils.wandb import parse_checkpoint
 
-    env, policy = make_env_policy(cfg)
+    # Optional warm-start: load weights from checkpoint_path and fine-tune (fresh
+    # optimizer). None when checkpoint_path is unset -> normal from-scratch training.
+    _init_ckpt = parse_checkpoint(cfg.get("checkpoint_path"))
+    if _init_ckpt is not None:
+        logging.info(f"Warm-starting policy from {cfg.get('checkpoint_path')}")
+    env, policy = make_env_policy(cfg, _init_ckpt)
     policy: PPOBase
 
     frames_per_batch = env.num_envs * cfg.algo.train_every

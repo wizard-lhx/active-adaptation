@@ -50,6 +50,8 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
         cfg.task.reward = {}
     elif backend == "mjlab":
         env_cls = _EnvBase.registry[cfg.task.get("env_class", "MjlabBackendEnv")]
+    elif backend == "motrixsim":
+        env_cls = _EnvBase.registry[cfg.task.get("env_class", "MotrixsimBackendEnv")]
     else:
         raise ValueError(f"Unknown backend: {backend}")
     

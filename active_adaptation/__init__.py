@@ -4,7 +4,6 @@ import json
 import datetime
 import builtins
 import inspect
-import importlib
 import warp as wp
 
 from pathlib import Path
@@ -16,7 +15,7 @@ from active_adaptation.project_loading.manifest import CACHE_DIR
 from active_adaptation.project_loading.plugin import ActiveAdaptationSearchPathPlugin
 from active_adaptation.project_loading.runtime import import_environment_projects
 
-import active_adaptation.learning
+import active_adaptation.learning  # noqa: F401  (side-effect import: registers learning components)
 
 OmegaConf.register_new_resolver("frac", lambda s: float(Fraction(s)))
 OmegaConf.register_new_resolver("eval", eval)
@@ -73,9 +72,9 @@ def set_backend(backend: str):
         raise RuntimeError(
             f"set_backend() already called at {_CALLED_AT['filename']}:{_CALLED_AT['lineno']} in {_CALLED_AT['function']}"
         )
-    if not backend in ("isaac", "mujoco", "mjlab"):
+    if not backend in ("isaac", "mujoco", "mjlab", "motrixsim"):
         raise ValueError(
-            f"backend must be either 'isaac' or 'mujoco' or 'mjlab', got {backend}"
+            f"backend must be either 'isaac' or 'mujoco' or 'mjlab' or 'motrixsim', got {backend}"
         )
     # Record the call site
     stack = inspect.stack()
@@ -122,6 +121,15 @@ def init(cfg: DictConfig, auto_rank: bool):
         cfg.device = "cuda"  # force to use GPU for mjlab
     elif _BACKEND == "mujoco":
         cfg.device = "cpu"  # force to use CPU for mujoco
+    elif _BACKEND == "motrixsim":
+        # MotrixSim physics runs on CPU (Rust engine), but the torch side — MDP
+        # obs/rewards, policy, PPO — honors cfg.device. cuda gives a large speedup
+        # (~4-5x) since the MDP + PPO update dominate cost; the backend bridges
+        # CPU-physics <-> GPU-torch across the numpy boundary. Falls back to CPU
+        # if no GPU is available.
+        import torch as _torch
+        if str(cfg.device).startswith("cuda") and not _torch.cuda.is_available():
+            cfg.device = "cpu"
 
     if auto_rank and str(cfg.device).startswith("cuda"):
         cfg.device = f"cuda:{get_local_rank()}"

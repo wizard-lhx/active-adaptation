@@ -461,6 +461,42 @@ class AssetCfg:
             spatial_symmetry_mapping=self.spatial_symmetry_mapping,
         )
 
+    def motrixsim(self):
+        """Convert to MotrixSim (Motphys) asset configuration.
+
+        MotrixSim is MJCF-native and CPU-based; this mirrors :meth:`mujoco`,
+        returning a lightweight cfg consumed by the motrixsim backend, which
+        loads the MJCF and applies PD-as-torque control.
+        """
+        from active_adaptation.envs.backends.motrixsim.motrixsim_sim import (
+            MotrixArticulationCfg,
+        )
+
+        merged = self._merge_actuator_dicts()
+        return MotrixArticulationCfg(
+            mjcf_path=str(self.mjcf_path),
+            init_state={
+                "pos": self.init_state.pos,
+                "rot": self.init_state.rot,
+                "joint_pos": self.init_state.joint_pos,
+                "joint_vel": self.init_state.joint_vel,
+            },
+            actuators={
+                "all": {
+                    "joint_names_expr": merged["joint_names_expr"],
+                    "stiffness": merged["stiffness"],
+                    "damping": merged["damping"],
+                    "friction": merged["friction"],
+                    "armature": merged["armature"],
+                    "effort_limit": merged["effort_limit"],
+                }
+            },
+            body_names_simulation=self.body_names_simulation,
+            joint_names_simulation=self.joint_names_simulation,
+            joint_symmetry_mapping=self.joint_symmetry_mapping,
+            spatial_symmetry_mapping=self.spatial_symmetry_mapping,
+        )
+
     def mjlab(self):
         """Convert to MuJoCo Lab asset configuration.
         

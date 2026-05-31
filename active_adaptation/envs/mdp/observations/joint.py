@@ -112,7 +112,13 @@ class joint_pos_multistep(joint_observation):
     @override
     def update(self):
         next_joint_pos_multistep = self.joint_pos_multistep.roll(1, 1)
-        next_joint_pos = self.joint_pos_substep.mean(1)
+        # Average only the substep slots actually written this control step. With
+        # decimation==1 (motrix step_n) post_step fills slot 0 only, so the old
+        # mean over both 2 slots returned joint_pos/2 (stale-zero slot 1) -> halved
+        # obs. Slicing to min(2, decimation) fixes decimation==1 and is a no-op for
+        # decimation>=2 (isaac/mujoco).
+        n = min(2, self.env.decimation)
+        next_joint_pos = self.joint_pos_substep[:, :n].mean(1)
         next_joint_pos_multistep[:, 0] = normal_noise(next_joint_pos, self.noise_std)
         self.joint_pos_multistep = next_joint_pos_multistep
     
@@ -168,8 +174,12 @@ class joint_vel_multistep(joint_observation):
     @override
     def update(self):
         self.joint_vel_multistep = self.joint_vel_multistep.roll(1, 1)
-        if self.from_pos:
+        if self.from_pos and self.joint_pos_substep.shape[1] >= 2:
             joint_vel = self.joint_pos_substep.diff(dim=1).mean(dim=1) / self.env.physics_dt
+        elif self.from_pos:
+            # decimation==1 (e.g. motrix step_n collapses substeps): diff over a single
+            # sample is empty -> mean is NaN. Fall back to the sim's direct joint velocity.
+            joint_vel = self.asset.data.joint_vel[:, self.joint_ids]
         else:
             joint_vel = self.joint_vel_substep.mean(dim=1)
         self.joint_vel_multistep[:, 0] = normal_noise(joint_vel, self.noise_std)
