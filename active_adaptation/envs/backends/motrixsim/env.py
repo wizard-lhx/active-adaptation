@@ -17,7 +17,7 @@ class MotrixsimBackendEnv(_EnvBase):
         self.robot = self.scene.articulations["robot"]
 
     def setup_scene(self):
-        from active_adaptation.envs.backends.motrixsim.motrixsim_sim import (
+        from active_adaptation.envs.backends.motrixsim.motrixsim import (
             MotrixScene,
             MotrixSim,
         )

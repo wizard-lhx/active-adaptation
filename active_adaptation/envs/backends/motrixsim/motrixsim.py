@@ -3,15 +3,13 @@
 Mirrors the IsaacLab-style ``Articulation.data`` API used by the MDP layer,
 implemented on top of MotrixSim's ``SceneModel`` / ``SceneData`` (CPU, MJCF-native),
 batched over ``num_envs``. This is the MotrixSim analog of ``backends/mujoco/mujoco.py``.
-
-See ``NOTES.md`` in this directory for the full API mapping.
 """
 
 import os
 import tempfile
 import warnings
-from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Optional, Sequence, Union
+from dataclasses import dataclass, replace
+from typing import Dict, Sequence, Union
 
 import mujoco
 import numpy as np
@@ -24,9 +22,16 @@ try:
 except ModuleNotFoundError:
     from mjlab.utils.lab_api import string as string_utils
 
-from active_adaptation.utils.math import quat_rotate_inverse, quat_rotate
+from active_adaptation.utils.math import quat_rotate_inverse
 
 ArrayType = Union[np.ndarray, torch.Tensor]
+
+# Stiff, well-damped contact (negative solref = direct stiffness/damping). The strong
+# damping -5000 (vs MuJoCo's underdamped default) is what stops MotrixSim's impulse solver
+# from going "LTL NotPositiveDefinite" under full-body ground contact. Applied to every
+# collision geom and to the floor.
+_CONTACT_SOLREF = [-50000.0, -5000.0]
+_CONTACT_SOLIMP = [0.99, 0.999, 0.0001, 0.5, 2.0]
 
 
 def xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
@@ -46,11 +51,6 @@ class MotrixArticulationCfg:
     joint_names_simulation: Sequence[str]
     joint_symmetry_mapping: Dict = None
     spatial_symmetry_mapping: Dict = None
-
-
-@dataclass
-class MotrixTerrainCfg:
-    mjcf_path: Optional[str] = None
 
 
 @dataclass
@@ -171,38 +171,29 @@ class MotrixArticulationData:
 
 
 class MotrixArticulation:
+    """One robot: MJCF/scene setup, native<->Isaac translation, and the read/write
+    paths the MDP and ``_EnvBase`` step loop use.
+
+    All ``data`` fields are batched ``(num_envs, ...)`` and in Isaac order. Physics
+    state is read by slicing ``dof_pos``/``dof_vel`` (native MJCF order); the
+    permutation maps built in ``_initialize`` bridge the two orderings.
+    """
+
     is_fixed_base = False
 
     def __init__(self, cfg: MotrixArticulationCfg):
         self.cfg = cfg
-        # build a mujoco spec so we can (a) add a ground plane and (b) reuse mj gain setup
+        # Edit the MJCF as a mujoco.MjSpec before MotrixSim loads it (no post-load edits
+        # are possible): configure collision, then ensure every joint has an actuator.
         self.spec = mujoco.MjSpec.from_file(cfg.mjcf_path)
-        # FEET-ONLY collision (default). Two reasons, both required for Go2 to train:
-        #  (1) MotrixSim's impulse solver panics ("LTL factorization NotPositiveDefinite")
-        #      when the trunk/calf/thigh boxes lie flat on the floor during a fall (many
-        #      coincident contacts -> singular contact matrix) -> NaN state -> poisons PPO.
-        #      PhysX/isaac tolerate this; MotrixSim does not. Restricting collision to the
-        #      foot point-contacts removes the degenerate configs (matches umi-on-legs).
-        #  (2) We also name the kept collision geoms after their body so the contact sensor
-        #      can map geom<->body; go2.xml's geoms are ALL unnamed, which is why the sensor
-        #      built no pairs and feet_air_time/feet_sliding were silently DEAD.
-        # Non-foot terms (undesired_contact / crash) then read 0, but with feet-only collision
-        # those bodies can't touch the floor anyway; geometric fall_over handles termination.
-        # Opt out (full-body collision) with MOTRIX_FULLBODY=1 for debugging.
-        # FULL-BODY collision is the DEFAULT, matching isaac (the policy is trained
-        # against the ground with all link collision geoms). Feet-ONLY collision (the
-        # old default) made the Go2 an unstable inverted pendulum on 4 point-feet: with
-        # the compliant explicit PD it tips and flips within ~1 s even at the default
-        # pose, so no transferred policy can survive. Opt into feet-only (debug) with
-        # MOTRIX_FEET_ONLY=1. The LTL-solver blow-ups that originally motivated feet-only
-        # are cured here by stiff WELL-DAMPED contact (solref below) + Newton/multiccd
-        # solver options set in MotrixScene (umi-on-LEGS recipe).
+
+        # Collision model. Full-body is the default (matches Isaac, which collides all
+        # link geoms against the ground); MOTRIX_FEET_ONLY=1 restricts collision to
+        # foot/ankle bodies for debugging. Two MotrixSim-specific requirements:
+        #   - both contype AND conaffinity must be 1 (no MuJoCo bitmask OR-check), and
+        #   - every kept collision geom must be named, so the contact sensor can map it
+        #     back to its body (go2.xml's geoms are unnamed).
         feet_only = bool(os.environ.get("MOTRIX_FEET_ONLY"))
-        # umi-on-LEGS contact: solref negative = direct (stiffness, damping). Damping
-        # -5000 (vs MuJoCo's underdamped default) kills the contact chatter that makes
-        # the impulse solver go NotPositiveDefinite.
-        SOLREF = [-50000.0, -5000.0]
-        SOLIMP = [0.99, 0.999, 0.0001, 0.5, 2.0]
         self.collision_geom_bodies: dict[str, str] = {}
         for body in self.spec.bodies:
             is_foot_body = ("foot" in body.name.lower() or "ankle" in body.name.lower())
@@ -217,24 +208,56 @@ class MotrixArticulation:
                 # MotrixSim needs contype=1 AND conaffinity=1 (no MuJoCo bitmask OR-check)
                 g.contype = 1
                 g.conaffinity = 1
-                g.solref = SOLREF
-                g.solimp = SOLIMP
+                g.solref = _CONTACT_SOLREF
+                g.solimp = _CONTACT_SOLIMP
                 if not g.name:
                     g.name = f"{body.name}_colgeom{k}"
                 self.collision_geom_bodies[g.name] = body.name
                 k += 1
-        # Inject a motor (torque) actuator per hinge joint that lacks one. Some MJCFs
-        # (e.g. go2.xml) declare <motor> only in <default>, yielding 0 real actuators;
-        # this mirrors the mujoco backend so any robot is drivable.
-        existing = {a.target for a in self.spec.actuators}
+        # Resolve PD gains and configure native position-servo actuators (the engine
+        # computes the PD implicitly each substep).
+        self.joint_names_isaac = list(cfg.joint_names_simulation)
+        self._kp, self._kd = self._resolve_gains()
+        self._setup_actuators()
+
+    def _resolve_gains(self):
+        """Per-joint PD gains (kp, kd) from cfg, as Isaac-order numpy arrays."""
+        nj = len(self.joint_names_isaac)
+        kp = np.zeros(nj, dtype=np.float32)
+        kd = np.zeros(nj, dtype=np.float32)
+        for _, actuator_cfg in self.cfg.actuators.items():
+            for key, dst in (("stiffness", kp), ("damping", kd)):
+                spec = actuator_cfg.get(key, {".*": 0.0})
+                ids, _, vals = string_utils.resolve_matching_names_values(spec, self.joint_names_isaac)
+                dst[ids] = np.asarray(vals, dtype=np.float32)
+        return kp, kd
+
+    def _setup_actuators(self):
+        """Configure a native MuJoCo position servo on every hinge joint.
+
+        force = kp*(target-q) - kd*qd, via gainprm/biasprm, which MotrixSim integrates
+        implicitly each substep. Joints with no actuator (e.g. go2.xml declares motors
+        only in <default>) get one added, mirroring the mujoco backend.
+        """
+        kp_by_name = dict(zip(self.joint_names_isaac, self._kp))
+        kd_by_name = dict(zip(self.joint_names_isaac, self._kd))
+        by_target = {a.target: a for a in self.spec.actuators}
         for joint in self.spec.joints:
-            if joint.type != mujoco.mjtJoint.mjJNT_HINGE or joint.name in existing:
+            if joint.type != mujoco.mjtJoint.mjJNT_HINGE:
                 continue
-            act = self.spec.add_actuator(name=joint.name, target=joint.name)
-            act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+            act = by_target.get(joint.name)
+            if act is None:
+                act = self.spec.add_actuator(name=joint.name, target=joint.name)
+                act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+                act.gear[0] = 1.0
+            kp = float(kp_by_name.get(joint.name, 0.0))
+            kd = float(kd_by_name.get(joint.name, 0.0))
             act.gaintype = mujoco.mjtGain.mjGAIN_FIXED
-            act.biastype = mujoco.mjtBias.mjBIAS_NONE
-            act.gear[0] = 1.0
+            act.gainprm[0] = kp
+            act.biastype = mujoco.mjtBias.mjBIAS_AFFINE
+            act.biasprm[0] = 0.0
+            act.biasprm[1] = -kp
+            act.biasprm[2] = -kd
 
     # ------------------------------------------------------------------
     def _initialize(self, model: "mx.SceneModel", data: "mx.SceneData", num_envs: int, device: str):
@@ -242,10 +265,8 @@ class MotrixArticulation:
         self.mtx_data = data
         self.num_envs = num_envs
         self.device = device
-        self.body = model.get_body(self._find_root_body_name())
 
         # ---- name lists & ordering maps (motrixsim/MJCF order <-> Isaac order) ----
-        self.joint_names_isaac = list(self.cfg.joint_names_simulation)
         self.body_names_isaac = list(self.cfg.body_names_simulation)
         self.joint_names_mtx = list(model.joint_names)
         self.link_names_mtx = list(model.link_names)
@@ -259,7 +280,6 @@ class MotrixArticulation:
         # actuator k (motrixsim order) -> index into the Isaac-ordered torque vector
         self._act2isaac = [self.joint_names_isaac.index(t) for t in self.actuator_target_mtx]
 
-        self._link_objs = [model.get_link(n) for n in self.link_names_mtx]
         # effort/torque limits per actuator: prefer the asset's effort_limit (works when
         # the MJCF has no ctrlrange, e.g. injected motors); else fall back to ctrl_range.
         eff_cfg = self.cfg.actuators.get("all", {}).get("effort_limit", None)
@@ -274,32 +294,31 @@ class MotrixArticulation:
                 [a.ctrl_range for a in model.actuators], dtype=np.float32
             )  # (nu, 2)
 
-        # ---- defaults / gains in Isaac order ----
+        # ---- control maps: Isaac<->native joint perms + per-joint effort bounds ----
+        # _jnt_mtx2isaac (above) goes native->Isaac; _mtx_from_isaac is its inverse.
+        self._mtx_from_isaac = [self.joint_names_isaac.index(n) for n in self.joint_names_mtx]
+        self._act_jointidx = [self.joint_names_mtx.index(t) for t in self.actuator_target_mtx]
+        self._kp_native = self._kp[self._mtx_from_isaac]
+        self._kd_native = self._kd[self._mtx_from_isaac]
+        self._eff_lo_native = np.empty(self.num_joints, np.float32)
+        self._eff_hi_native = np.empty(self.num_joints, np.float32)
+        self._eff_lo_native[self._act_jointidx] = self.ctrl_limit_mtx[:, 0]
+        self._eff_hi_native[self._act_jointidx] = self.ctrl_limit_mtx[:, 1]
+
+        # ---- defaults in Isaac order (gains were resolved in __init__) ----
         nj = self.num_joints
         default_joint_pos = torch.zeros(nj)
-        jids, jnames, jvals = string_utils.resolve_matching_names_values(
+        jids, _, jvals = string_utils.resolve_matching_names_values(
             self.cfg.init_state["joint_pos"], self.joint_names_isaac
         )
         default_joint_pos[jids] = torch.as_tensor(jvals, dtype=torch.float32)
         default_joint_vel = torch.zeros(nj)
-
-        joint_stiffness = torch.zeros(nj)
-        joint_damping = torch.zeros(nj)
-        joint_armature = torch.zeros(nj)
-        for _, actuator_cfg in self.cfg.actuators.items():
-            for key, dst in (("stiffness", joint_stiffness), ("damping", joint_damping), ("armature", joint_armature)):
-                spec = actuator_cfg.get(key, {".*": 0.0})
-                ids, _, vals = string_utils.resolve_matching_names_values(spec, self.joint_names_isaac)
-                dst[ids] = torch.as_tensor(vals, dtype=torch.float32)
-        self._kp = joint_stiffness.numpy().astype(np.float32)
-        self._kd = joint_damping.numpy().astype(np.float32)
 
         # joint pos limits in Isaac order, read from the compiled mujoco model (same MJCF)
         jl_isaac = np.zeros((nj, 2), dtype=np.float32)
         for i, jname in enumerate(self.joint_names_isaac):
             jl = self.model.get_joint(jname).range
             jl_isaac[i] = np.asarray(jl, dtype=np.float32)
-        self._device_t = torch.device(device)
 
         N = self.num_envs
         self._data = MotrixArticulationData(
@@ -319,7 +338,8 @@ class MotrixArticulation:
         self._data.joint_pos_target = self._data.default_joint_pos.clone()
         self._data.joint_vel_target = self._data.default_joint_vel.clone()
 
-        # external wrench buffers (body frame), in Isaac order
+        # External-wrench buffers (Isaac order). Kept for SceneAdapter parity (the
+        # adapter zeroes them each substep); applying them to the sim is not implemented.
         self._external_force_b = torch.zeros(N, self.num_bodies, 3, device=device)
         self._external_torque_b = torch.zeros(N, self.num_bodies, 3, device=device)
         self.has_external_wrench = False
@@ -327,83 +347,7 @@ class MotrixArticulation:
         self._prev_joint_vel = None
         self._prev_body_pos = None
         self._prev_body_quat = None
-        # Gravity-compensation feedforward (umi-on-LEGS technique). Explicit PD has a
-        # steady-state droop (kp*(target-q)=tau_gravity -> q sags), so Go2 can't even
-        # hold its default pose (base sags 0.40->0.21) and RL can't bootstrap. The
-        # feedforward removes the droop. Opt out with NO_GRAVITY_FF=1.
-        self._gravity_ff = None
-        if not os.environ.get("NO_GRAVITY_FF"):
-            self._setup_gravity_ff()
         self.update(0.0)
-
-    def _setup_gravity_ff(self):
-        """Gravity-comp feedforward via umi-on-LEGS' droop-measure + scale-search.
-
-        Phase 1: settle one env at the default pose with pure PD; the steady-state
-        error ``droop = default - settled`` is the gravity-induced sag. The holding
-        torque is ``kp*droop``. Phase 2: grid-search a scale (full comp overshoots)
-        that minimises base-z drift. Result (native order) -> self._gravity_ff.
-        """
-        m = self.model
-        mtxj = self.joint_names_mtx
-        mfi = [self.joint_names_isaac.index(n) for n in mtxj]
-        kp_n = self._kp[mfi]
-        kd_n = self._kd[mfi]
-        default_n = self._data.default_joint_pos[0].cpu().numpy()[mfi]
-        cr = self.ctrl_limit_mtx
-        nj = self.num_joints
-        pos0 = np.asarray(self.cfg.init_state["pos"], dtype=np.float32)
-        quat0 = wxyz_to_xyzw(np.asarray(self.cfg.init_state["rot"], dtype=np.float32))
-        tmp = mx.SceneData(m, batch=(1,))
-
-        def reset():
-            dof = np.asarray(tmp.dof_pos).copy()
-            dof[0, 0:3] = pos0
-            dof[0, 3:7] = quat0
-            dof[0, 7:7 + nj] = default_n
-            tmp.set_dof_pos(dof.astype(np.float32), m)
-            tmp.set_dof_vel(np.zeros_like(np.asarray(tmp.dof_vel), dtype=np.float32))
-            m.forward_kinematic(tmp)
-
-        def settle(offset, n):
-            for _ in range(n):
-                cur = np.asarray(tmp.dof_pos)[:, 7:7 + nj]
-                cvel = np.asarray(tmp.dof_vel)[:, 6:6 + nj]
-                tau = np.clip(kp_n * (default_n - cur) - kd_n * cvel + offset, cr[:, 0], cr[:, 1])
-                tmp.actuator_ctrls = tau.astype(np.float32)
-                m.step(tmp)
-
-        # Go2 on point-feet is passively UNSTABLE with the soft PD (it tips during a
-        # settle), so droop can't be measured directly. Settle with a STIFF PD instead:
-        # it holds the default pose tightly (no sag, no tip) so the steady-state torque
-        # IS the true gravity holding torque (robot genuinely standing, body load via
-        # the feet included). Average it over the tail and apply with the normal kp.
-        dbg = bool(os.environ.get("GRAVITY_FF_DEBUG"))
-        kp_stiff = kp_n * 8.0
-        kd_stiff = kd_n * 8.0
-        reset()
-        n_settle, n_avg = 1200, 300
-        tau_acc = np.zeros(nj, dtype=np.float64)
-        for step in range(n_settle + n_avg):
-            cur = np.asarray(tmp.dof_pos)[:, 7:7 + nj]
-            cvel = np.asarray(tmp.dof_vel)[:, 6:6 + nj]
-            tau = np.clip(kp_stiff * (default_n - cur) - kd_stiff * cvel, cr[:, 0], cr[:, 1])
-            tmp.actuator_ctrls = tau.astype(np.float32)
-            m.step(tmp)
-            if step >= n_settle:
-                tau_acc += tau[0]
-            if dbg and step in (50, 300, 800, n_settle + n_avg - 1):
-                print(f"  [gravity_ff] step {step}: base_z={float(np.asarray(tmp.dof_pos)[0,2]):.3f} "
-                      f"max|jdroop|={np.abs(default_n - cur[0]).max():.3f}rad")
-        self._gravity_ff = (tau_acc / n_avg).astype(np.float32)
-        if dbg:
-            print(f"  [gravity_ff] max|ff|={np.abs(self._gravity_ff).max():.2f}Nm "
-                  f"mean|ff|={np.abs(self._gravity_ff).mean():.2f}Nm")
-
-    # ------------------------------------------------------------------
-    def _find_root_body_name(self) -> str:
-        # the first entry of body_names_simulation is the root link (pelvis/base/trunk)
-        return list(self.cfg.body_names_simulation)[0]
 
     @staticmethod
     def _check_names(kind, isaac, mtx):
@@ -466,12 +410,14 @@ class MotrixArticulation:
         sign = np.where(dw < 0, -1.0, 1.0)[..., None]  # shortest path (double-cover)
         return (2.0 / dt) * sign * np.stack([dx, dy, dz], axis=-1)
 
-    # ---- state read (motrixsim -> Isaac-ordered torch on device) -------
-    # Reads base + joints by slicing dof_pos/dof_vel directly (qpos/qvel order),
-    # and body velocities by finite-differencing the single batched get_link_poses
-    # call. This mirrors umi-on-LEGS' motrix env and avoids the per-link velocity
-    # loop (30x get_linear/angular_velocity calls) that throttled throughput.
     def update(self, dt: float):
+        """Read native MotrixSim state into the Isaac-ordered ``data`` (per substep).
+
+        Base and joints are sliced from ``dof_pos``/``dof_vel``; per-body velocities come
+        from finite-differencing one batched ``get_link_poses`` call (the per-link
+        velocity API is too slow to loop). The root velocity rows are then overwritten
+        with the exact free-joint velocities.
+        """
         d = self.mtx_data
         N = self.num_envs
         nj = self.num_joints
@@ -523,13 +469,12 @@ class MotrixArticulation:
         w, x, y, z = root_quat_t.unbind(-1)
         heading_w = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 
+        # replace() preserves the fields not listed (e.g. joint_pos_target, defaults).
         self._data = replace(
             self._data,
             joint_pos=joint_pos_t,
             joint_vel=joint_vel_t,
             joint_acc=joint_acc_t,
-            joint_pos_target=self._data.joint_pos_target,
-            joint_vel_target=self._data.joint_vel_target,
             body_link_pos_w=torch.as_tensor(body_link_pos_w, dtype=torch.float32, device=dev),
             body_link_quat_w=torch.as_tensor(body_link_quat_w, dtype=torch.float32, device=dev),
             body_com_pos_w=torch.as_tensor(body_link_pos_w, dtype=torch.float32, device=dev),
@@ -556,56 +501,31 @@ class MotrixArticulation:
             self._data.joint_vel_target[:, joint_ids] = target
 
     def write_data_to_sim(self):
-        # PD-as-torque computed entirely in native (MJCF joint) order and gathered to
-        # actuators by joint index — the formulation verified to hold the robot. Read
-        # FRESH joint state each substep (the cached self._data.joint_pos lags the PD
-        # feedback by one substep and destabilizes the inverted-pendulum humanoid).
-        N = self.num_envs
-        if not hasattr(self, "_pd_kp_mtx"):
-            mtxj = self.joint_names_mtx
-            # isaac-ordered target -> native order; native joint -> isaac (for applied_torque)
-            self._mtx_from_isaac = [self.joint_names_isaac.index(n) for n in mtxj]
-            # actuator k -> index of its target joint in native order
-            self._act_jointidx = [mtxj.index(t) for t in self.actuator_target_mtx]
-            # explicit PD is SOFTER + underdamped vs isaac's implicit PD at the same
-            # gains (isaac's implicit drive tracks the target far more stiffly per step).
-            # KP_SCALE/KD_SCALE calibrate the explicit gains up to reproduce isaac's
-            # effective stiffness/damping so an isaac-trained policy transfers.
-            self._pd_kp_mtx = self._kp[self._mtx_from_isaac] * float(os.environ.get("KP_SCALE", "1.0"))
-            self._pd_kd_mtx = self._kd[self._mtx_from_isaac] * float(os.environ.get("KD_SCALE", "1.0"))
+        """Command the joint-position target to the native servo; expose ``applied_torque``.
 
-        # current joint state by slicing dof_pos/dof_vel (native qpos/qvel order)
+        MotrixSim integrates the PD (kp*(target-q) - kd*qd) implicitly each substep, so we
+        only write the position target. ``applied_torque`` is reported analytically from
+        FRESH joint state (clipped to the effort limits) for the reward terms.
+        """
+        # fresh joint state and target, native (qpos/qvel) order
         nj = self.num_joints
         jp_mtx = np.asarray(self.mtx_data.dof_pos)[:, 7:7 + nj]
         jv_mtx = np.asarray(self.mtx_data.dof_vel)[:, 6:6 + nj]
         tgt_mtx = self._data.joint_pos_target.detach().cpu().numpy()[:, self._mtx_from_isaac]
-        vtgt_mtx = self._data.joint_vel_target.detach().cpu().numpy()[:, self._mtx_from_isaac]
-        tau_mtx = self._pd_kp_mtx * (tgt_mtx - jp_mtx) + self._pd_kd_mtx * (vtgt_mtx - jv_mtx)
-        if getattr(self, "_gravity_ff", None) is not None:
-            tau_mtx = tau_mtx + self._gravity_ff  # gravity-compensation feedforward (native)
+
+        # Command the position target. The array MUST be C-contiguous: MotrixSim reads
+        # actuator_ctrls by raw buffer and ignores numpy strides, so a fancy-indexed
+        # (non-contiguous) array scrambles per-env commands -> N>1 collapse (invisible at N=1).
+        self.mtx_data.actuator_ctrls = np.ascontiguousarray(
+            tgt_mtx[:, self._act_jointidx], dtype=np.float32
+        )
+        # report the servo torque (clipped to effort limits) for the reward terms
+        tau_mtx = self._kp_native * (tgt_mtx - jp_mtx) - self._kd_native * jv_mtx
         tau_mtx = np.nan_to_num(tau_mtx, nan=0.0, posinf=0.0, neginf=0.0)
-        # clip to the effort limits in NATIVE order, so applied_torque (exposed to the
-        # reward terms) reflects what is ACTUALLY applied (not the unclipped PD demand,
-        # which spiked to +-85 Nm during a blow-up and wrecked the torque/energy rewards).
-        if not hasattr(self, "_eff_lo_native"):
-            self._eff_lo_native = np.empty(self.num_joints, np.float32)
-            self._eff_hi_native = np.empty(self.num_joints, np.float32)
-            self._eff_lo_native[self._act_jointidx] = self.ctrl_limit_mtx[:, 0]
-            self._eff_hi_native[self._act_jointidx] = self.ctrl_limit_mtx[:, 1]
         tau_mtx = np.clip(tau_mtx, self._eff_lo_native, self._eff_hi_native)
         self._data.applied_torque = torch.as_tensor(
             tau_mtx[:, self._jnt_mtx2isaac], dtype=torch.float32, device=self.device
         )
-        ctrl = tau_mtx[:, self._act_jointidx]  # (N, nu) actuator order (already clipped)
-        self.mtx_data.actuator_ctrls = ctrl.astype(np.float32)
-
-        if self.has_external_wrench:
-            # apply body-frame external force on the root as a world-frame force on base link
-            from active_adaptation.utils.math import quat_rotate
-            root_quat = self._data.root_link_quat_w.unsqueeze(1)
-            force_w = quat_rotate(root_quat, self._external_force_b).cpu().numpy()
-            for bi, link in enumerate(self._link_objs):
-                pass  # per-body external force is applied in MotrixScene via add_external_force
 
     # ---- state write ---------------------------------------------------
     @staticmethod
@@ -658,7 +578,7 @@ class MotrixArticulation:
         if joint_pos is not None:
             jp = joint_pos.detach().cpu().numpy() if torch.is_tensor(joint_pos) else np.asarray(joint_pos)
             cur = dof[np.ix_(idx, np.arange(7, 7 + self.num_joints))]
-            cur_isaac = cur[:, [self.joint_names_mtx.index(n) for n in self.joint_names_isaac]]
+            cur_isaac = cur[:, self._jnt_mtx2isaac]
             if joint_ids is None or isinstance(joint_ids, slice):
                 cur_isaac[:, :] = jp
             else:
@@ -669,7 +589,7 @@ class MotrixArticulation:
         if joint_vel is not None:
             jv = joint_vel.detach().cpu().numpy() if torch.is_tensor(joint_vel) else np.asarray(joint_vel)
             cur = dvel[np.ix_(idx, np.arange(6, 6 + self.num_joints))]
-            cur_isaac = cur[:, [self.joint_names_mtx.index(n) for n in self.joint_names_isaac]]
+            cur_isaac = cur[:, self._jnt_mtx2isaac]
             if joint_ids is None or isinstance(joint_ids, slice):
                 cur_isaac[:, :] = jv
             else:
@@ -692,11 +612,12 @@ class MotrixContactData:
 
 
 class MotrixContactSensor:
-    """Foot-ground contact via geom-pair ``is_colliding`` (feet-only collision model).
+    """Per-body ground contact via geom-pair ``is_colliding``.
 
-    Produces a per-body boolean contact -> contact/air-time bookkeeping, matching
-    backends/mujoco/mujoco.py:MjContactSensor (which only uses force>thr as a boolean).
-    Non-foot bodies have no floor contact pairs -> always 0 (matches the mujoco backend).
+    MotrixSim exposes no per-body contact force, so each (collision geom, floor) pair is
+    queried and OR-aggregated per body into a boolean contact, turned into a pseudo +z
+    net force, and tracked as air/contact times. Matches MjContactSensor, which also
+    treats contact as a boolean (force > threshold).
     """
 
     def __init__(self, articulation: MotrixArticulation):
@@ -728,13 +649,15 @@ class MotrixContactSensor:
         self._pairs = np.asarray(pair_list, dtype=np.uint32) if pair_list else None
         self._pair_body = np.asarray(pair_body, dtype=np.int64) if pair_body else None
 
-        z = lambda *s: torch.zeros(*s, device=self.device)
+        def zeros(*shape):
+            return torch.zeros(*shape, device=self.device)
+
         self._data = MotrixContactData(
-            net_forces_w=z(N, nb, 3),
-            last_air_time=z(N, nb),
-            current_air_time=z(N, nb),
-            last_contact_time=z(N, nb),
-            current_contact_time=z(N, nb),
+            net_forces_w=zeros(N, nb, 3),
+            last_air_time=zeros(N, nb),
+            current_air_time=zeros(N, nb),
+            last_contact_time=zeros(N, nb),
+            current_contact_time=zeros(N, nb),
         )
         self._cq = model.get_contact_query(mtx_data)
 
@@ -796,14 +719,18 @@ class MotrixContactSensor:
 
 
 class MotrixScene:
+    """Owns the compiled model + batched SceneData and fans calls out to the
+    articulation(s) and contact sensor. Builds the combined robot + floor scene.
+    """
+
     def __init__(self, cfg, num_envs: int, device: str, physics_dt: float, step_dt: float = 0.02):
         self.cfg = cfg
         self.num_envs = num_envs
         self.device = device
-        # step_n mode (umi-on-legs): step all substeps natively in one call with the torque
-        # held, instead of env_base's per-substep Python loop. round() fixes the int(0.02/0.002)=9 bug.
-        # This is the default: it fixes the per-substep marginal PD instability (robot now
-        # trains to 100% success vs ~23% before) AND is ~40x faster. Opt out with NO_STEPN=1.
+        # step_n mode (default): advance all substeps inside one MotrixSim call with the
+        # PD torque held, instead of _EnvBase's per-substep Python loop (~40x faster).
+        # NO_STEPN=1 falls back to honest per-substep stepping. round() avoids the
+        # int(step_dt/physics_dt) truncation bug.
         self.step_dt = step_dt
         self.substeps = max(1, round(step_dt / physics_dt))
         self.use_stepn = not bool(os.environ.get("NO_STEPN"))
@@ -825,20 +752,16 @@ class MotrixScene:
         assert robot_cfg is not None, "MotrixScene requires a robot MotrixArticulationCfg"
 
         spec = self.articulations["robot"].spec
-        if spec.worldbody.find_all(mujoco.mjtObj.mjOBJ_GEOM):
-            pass
         g = spec.worldbody.add_geom()
         g.type = mujoco.mjtGeom.mjGEOM_PLANE
         g.name = "floor"
         g.size = [0.0, 0.0, 0.05]
         g.friction = [1.0, 0.1, 0.1]
-        # STIFF contact (umi-on-LEGS values). Without an explicit solref the plane
-        # uses MuJoCo's soft default and the Go2 feet sink ~0.7 m THROUGH the floor
-        # (the robot "stands" at base_z=-0.3), which no policy can survive. Negative
-        # solref = direct (stiffness, damping) = (50000 N/m, 200). priority=1 so the
-        # foot<->floor contact adopts the floor's stiff params over the foot default.
-        g.solref = [-50000.0, -5000.0]
-        g.solimp = [0.99, 0.999, 0.0001, 0.5, 2.0]
+        # Stiff floor contact (same params as the link geoms). Without it the plane uses
+        # MuJoCo's soft default and the feet sink ~0.7 m through the floor. priority=1 so
+        # the foot<->floor contact adopts the floor's params.
+        g.solref = _CONTACT_SOLREF
+        g.solimp = _CONTACT_SOLIMP
         g.priority = 1
         g.condim = 3
         # solver options (umi-on-LEGS recipe): Newton + multiccd makes full-body
@@ -851,8 +774,8 @@ class MotrixScene:
             spec.option.impratio = 1.0
             if not os.environ.get("NO_MULTICCD"):
                 spec.option.enableflags |= mujoco.mjtEnableBit.mjENBL_MULTICCD
-        except Exception as _e:
-            warnings.warn(f"could not set motrix solver options: {_e}")
+        except Exception as e:
+            warnings.warn(f"could not set motrix solver options: {e}")
         spec.compile()
         # write the combined scene next to the original MJCF so relative mesh
         # paths (e.g. meshes/*.STL) resolve, then load and clean up.
@@ -899,10 +822,11 @@ class MotrixScene:
 
 
 class MotrixSim:
-    device = "cpu"
+    """Steps the batched scene, with NaN/velocity guards and panic recovery."""
 
-    # safety bounds to keep the implicit solver well-conditioned on CPU
-    VEL_CLAMP = 50.0
+    device = "cpu"
+    # Clamp only true blow-ups; high enough not to touch normal motion.
+    VEL_CLAMP = 200.0
 
     def __init__(self, scene: MotrixScene):
         self.scene = scene
@@ -910,17 +834,14 @@ class MotrixSim:
         self.mtx_data = scene.mtx_data
 
     def get_physics_dt(self):
-        # In step_n mode, report step_dt so env_base runs ONE step per control step
-        # (torque computed once); the real substeps happen inside step() via step_n.
+        # In step_n mode, report step_dt so _EnvBase runs ONE step per control step;
+        # the real substeps happen inside step() via step_n.
         if self.scene.use_stepn:
             return float(self.scene.step_dt)
         return float(self.model.options.timestep)
 
     def has_gui(self):
         return False
-
-    # clamp only true blow-ups; high enough not to touch normal humanoid motion
-    VEL_CLAMP = 200.0
 
     def step(self, render: bool = False):
         # Scrub NaN/Inf and clamp runaway velocities before the solve so a diverging
@@ -931,12 +852,9 @@ class MotrixSim:
             self.mtx_data.set_dof_vel(dv.astype(np.float32))
         try:
             if self.scene.use_stepn:
-                # umi-on-legs pattern: step one substep with the env_base-computed torque,
-                # recompute the PD once, then step_n the remaining substeps with it held.
-                self.model.step(self.mtx_data)
-                if self.scene.substeps > 1:
-                    self.scene.write_data_to_sim()
-                    self.model.step_n(self.mtx_data, self.scene.substeps - 1)
+                # the engine re-evaluates the position servo each substep, so step_n runs
+                # all substeps in one call with the target held.
+                self.model.step_n(self.mtx_data, self.scene.substeps)
             else:
                 self.model.step(self.mtx_data)
         except BaseException as e:  # pyo3 PanicException (e.g. NotPositiveDefinite)

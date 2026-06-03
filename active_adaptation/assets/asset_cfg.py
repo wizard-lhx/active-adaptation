@@ -468,7 +468,7 @@ class AssetCfg:
         returning a lightweight cfg consumed by the motrixsim backend, which
         loads the MJCF and applies PD-as-torque control.
         """
-        from active_adaptation.envs.backends.motrixsim.motrixsim_sim import (
+        from active_adaptation.envs.backends.motrixsim.motrixsim import (
             MotrixArticulationCfg,
         )
 

@@ -58,7 +58,8 @@ class angvel_xy_l2(Reward):
 
 
 class undesired_contact(Reward):
-    supported_backends = ("isaac",)
+    # motrixsim full-body collision + is_colliding detects calf/thigh/head ground contact
+    supported_backends = ("isaac", "motrixsim")
     def __init__(self, env, body_names: Names, weight: float):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]
@@ -243,7 +244,7 @@ class feet_air_time(Reward):
 
 
 class feet_contact_count(Reward):
-    supported_backends = ("isaac", "mjlab")
+    supported_backends = ("isaac", "mjlab", "motrixsim")
     def __init__(self, env, body_names: str, weight: float):
         super().__init__(env, weight)
         self.asset: Articulation = self.env.scene.articulations["robot"]
