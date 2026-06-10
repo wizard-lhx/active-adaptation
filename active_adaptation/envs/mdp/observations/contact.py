@@ -49,8 +49,8 @@ class last_contact_pos(Observation):
             self.has_contact = torch.zeros(self.num_envs, len(self.body_ids), dtype=bool)
             self.last_contact_pos_w = torch.zeros(self.num_envs, len(self.contact_ids), 3)
         
-        if self.env.sim.has_gui() and self.env.backend == "isaac":
-            from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+        if self.env.sim.has_gui() and self.env.backend == "isaaclab":
+            from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
             scene: IsaacSceneAdapter = self.env.scene
             self.marker = scene.create_sphere_marker(
                 f"/Visuals/last_contact_pos", color=(0.0, 0.0, 1.0), radius=0.04
@@ -90,7 +90,7 @@ class last_contact_pos(Observation):
 
     def debug_draw(self) -> None:
         """Draw a vector from each body link to its latched last-contact marker and show spheres."""
-        if self.env.sim.has_gui() and self.env.backend == "isaac":
+        if self.env.sim.has_gui() and self.env.backend == "isaaclab":
             self.env.debug_draw.vector(
                 self.body_link_pos_w,
                 self.last_contact_pos_w - self.body_link_pos_w,
@@ -102,7 +102,7 @@ class last_contact_pos(Observation):
 
 
 class contact_indicator(Observation):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
     def __init__(self, env, body_names: str):
         super().__init__(env)
         self.asset: Articulation = self.env.scene.articulations["robot"]
@@ -188,8 +188,8 @@ class contact_forces(Observation):
 #             )
 #             self.last_contact_pos_w = torch.zeros(self.num_envs, len(self.body_ids), 3)
 
-#         if self.env.sim.has_gui() and self.env.backend == "isaac":
-#             from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+#         if self.env.sim.has_gui() and self.env.backend == "isaaclab":
+#             from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
 
 #             scene: IsaacSceneAdapter = self.env.scene
 #             self.marker = scene.create_sphere_marker(
@@ -248,7 +248,7 @@ class contact_forces(Observation):
 #         return obs
 
 #     def debug_draw(self) -> None:
-#         if self.env.backend == "isaac":
+#         if self.env.backend == "isaaclab":
 #             self.marker.visualize(
 #                 translations=self.last_contact_pos_w.reshape(-1, 3),
 #             )

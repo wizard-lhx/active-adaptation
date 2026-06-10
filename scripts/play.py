@@ -73,7 +73,7 @@ def main(cfg: DictConfig):
         print("Starting background checkpoint refresh")
         checkpoint.start_background_refresh(interval_sec=60)
 
-    # Optional video recording (Isaac backend only). This remains safe under
+    # Optional video recording (IsaacLab backend only). This remains safe under
     # KeyboardInterrupt because the recorder is a context manager that flushes
     # buffered frames on exit.
     record_enabled = bool(cfg.get("record_video", False))

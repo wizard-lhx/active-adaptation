@@ -35,7 +35,7 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
     
     # Select the appropriate backend-specific environment class
     backend = active_adaptation.get_backend()
-    if backend == "isaac":
+    if backend == "isaaclab":
         env_cls = _EnvBase.registry[cfg.task.get("env_class", "IsaacBackendEnv")]
     elif backend == "mujoco":
         env_cls = _EnvBase.registry[cfg.task.get("env_class", "MujocoBackendEnv")]
@@ -54,6 +54,7 @@ def make_env_policy(cfg: DictConfig, checkpoint: CheckpointBase | None = None):
         if (
             obs_group_key not in policy_in_keys
             and not obs_group_key.endswith("_")
+            and not obs_group_key.startswith("_")
         ):
             cfg.task.observation.pop(obs_group_key)
             print(colored(f"Discard obs group {obs_group_key} as it is not used.", "yellow"))

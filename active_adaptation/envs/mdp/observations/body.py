@@ -45,7 +45,7 @@ class body_link_pos_w(body_observation):
 
 
 # class body_pos_b(body_observation):
-#     def __init__(self, env, body_names: str, yaw_only: bool=False, output_order: Literal["isaac", "mujoco", "mjlab"] = "isaac"):
+#     def __init__(self, env, body_names: str, yaw_only: bool=False, output_order: Literal["isaaclab", "mujoco", "mjlab"] = "isaaclab"):
 #         super().__init__(env, body_names, output_order)
 #         self.yaw_only = yaw_only
 #         self.root_link_pos_w = self.asset.data.root_link_pos_w.unsqueeze(1)
@@ -76,7 +76,7 @@ class body_link_pos_w(body_observation):
 
 # class body_vel_b(body_observation):
 
-#     def __init__(self, env, body_names: str, yaw_only: bool=False, output_order: Literal["isaac", "mujoco", "mjlab"] = "isaac"):
+#     def __init__(self, env, body_names: str, yaw_only: bool=False, output_order: Literal["isaaclab", "mujoco", "mjlab"] = "isaaclab"):
 #         super().__init__(env, body_names, output_order)
 #         self.yaw_only = yaw_only
 #         self.root_link_quat_w = self.asset.data.root_link_quat_w.unsqueeze(1)

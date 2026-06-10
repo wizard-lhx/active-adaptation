@@ -25,6 +25,7 @@ import datetime
 import json
 import logging
 import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -122,7 +123,7 @@ def _load_manifest() -> Dict[str, Any]:
 
 def _save_manifest(data: Dict[str, Any]) -> None:
     manifest_path = _get_manifest_path()
-    tmp_path = manifest_path.with_suffix(".json.tmp")
+    tmp_path = manifest_path.with_name(f"{manifest_path.stem}.{os.getpid()}.tmp")
     tmp_path.write_text(json.dumps(data, indent=2))
     tmp_path.replace(manifest_path)
 

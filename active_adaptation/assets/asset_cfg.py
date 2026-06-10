@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 import active_adaptation as aa
 
-if aa.get_backend() == "isaac":
+if aa.get_backend() == "isaaclab":
     import isaaclab.sim as sim_utils
     from isaaclab.actuators import ImplicitActuatorCfg
     from isaaclab.assets import (
@@ -595,7 +595,7 @@ class MjlabCollisionCfg:
 
 # WARNING: will be deprecated: now used in _DelayedJointAction, check projects/hdmi/hdmi/tasks/actions.py:JointPosition
 def get_input_joint_indexing(
-    input_order: Literal["isaac", "mujoco", "mjlab", "simulation"],
+    input_order: Literal["isaaclab", "mujoco", "mjlab", "simulation"],
     asset_cfg: AssetCfg,
     target_joint_names: List[str],
     device: str = "cpu",
@@ -603,7 +603,7 @@ def get_input_joint_indexing(
     if input_order == aa.get_backend() or input_order == "mujoco":
         # aa's mujoco backend uses the same joint order as isaaclab
         return slice(None), target_joint_names
-    if input_order not in {"isaac", "mjlab", "simulation"}:
+    if input_order not in {"isaaclab", "mjlab", "simulation"}:
         raise ValueError(f"Invalid input_order: {input_order}")
     if asset_cfg.joint_names_simulation is None:
         raise ValueError("asset_cfg.joint_names_simulation is required")
@@ -615,14 +615,14 @@ def get_input_joint_indexing(
 
 # WARNING: will be deprecated: now used in joint_observation, check projects/hdmi/hdmi/tasks/observations/common.py:joint_pos_history
 def get_output_joint_indexing(
-    output_order: Literal["isaac", "mujoco", "mjlab", "simulation"],
+    output_order: Literal["isaaclab", "mujoco", "mjlab", "simulation"],
     asset_cfg: AssetCfg,
     source_joint_names: List[str],
     device: str = "cpu",
 ) -> Tuple[torch.Tensor, List[str]]:
     if output_order == aa.get_backend() or output_order == "mujoco":
         return slice(None), source_joint_names
-    if output_order not in {"isaac", "mjlab", "simulation"}:
+    if output_order not in {"isaaclab", "mjlab", "simulation"}:
         raise ValueError(f"Invalid output_order: {output_order}")
     if asset_cfg.joint_names_simulation is None:
         raise ValueError("asset_cfg.joint_names_simulation is required")
@@ -635,14 +635,14 @@ def get_output_joint_indexing(
 
 # WARNING: will be deprecated: now used in body_observation, check projects/hdmi/hdmi/tasks/observations/common.py:body_pos_b
 def get_output_body_indexing(
-    output_order: Literal["isaac", "mujoco", "mjlab", "simulation"],
+    output_order: Literal["isaaclab", "mujoco", "mjlab", "simulation"],
     asset_cfg: AssetCfg,
     source_body_names: List[str],
     device: str = "cpu",
 ) -> Tuple[torch.Tensor, List[str]]:
     if output_order == aa.get_backend() or output_order == "mujoco":
         return slice(None), source_body_names
-    if output_order not in {"isaac", "mjlab", "simulation"}:
+    if output_order not in {"isaaclab", "mjlab", "simulation"}:
         raise ValueError(f"Invalid output_order: {output_order}")
     if asset_cfg.body_names_simulation is None:
         raise ValueError("asset_cfg.body_names_simulation is required")

@@ -133,7 +133,7 @@ That path is `ROBOT_MODEL_DIR` in code (`CACHE_DIR` is the repo’s `.cache/` fo
 - **Layout under `aa-robot-models/`** (paths used today):
   - `a2/` — Unitree A2 MJCF/USD (`a2.xml`, `a2.usd`)
   - `b2/` — Unitree B2 MJCF/USD (`b2.xml`, `b2_flattened.usda`)
-  - `scene/` — e.g. `kloofendal_43d_clear_puresky_4k.hdr` (dome light / sky for the Isaac backend)
+  - `scene/` — e.g. `kloofendal_43d_clear_puresky_4k.hdr` (dome light / sky for the IsaacLab backend)
 
 If the archive or clone has an extra top-level folder, unpack or move contents so those directories sit **directly** under `.cache/aa-robot-models/`.
 

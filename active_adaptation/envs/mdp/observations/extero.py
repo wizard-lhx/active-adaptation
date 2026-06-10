@@ -10,7 +10,7 @@ from active_adaptation.utils.symmetry import SymmetryTransform, cartesian_space_
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
 
-if active_adaptation.get_backend() == "isaac":
+if active_adaptation.get_backend() == "isaaclab":
     from isaaclab.utils.warp import raycast_mesh
 
 
@@ -62,7 +62,7 @@ def raymap(width: int, height: int, fov: float) -> Float[torch.Tensor, "height w
 
 
 class external_forces(Observation):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
     def __init__(self, env, body_names, divide_by_mass: bool=True, scale: float = 1.0):
         super().__init__(env)
         self.asset: Articulation = self.env.scene.articulations["robot"]
@@ -85,7 +85,7 @@ class external_forces(Observation):
 
 
 class external_torques(Observation):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
     def __init__(self, env, body_names, divide_by_mass: bool=True, scale: float = 0.2):
         super().__init__(env)
         self.asset: Articulation = self.env.scene.articulations["robot"]
@@ -161,7 +161,7 @@ class height_scan(Observation):
         self.target_assets = []
         
         if targets is not None:
-            if self.env.backend == "isaac":
+            if self.env.backend == "isaaclab":
                 from isaacsim.core.utils.stage import get_current_stage
                 stage = get_current_stage()
                 for target in targets:
@@ -172,8 +172,8 @@ class height_scan(Observation):
             else:
                 raise NotImplementedError(f"Unsupported backend: {self.env.backend}")
         
-        if self.env.backend == "isaac" and self.env.sim.has_gui():
-            from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+        if self.env.backend == "isaaclab" and self.env.sim.has_gui():
+            from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
             scene: IsaacSceneAdapter = self.env.scene
             self.marker = scene.create_sphere_marker(
                 "/Visuals/Command/height_scan", (0.8, 0.0, 0.0), radius=0.02
@@ -220,7 +220,7 @@ class height_scan(Observation):
             return height_map.reshape(self.num_envs, -1, *self.shape)
     
     def debug_draw(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             self.marker.visualize(self.hit_pos_w.reshape(-1, 3))
 
     def symmetry_transform(self):
@@ -235,7 +235,7 @@ class height_scan(Observation):
 
 
 class forward_scan(Observation):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
 
     def __init__(
         self,
@@ -264,8 +264,8 @@ class forward_scan(Observation):
         self.directions = directions.reshape(-1, 3).to(self.device)
         self.num_rays = self.directions.shape[0]
 
-        if self.env.backend == "isaac" and self.env.sim.has_gui():
-            from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+        if self.env.backend == "isaaclab" and self.env.sim.has_gui():
+            from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
             scene: IsaacSceneAdapter = self.env.scene
             self.marker = scene.create_sphere_marker(
                 "/Visuals/Command/forward_scan", (0.8, 0.0, 0.0), radius=0.02
@@ -307,13 +307,13 @@ class forward_scan(Observation):
             )
 
     def debug_draw(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             pos = self.ray_hits.reshape(-1, 3)
             self.marker.visualize(pos)
 
 
 class raycast_camera(Observation):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
 
     supported_dtypes = {
         "float32": torch.float32,
@@ -360,8 +360,8 @@ class raycast_camera(Observation):
         else:
             self.body_id = None
 
-        if self.env.backend == "isaac" and self.env.sim.has_gui():
-            from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+        if self.env.backend == "isaaclab" and self.env.sim.has_gui():
+            from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
             scene: IsaacSceneAdapter = self.env.scene
             self.marker = scene.create_sphere_marker(
                 "/Visuals/Command/raycast_camera", (0.8, 0.0, 0.8), radius=0.02
@@ -403,7 +403,7 @@ class raycast_camera(Observation):
         return ray_distance.reshape(self.num_envs, 1, self.shape[0], self.shape[1])
     
     def debug_draw(self) -> None:
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             pos = self.ray_hits_w[0].reshape(-1, 3)
             self.marker.visualize(pos)
             # self.env.debug_draw.vector(
@@ -463,8 +463,8 @@ class feet_height_map(Observation):
         self.ray_starts = torch.stack([xx, yy, torch.zeros_like(xx)], dim=-1).reshape(-1, 3)
         self.num_rays = len(self.ray_starts)
 
-        if self.env.backend == "isaac" and self.env.sim.has_gui():
-            from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+        if self.env.backend == "isaaclab" and self.env.sim.has_gui():
+            from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
             scene: IsaacSceneAdapter = self.env.scene
             self.marker = scene.create_sphere_marker(
                 "/Visuals/Command/feet_height_map", (0.8, 0.0, 0.8), radius=0.02
@@ -502,7 +502,7 @@ class feet_height_map(Observation):
             return feet_height # [N, F, R]
     
     def debug_draw(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             self.marker.visualize(self.vis_points.reshape(-1, 3))
     
     def symmetry_transform(self):

@@ -86,7 +86,7 @@ class undesired_contact(Termination):
     Soft termination based on the contact forces on the specified body names.
     """
 
-    supported_backends = ("isaac", )
+    supported_backends = ("isaaclab", )
 
     def __init__(
         self,

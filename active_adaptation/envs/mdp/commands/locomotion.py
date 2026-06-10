@@ -50,7 +50,7 @@ class Twist(Command):
         self.resample_interval = resample_interval
         self.resample_prob = resample_prob
         self.stand_prob = stand_prob
-        self.curriculum = curriculum and self.env.backend == "isaac"
+        self.curriculum = curriculum and self.env.backend == "isaaclab"
 
         if self.curriculum:
             self.terrain = self.env.scene.terrain
@@ -84,7 +84,7 @@ class Twist(Command):
             self._cum_linvel_error = self.cum_error[:, 0].unsqueeze(1)
             self._cum_angvel_error = self.cum_error[:, 1].unsqueeze(1)
 
-        if self.teleop and self.env.backend == "isaac":
+        if self.teleop and self.env.backend == "isaaclab":
             self.key_mappings_pos = {
                 "W": torch.tensor(
                     [self.linvel_x_range[1], 0.0, 0.0], device=self.device
@@ -168,7 +168,7 @@ class Twist(Command):
     def step(self) -> None:
         # Advance commands for the next physics step; observations read this state.
         if self.teleop:
-            if self.env.backend != "isaac":
+            if self.env.backend != "isaaclab":
                 self._step_twist_command()
             else:
                 self._step_teleop()
@@ -291,7 +291,7 @@ class Twist(Command):
             ],
             1,
         )
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             self.env.debug_draw.vector(
                 start,
                 self.cmd_linvel_w,
@@ -332,7 +332,7 @@ class PositionVelocityTracking(Command):
         self.angvel_range = angvel_range
         self.resample_interval = resample_interval
         self.resample_prob = resample_prob
-        self.curriculum = curriculum and self.env.backend == "isaac"
+        self.curriculum = curriculum and self.env.backend == "isaaclab"
 
         if self.curriculum:
             from isaaclab.terrains import TerrainImporter
@@ -357,7 +357,7 @@ class PositionVelocityTracking(Command):
             self.distance_traveled = torch.zeros(self.num_envs, 1)
         
         if self.env.sim.has_gui():
-            if self.env.backend == "isaac":
+            if self.env.backend == "isaaclab":
                 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg, sim_utils
                 self.marker = VisualizationMarkers(
                     VisualizationMarkersCfg(
@@ -468,7 +468,7 @@ class PositionVelocityTracking(Command):
             self.ref_yawvel_w[resample_ids] = ref_yaw_vel_w
 
     def debug_draw(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             self.marker.visualize(self.ref_pos_w)
 
 

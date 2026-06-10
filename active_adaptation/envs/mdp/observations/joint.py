@@ -222,9 +222,9 @@ class joint_pos_target(joint_observation):
 
 # class applied_torque(joint_observation):
     
-#     supported_backends = ("isaac",)
+#     supported_backends = ("isaaclab",)
 
-#     def __init__(self, env, joint_names: str=".*", output_order: Literal["isaac", "mujoco", "mjlab"] = "isaac"):
+#     def __init__(self, env, joint_names: str=".*", output_order: Literal["isaaclab", "mujoco", "mjlab"] = "isaaclab"):
 #         super().__init__(env, joint_names, output_order=output_order)
 #         self.asset: Articulation = self.env.scene.articulations["robot"]
 #         self.joint_ids, self.joint_names = self.asset.find_joints(joint_names)

@@ -4,7 +4,7 @@ hydra:
 
 headless: false
 
-backend: isaac
+backend: isaaclab
 device: cuda
 
 record_video: false

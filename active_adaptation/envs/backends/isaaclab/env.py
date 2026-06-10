@@ -1,6 +1,8 @@
+import os
+
 from active_adaptation import ROBOT_MODEL_DIR
 from active_adaptation.assets import AssetCfg
-from active_adaptation.envs.backends.isaac.adapter import (
+from active_adaptation.envs.backends.isaaclab.adapter import (
     IsaacSceneAdapter,
     IsaacSimAdapter,
 )
@@ -9,7 +11,7 @@ from active_adaptation.registry import Registry
 
 
 class IsaacBackendEnv(_EnvBase):
-    """Isaac backend env: scene/sim construction and viewer glue."""
+    """IsaacLab backend env: scene/sim construction and viewer glue."""
 
     def __init__(self, cfg, device: str, headless: bool = True):
         super().__init__(cfg, device, headless)
@@ -74,6 +76,10 @@ class IsaacBackendEnv(_EnvBase):
             )
 
         scene_cfg.robot.prim_path = "{ENV_REGEX_NS}/Robot"
+        usd_cache_root = os.environ.get("ISAACLAB_USD_DIR")
+        if usd_cache_root and hasattr(scene_cfg.robot.spawn, "usd_dir"):
+            local_rank = os.environ.get("LOCAL_RANK", "0")
+            scene_cfg.robot.spawn.usd_dir = os.path.join(usd_cache_root, f"rank_{local_rank}")
         terrain_name = self.cfg.get("terrain", "plane")
         scene_cfg.terrain = registry.get("terrain", terrain_name)
 
@@ -101,18 +107,19 @@ class IsaacBackendEnv(_EnvBase):
             sim.reset()
 
         sim.set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
-        try:
-            import omni.replicator.core as rep
+        if not self.headless:
+            try:
+                import omni.replicator.core as rep
 
-            self._render_product = rep.create.render_product(
-                "/OmniverseKit_Persp", tuple(self.cfg.viewer.resolution)
-            )
-            self._rgb_annotator = rep.AnnotatorRegistry.get_annotator(
-                "rgb", device="cpu"
-            )
-            self._rgb_annotator.attach([self._render_product])
-        except ModuleNotFoundError:
-            print("Set enable_cameras=true to use cameras.")
+                self._render_product = rep.create.render_product(
+                    "/OmniverseKit_Persp", tuple(self.cfg.viewer.resolution)
+                )
+                self._rgb_annotator = rep.AnnotatorRegistry.get_annotator(
+                    "rgb", device="cpu"
+                )
+                self._rgb_annotator.attach([self._render_product])
+            except ModuleNotFoundError:
+                print("Set enable_cameras=true to use cameras.")
 
         self.sim = IsaacSimAdapter(sim)
         self.scene = IsaacSceneAdapter(self.scene)

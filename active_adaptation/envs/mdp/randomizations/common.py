@@ -14,7 +14,7 @@ except ModuleNotFoundError:
     from mjlab.utils.lab_api import string as string_utils
 
 
-if active_adaptation.get_backend() == "isaac":
+if active_adaptation.get_backend() == "isaaclab":
     from isaaclab.actuators import DCMotor, ImplicitActuator
 elif active_adaptation.get_backend() == "mjlab":
     import mujoco_warp
@@ -112,7 +112,7 @@ def _set_external_wrench(
 
 
 class motor_params(Randomization):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
     def __init__(
         self,
         env,
@@ -160,7 +160,7 @@ class motor_params(Randomization):
 
 
 class motor_params_implicit(Randomization):
-    supported_backends = ("isaac", "mjlab")
+    supported_backends = ("isaaclab", "mjlab")
 
     def __init__(
         self,
@@ -179,7 +179,7 @@ class motor_params_implicit(Randomization):
 
         if self.env.backend == "mjlab":
             self._init_mjlab()
-        elif self.env.backend == "isaac":
+        elif self.env.backend == "isaaclab":
             self._init_isaac()
 
     def _init_isaac(self):
@@ -342,7 +342,7 @@ class motor_params_implicit(Randomization):
                 armature = self._rand_log_uniform(self.num_envs, self.arm_low, self.arm_high)
                 self.model.dof_armature[:, self.arm_dof_ids] = self.arm_def.unsqueeze(0) * armature
                 _mjlab_recompute_constants(self.env, RecomputeLevel.set_const_0)
-        elif self.env.backend == "isaac":
+        elif self.env.backend == "isaaclab":
             if self.armature_range is None:
                 return
             env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
@@ -375,7 +375,7 @@ class motor_params_implicit(Randomization):
                 high = self.friction_high.unsqueeze(0).expand(n_env, -1)
                 friction = uniform(low, high)
                 self.model.dof_frictionloss[env_ids.unsqueeze(1), self.friction_dof_ids] = friction
-        elif self.env.backend == "isaac":
+        elif self.env.backend == "isaaclab":
             if self.stiffness_range is not None:
                 stiffness = self._rand_log_uniform(
                     len(env_ids), self.stiffness_low, self.stiffness_high
@@ -400,7 +400,7 @@ class motor_params_implicit(Randomization):
 
 
 class random_motor_failure(Randomization):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
     def __init__(
         self,
         env,
@@ -439,7 +439,7 @@ class random_motor_failure(Randomization):
 
 
 class perturb_body_materials(Randomization):
-    supported_backends = ("isaac", "mjlab")
+    supported_backends = ("isaaclab", "mjlab")
     def __init__(
         self,
         env,
@@ -469,7 +469,7 @@ class perturb_body_materials(Randomization):
         ):
             raise ValueError("solref_dampratio_range must be positive for log-uniform sampling.")
 
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             num_shapes_per_body = []
             for link_path in self.asset.root_physx_view.link_paths[0]:
                 link_physx_view = self.asset._physics_sim_view.create_rigid_body_view(link_path)  # type: ignore
@@ -535,7 +535,7 @@ class perturb_body_materials(Randomization):
             self.geom_names = selected_geom_names
 
     def startup(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             logging.info(f"Randomize body materials of {self.body_names} upon startup.")
 
             materials = self.asset.root_physx_view.get_material_properties().clone()
@@ -624,7 +624,7 @@ class perturb_body_materials(Randomization):
 
 
 class perturb_body_mass(Randomization):
-    supported_backends = ("isaac", "mjlab")
+    supported_backends = ("isaaclab", "mjlab")
     def __init__(
         self, env, **perturb_ranges: Tuple[float, float]
     ):
@@ -656,7 +656,7 @@ class perturb_body_mass(Randomization):
 
     def startup(self):
         logging.info(f"Randomize body masses of {self.body_names} upon startup.")
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             masses = self.asset.data.default_mass.clone()
             inertias = self.asset.data.default_inertia.clone()
             scale = uniform(
@@ -693,7 +693,7 @@ class perturb_body_mass(Randomization):
 
 
 class perturb_body_com(Randomization):
-    supported_backends = ("isaac", "mjlab")
+    supported_backends = ("isaaclab", "mjlab")
     def __init__(
         self, env, **perturb_ranges: Tuple[float, float]
     ):
@@ -727,7 +727,7 @@ class perturb_body_com(Randomization):
 
     def startup(self):
         logging.info(f"Randomize body CoM of {self.body_names} upon startup.")
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             coms = self.asset.root_physx_view.get_coms().clone()
             rand_sample = uniform(
                 self.pos_ranges[:, 0].unsqueeze(0).unsqueeze(-1).expand_as(coms[:, self.body_ids, :3]),
@@ -754,7 +754,7 @@ class perturb_body_com(Randomization):
             # )
 
 class perturb_root_vel(Randomization):
-    supported_backends = ("isaac", "mjlab")
+    supported_backends = ("isaaclab", "mjlab")
 
     def __init__(
         self,
@@ -906,7 +906,7 @@ class reset_joint_states_scale(Randomization):
 
 
 class push_body(Randomization):
-    supported_backends = ("isaac", "mujoco")
+    supported_backends = ("isaaclab", "mujoco")
     def __init__(
         self,
         env,
@@ -952,7 +952,7 @@ class push_body(Randomization):
         self.forces = torch.where(i, push_forces, self.forces * self.decay)
         
     def debug_draw(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             self.env.debug_draw.vector(
                 self.asset.data.body_link_pos_w[:, self.body_indices],
                 self.forces / 9.81,

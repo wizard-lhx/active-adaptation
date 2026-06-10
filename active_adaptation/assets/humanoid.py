@@ -184,10 +184,15 @@ G1_WAIST_UNLOCKED_CFG = AssetCfg( # no wrist pitch and yaw
     sensors_mjlab=[
         ContactSensorCfg(
             name="contact_forces",
-            primary=".*",
-            secondary=[],
+            primary_contact_match_mode="subtree",
+            primary_contact_match_pattern=r"^(left_ankle_roll_link|right_ankle_roll_link)$",
+            primary_contact_match_entity="robot",
+            # secondary="terrain",
+            secondary_contact_match_mode="body",
+            secondary_contact_match_pattern="terrain",
             track_air_time=True,
-            history_length=3
+            history_length=4,
+            reduce="netforce",
         ),
     ],
     joint_names_simulation=[

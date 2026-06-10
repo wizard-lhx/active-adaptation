@@ -5,6 +5,7 @@ import datetime
 import builtins
 import inspect
 import importlib
+import glob
 import warp as wp
 
 from pathlib import Path
@@ -68,6 +69,31 @@ def _apply_default_isaaclab_kit_args(app_config: dict) -> dict:
     return app_config
 
 
+def _expose_isaacsim_extension_modules() -> None:
+    """Expose pip IsaacSim extension packages as importable Python modules."""
+
+    try:
+        import isaacsim
+    except Exception:
+        return
+
+    isaacsim_root = Path(isaacsim.__file__).resolve().parent
+    search_roots = [
+        isaacsim_root / "exts",
+        isaacsim_root / "extscache",
+        isaacsim_root / "kit" / "extscore",
+    ]
+    for root in search_roots:
+        for path in glob.glob(str(root / "*")):
+            if os.path.isdir(path) and path not in sys.path:
+                sys.path.insert(0, path)
+
+    for root in (isaacsim_root / "exts", isaacsim_root / "extscache"):
+        for path in glob.glob(str(root / "*" / "isaacsim")):
+            if os.path.isdir(path) and path not in isaacsim.__path__:
+                isaacsim.__path__.append(path)
+
+
 # Save original print function
 _original_print = builtins.print
 
@@ -94,9 +120,9 @@ def set_backend(backend: str):
         raise RuntimeError(
             f"set_backend() already called at {_CALLED_AT['filename']}:{_CALLED_AT['lineno']} in {_CALLED_AT['function']}"
         )
-    if not backend in ("isaac", "mujoco", "mjlab"):
+    if not backend in ("isaaclab", "mujoco", "mjlab"):
         raise ValueError(
-            f"backend must be either 'isaac' or 'mujoco' or 'mjlab', got {backend}"
+            f"backend must be either 'isaaclab' or 'mujoco' or 'mjlab', got {backend}"
         )
     # Record the call site
     stack = inspect.stack()
@@ -125,13 +151,25 @@ def init(cfg: DictConfig, auto_rank: bool):
         auto_rank: Whether to automatically modify `cfg.device` according to the local rank.
     """
 
+    if auto_rank:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.set_device(get_local_rank())
+        except Exception:
+            pass
+
     wp.init()
 
     # Store sys.argv to a local file
     if is_main_process():
         argv_file = CACHE_DIR / "command_history.json"
         if argv_file.exists():
-            history = json.loads(argv_file.read_text())
+            try:
+                history = json.loads(argv_file.read_text())
+            except Exception:
+                history = []
         else:
             history = []
         entry = {"timestamp": datetime.datetime.now().isoformat(), "args": sys.argv}
@@ -159,12 +197,13 @@ def init(cfg: DictConfig, auto_rank: bool):
                 init_method="env://",
             )
 
-    if get_backend() == "isaac":
+    if get_backend() == "isaaclab":
         from isaaclab.app import AppLauncher
 
         app_config = OmegaConf.to_container(cfg.app, resolve=True)
         app_config = _apply_default_isaaclab_kit_args(app_config)
         AppLauncher(app_config, distributed=is_distributed(), device=cfg.device)
+        _expose_isaacsim_extension_modules()
 
     import_environment_projects()
 

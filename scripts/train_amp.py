@@ -28,7 +28,7 @@ def main(cfg: DictConfig):
         MjlabBackendEnv,
     )
     EnvClass = {
-        "isaac": IsaacBackendEnv,
+        "isaaclab": IsaacBackendEnv,
         "mujoco": MujocoBackendEnv,
         "mjlab": MjlabBackendEnv,
     }[cfg.backend]

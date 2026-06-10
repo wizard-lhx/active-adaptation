@@ -15,7 +15,7 @@ class Game(Command):
             self.target_caught_time = torch.zeros(self.num_envs, 1)
             self.is_standing_env = torch.zeros(self.num_envs, 1, dtype=bool)
 
-        if self.env.sim.has_gui() and self.env.backend == "isaac":
+        if self.env.sim.has_gui() and self.env.backend == "isaaclab":
             from isaaclab.markers import RED_ARROW_X_MARKER_CFG, VisualizationMarkers
 
             self.frame_marker = VisualizationMarkers(

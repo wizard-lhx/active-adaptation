@@ -58,7 +58,7 @@ class angvel_xy_l2(Reward):
 
 
 class undesired_contact(Reward):
-    supported_backends = ("isaac",)
+    supported_backends = ("isaaclab",)
     def __init__(self, env, body_names: Names, weight: float, track_var: bool = False):
         super().__init__(env, weight, track_var=track_var)
         self.asset: Articulation = self.env.scene.articulations["robot"]
@@ -120,7 +120,7 @@ class linvel_exp(Reward[Twist]):
         return rew.reshape(self.num_envs, 1)
 
     def debug_draw(self):
-        if self.env.backend == "isaac":
+        if self.env.backend == "isaaclab":
             # draw smoothed lin vel (purple)
             linvel_w = self.linvel_w_sum / self.count.clamp_min(1.0)
             self.env.debug_draw.vector(

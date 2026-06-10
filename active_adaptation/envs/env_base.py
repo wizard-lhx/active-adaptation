@@ -23,7 +23,7 @@ from active_adaptation.utils.video_recorder import (
 from active_adaptation.envs.utils import GroundQuery
 from active_adaptation.registry import RegistryMixin
 
-if active_adaptation.get_backend() == "isaac":
+if active_adaptation.get_backend() == "isaaclab":
     import isaacsim.core.utils.torch as torch_utils
 
 
@@ -508,7 +508,7 @@ class _EnvBase(EnvBase, RegistryMixin):
         tensordict["stats"] = self.stats.clone()
 
         if self.sim.has_gui():
-            if self.backend == "isaac":
+            if self.backend == "isaaclab":
                 self.debug_draw.clear()
             elif self.backend == "mjlab":
                 self.sim.viewer.clear()
@@ -616,7 +616,7 @@ class _EnvBase(EnvBase, RegistryMixin):
         """
         if not enabled:
             return NullVideoRecorder()
-        if self.backend == "isaac":
+        if self.backend == "isaaclab":
             return IsaacVideoRecorder(self, path, enabled=True)
         if self.backend == "mjlab":
             return RgbArrayVideoRecorder(self, path, enabled=True)
@@ -624,14 +624,20 @@ class _EnvBase(EnvBase, RegistryMixin):
         return NullVideoRecorder()
 
     def _set_seed(self, seed: int = -1):
-        if self.backend == "isaac":
-            try:
-                import omni.replicator.core as rep
+        if self.backend == "isaaclab":
+            seed = torch_utils.set_seed(seed)
+            if hasattr(self, "_rgb_annotator"):
+                try:
+                    import omni.replicator.core as rep
 
-                rep.set_global_seed(seed)
-            except ModuleNotFoundError:
-                pass
-            return torch_utils.set_seed(seed)
+                    rep.set_global_seed(seed)
+                except Exception as exc:
+                    warnings.warn(
+                        f"Failed to seed IsaacLab Replicator graph: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            return seed
         elif self.backend == "mujoco":
             torch.manual_seed(seed)
             np.random.seed(seed)
@@ -656,7 +662,7 @@ class _EnvBase(EnvBase, RegistryMixin):
                 return self.sim.render_rgb_array()
             raise NotImplementedError(
                 f"rgb_array mode not supported for backend '{self.backend}'. "
-                "Only Isaac and mjlab backends support rgb_array rendering."
+                "Only IsaacLab and mjlab backends support rgb_array rendering."
             )
         raise NotImplementedError(f"Render mode '{mode}' not supported.")
 
@@ -674,7 +680,7 @@ class _EnvBase(EnvBase, RegistryMixin):
 
     def close(self, *, raise_if_closed: bool = True):
         if not self.is_closed:
-            if self.backend == "isaac":
+            if self.backend == "isaaclab":
                 del self.scene
                 self.sim.clear_all_callbacks()
                 self.sim.clear_instance()

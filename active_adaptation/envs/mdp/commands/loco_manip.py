@@ -87,10 +87,10 @@ class SingleEEFLocoManip(Command):
 
         self.marker = None
         if (
-            self.env.backend == "isaac"
+            self.env.backend == "isaaclab"
             and self.env.sim.has_gui()
         ):
-            from active_adaptation.envs.backends.isaac import IsaacSceneAdapter
+            from active_adaptation.envs.backends.isaaclab import IsaacSceneAdapter
 
             self.scene: IsaacSceneAdapter = self.env.scene
             self.marker = self.scene.create_sphere_marker(

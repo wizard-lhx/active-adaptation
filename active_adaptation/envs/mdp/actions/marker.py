@@ -29,7 +29,7 @@ class Marker(Action):
         self.has_gui = self.env.sim.has_gui()
         self.action_dim = 3 # not actually limited to 3
 
-        if self.has_gui and self.env.backend == "isaac":
+        if self.has_gui and self.env.backend == "isaaclab":
             from isaaclab.markers import (
                 VisualizationMarkers,
                 VisualizationMarkersCfg,

@@ -160,7 +160,7 @@ class Impedance(Command):
             self.command_transition /= self.command_transition.sum(dim=-1, keepdim=True)
         
         self.vis_arrow = None
-        if self.env.backend != "isaac":
+        if self.env.backend != "isaaclab":
             self.USE_MARKERS = False
         if self.env.sim.has_gui() and self.USE_MARKERS:
             from isaaclab.markers.config import (
@@ -530,7 +530,7 @@ class Impedance(Command):
         self.spring_force[env_ids] = spring_force
 
     def debug_draw(self):
-        if not self.env.backend == "isaac":
+        if not self.env.backend == "isaaclab":
             return
         eye = (
             self.asset.data.root_pos_w[0].cpu() 

@@ -5,7 +5,7 @@ hydra:
 num_steps: ${oc.select:task.max_episode_length,1000}
 headless: true
 
-backend: isaac
+backend: isaaclab
 device: cuda
 seed: 42
 
