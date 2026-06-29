@@ -37,7 +37,8 @@ command:
   angvel_range:   [0.0, 0.0]
   yaw_stiffness_range: [1.0, 1.0]
   use_stiffness_ratio: 1.0
-  base_height_range: [0.30, 0.52]
+  base_height_range: [0.10, 0.52]
+  init_root_height: 0.1
   resample_interval: 250
   resample_prob: 1.0
   stand_prob: 1.0

@@ -99,6 +99,7 @@ class Twist(CommandV2):
         yaw_stiffness_range: Tuple[float, float] = (0.5, 0.6),
         use_stiffness_ratio: float = 0.5,
         base_height_range: Tuple[float, float] = (0.2, 0.4),
+        init_root_height: float | None = None,
         resample_interval: int = 300,
         resample_prob: float = 0.75,
         stand_prob: float = 0.2,
@@ -117,6 +118,7 @@ class Twist(CommandV2):
         self.use_stiffness_ratio = use_stiffness_ratio
         self.yaw_stiffness_range = yaw_stiffness_range
         self.base_height_range = base_height_range
+        self.init_root_height = init_root_height
         self.resample_interval = resample_interval
         self.resample_prob = resample_prob
         self.stand_prob = stand_prob
@@ -246,7 +248,11 @@ class Twist(CommandV2):
         self.env.extra["curriculum/distance_traveled"] = self.distance_traveled.mean()
         self.distance_commanded[env_ids] = 0.0
         self.distance_traveled[env_ids] = 0.0
-        return super().sample_init(env_ids)
+        init_state = super().sample_init(env_ids)
+        if self.init_root_height is not None:
+            origins = self.env.scene.get_spawn_origins(env_ids)
+            init_state[:, 2] = origins[:, 2] + self.init_root_height
+        return init_state
 
     @override
     def reset(self, env_ids):
