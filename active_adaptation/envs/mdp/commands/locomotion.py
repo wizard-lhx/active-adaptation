@@ -192,9 +192,18 @@ class Twist(CommandV2):
                 "LEFT": torch.tensor([self.angvel_range[1]], device=self.device),
                 "RIGHT": torch.tensor([self.angvel_range[0]], device=self.device),
             }
+            # use up-down arrow keys to switch base-height command
+            self.key_mappings_height = {
+                "UP": torch.tensor([self.base_height_range[1]], device=self.device),
+                "DOWN": torch.tensor([self.base_height_range[0]], device=self.device),
+            }
             # state for teleoperation commands (shared across all envs)
             self._teleop_linvel = torch.zeros(3, device=self.device)
             self._teleop_yaw = torch.zeros(1, device=self.device)
+            self._teleop_base_height = torch.tensor(
+                [sum(self.base_height_range) / 2],
+                device=self.device,
+            )
             # speed modifiers controlled by shift/ctrl
             self._speed_scale = 0.8
             self._fast_speed_scale = 1.6
@@ -339,13 +348,16 @@ class Twist(CommandV2):
         for key, vel in self.key_mappings_yaw.items():
             if km.get(key, False):
                 self._teleop_yaw.add_(vel)
+        for key, height in self.key_mappings_height.items():
+            if km.get(key, False):
+                self._teleop_base_height.copy_(height)
 
         linvel = (self._teleop_linvel * scale).unsqueeze(0).expand(self.num_envs, -1)
         linvel[:, 2] = 0.0
         max_speed = max(0.0, 2.5 - self._teleop_yaw.abs().item())
         self.cmd_linvel_b = clamp_norm(linvel, max=max_speed)
         self.cmd_yawvel_b[:] = (self._teleop_yaw * scale).clamp(*self.angvel_range)
-        self.cmd_base_height[:] = sum(self.base_height_range) / 2
+        self.cmd_base_height[:] = self._teleop_base_height.clamp(*self.base_height_range)
 
         self.quat_w = self.asset.data.root_link_quat_w
         self.cmd_linvel_w = quat_rotate(yaw_quat(self.quat_w), self.cmd_linvel_b)

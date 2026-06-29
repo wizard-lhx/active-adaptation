@@ -1,0 +1,117 @@
+# @package task
+name: B2Z1Loco
+
+viewer:
+  resolution: [1280, 720]
+  lookat: [0., 0., 0.]
+  eye: [4.0, 4.0, 4.0]
+
+robot:
+  name: unitree_b2_z1
+terrain: plane
+
+
+# common
+num_envs: 4096
+max_episode_length: 1000
+
+sim:
+  step_dt: 0.02
+  isaac_physics_dt: 0.005
+  mujoco_physics_dt: 0.002
+
+input:
+  action:
+    _target_: JointPosition
+    action_scaling:
+      .*_hip_joint: 0.35
+      .*_thigh_joint: 0.5
+      .*_calf_joint: 0.5
+    max_delay: 1
+    alpha_range: [0.8, 0.9]
+
+command:
+  _target_: Twist
+  linvel_x_range: [0.0, 0.0]
+  linvel_y_range: [0.0, 0.0]
+  angvel_range:   [0.0, 0.0]
+  yaw_stiffness_range: [1.0, 1.0]
+  use_stiffness_ratio: 1.0
+  base_height_range: [0.30, 0.52]
+  resample_interval: 250
+  resample_prob: 1.0
+  stand_prob: 1.0
+
+observation:
+  policy:
+    command:  {}
+    gravity_multistep: {steps: 4, noise_std: 0.05}
+    joint_pos_multistep: {joint_names: ".*_(hip|thigh|calf)_joint", steps: 4, noise_std: 0.05}
+    joint_vel_multistep: {joint_names: ".*_(hip|thigh|calf)_joint", steps: 4, noise_std: 0.2}
+    prev_actions: {steps: 2}
+  # priv:
+    root_linvel_b:    {yaw_only: true}
+    root_angvel_b:    {}
+
+reward:
+  loco:
+    linvel_exp:         {weight: 1.0, dim: 2}
+    angvel_z_exp:       {weight: 0.8}
+    angvel_xy_l2:       {weight: 0.02}
+    linvel_z_l2:        {weight: 2.0}
+    body_upright:       {weight: 1.0, body_name: base_link}
+    base_height_exp:    {weight: 4.0, sigma: 0.04}
+  regularization:
+    energy_l1:          {weight: 0.0002, joint_names: ".*_(hip|thigh|calf)_joint"}
+    joint_acc_l2:       {weight: 2.0e-7, joint_names: ".*_(hip|thigh|calf)_joint"}
+    joint_torques_l2:   {weight: 2.0e-5, joint_names: ".*_(hip|thigh|calf)_joint"}
+    survival:           {weight: 1.0}
+    action_rate_l2:     {weight: 0.02}
+    action_rate2_l2:    {weight: 0.004}
+    feet_sliding:       {weight: 0.2, body_names: .*_foot}
+    undesired_contact:  {body_names: [.*_calf, .*thigh], weight: 0.25}
+  debug:
+    _enabled_: false
+    base_height_l1:     {weight: 1.0}
+    is_standing_env:    {weight: 1.0}
+    feet_contact_count: {weight: 1.0, body_names: .*_foot}
+
+termination:
+  max_episode_length: {}
+  crash: {body_names_expr: [base_link, .*hip, .*thigh], t_thres: 0.01}
+  fall_over: {xy_thres: 0.9}
+  undesired_contact: {body_names: [.*_calf]}
+
+randomization:
+  perturb_body_mass:
+    (?!(payload|base_link)).*: [0.9, 1.1]
+    base_link: [0.9, 1.2]
+  randomize_materials_isaac:
+    body_names: .*_foot
+    static_friction_range:  [0.5, 3.0]
+    dynamic_friction_range: [0.5, 3.0]
+    restitution_range:      [0.0, 0.5]
+    homogeneous: true
+  actuator_pd_gains:
+    stiffness_range:
+      .*_hip_joint: [0.9, 1.1]
+      .*_thigh_joint: [0.9, 1.1]
+      .*_calf_joint: [0.9, 1.1]
+    damping_range:
+      .*_hip_joint: [0.9, 1.1]
+      .*_thigh_joint: [0.9, 1.1]
+      .*_calf_joint: [0.9, 1.1]
+  reset_joint_states_uniform:
+    pos_ranges:
+      FL_hip_joint: [0.27, 0.43]
+      FR_hip_joint: [-0.46, -0.30]
+      RL_hip_joint: [0.21, 0.37]
+      RR_hip_joint: [-0.35, -0.19]
+      FL_thigh_joint: [1.13, 1.33]
+      FR_thigh_joint: [1.11, 1.31]
+      RL_thigh_joint: [1.18, 1.38]
+      RR_thigh_joint: [1.17, 1.37]
+      FL_calf_joint: [-2.94, -2.70]
+      FR_calf_joint: [-2.92, -2.68]
+      RL_calf_joint: [-2.94, -2.70]
+      RR_calf_joint: [-2.94, -2.70]
