@@ -348,7 +348,7 @@ class _PpoSymaugMean(nn.Module):
         actor = getattr(policy, "actor")
         if isinstance(actor, nn.parallel.DistributedDataParallel):
             actor = actor.module
-        self.actor_module = actor.module
+        self.actor = actor
 
     @staticmethod
     def _find_vecnorm(module: nn.Module) -> VecNorm:
@@ -360,7 +360,7 @@ class _PpoSymaugMean(nn.Module):
     def forward(self, actor_input: Tensor) -> Tensor:
         normed = self.vecnorm._normalize(actor_input)
         td = TensorDict({"_obs_normed": normed}, batch_size=actor_input.shape[:-1], device=actor_input.device)
-        self.actor_module(td)
+        td = self.actor.get_dist_params(td)
         return td["loc"]
 
 

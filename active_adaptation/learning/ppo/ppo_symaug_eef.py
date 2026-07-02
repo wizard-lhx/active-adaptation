@@ -30,7 +30,7 @@ class PPOEEFConfig(PPOBaseConfig):
     _target_: str = "active_adaptation.learning.ppo.ppo_symaug_eef.PPOPolicy"
     name: str = "ppo_symaug_eef"
     eff_impedance: EffImpedanceConfig = field(default_factory=EffImpedanceConfig)
-    eff_impedance_interval: int = 1
+    eff_impedance_interval: int = 10
 
 
 cs = ConfigStore.instance()
@@ -49,7 +49,7 @@ class PPOPolicy(PPOBasePolicy):
     def __init__(self, cfg: PPOEEFConfig, *args, **kwargs) -> None:
         cfg_dict = _config_to_dict(cfg)
         eff_cfg = EffImpedanceConfig.from_any(cfg_dict.pop("eff_impedance", None))
-        interval = int(cfg_dict.pop("eff_impedance_interval", 1))
+        interval = int(cfg_dict.pop("eff_impedance_interval", 10))
         super().__init__(cfg_dict, *args, **kwargs)
         self.cfg = PPOEEFConfig(**cfg_dict, eff_impedance=eff_cfg, eff_impedance_interval=interval)
         self.eff_impedance_probe = EffImpedanceProbe(eff_cfg)
