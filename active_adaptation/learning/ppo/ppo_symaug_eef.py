@@ -14,6 +14,7 @@ import torch
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 
+from active_adaptation.learning.ppo.common import CMD_KEY, OBS_KEY
 from active_adaptation.learning.ppo.ppo_eef import EffImpedanceConfig, EffImpedanceProbe
 from active_adaptation.learning.ppo.ppo_symaug import PPOConfig as PPOBaseConfig
 from active_adaptation.learning.ppo.ppo_symaug import PPOPolicy as PPOBasePolicy
@@ -60,6 +61,7 @@ class PPOPolicy(PPOBasePolicy):
     def from_env(cls, cfg: PPOEEFConfig, env: "_EnvBase", device: str):
         policy = super().from_env(cfg, env, device)
         policy._eff_impedance_action_managers = list(policy._iter_action_managers(env.action_manager))
+        policy._configure_eff_impedance_from_env(env)
         return policy
 
     def train_op(self, tensordict: TensorDict):
@@ -104,6 +106,91 @@ class PPOPolicy(PPOBasePolicy):
                 f"diagnostic gain dimension {kp.numel()} does not match action dim {self.action_dim}"
             )
         return kp, kd
+
+    def _configure_eff_impedance_from_env(self, env: "_EnvBase") -> None:
+        cfg = self.eff_impedance_probe.cfg
+        controlled_joint_ids = self._eff_impedance_joint_ids()
+        cfg.alpha = tuple(float(v) for v in self._eff_impedance_action_scaling().detach().cpu().tolist())
+        cfg.q_slice = self._infer_joint_obs_slice(env, "pos", controlled_joint_ids)
+        cfg.qd_slice = self._infer_joint_obs_slice(env, "vel", controlled_joint_ids)
+
+        cfg_dict = _config_to_dict(self.cfg)
+        cfg_dict.pop("eff_impedance", None)
+        cfg_dict.pop("eff_impedance_interval", None)
+        self.cfg = PPOEEFConfig(
+            **cfg_dict,
+            eff_impedance=cfg,
+            eff_impedance_interval=self._eff_impedance_interval,
+        )
+
+    def _eff_impedance_joint_ids(self) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.as_tensor(manager.joint_ids, device=self.device)
+                for manager in self._eff_impedance_action_managers
+            ],
+            dim=0,
+        )
+
+    def _eff_impedance_action_scaling(self) -> torch.Tensor:
+        alpha_chunks = []
+        for manager in self._eff_impedance_action_managers:
+            alpha = torch.as_tensor(manager.action_scaling, device=self.device, dtype=torch.float32)
+            if alpha.ndim == 0:
+                alpha = alpha.expand(manager.action_dim)
+            alpha_chunks.append(alpha.reshape(-1))
+        alpha = torch.cat(alpha_chunks, dim=0)
+        if alpha.numel() != self.action_dim:
+            raise ValueError(
+                f"diagnostic action scaling dimension {alpha.numel()} does not match action dim {self.action_dim}"
+            )
+        return alpha
+
+    def _infer_joint_obs_slice(
+        self,
+        env: "_EnvBase",
+        kind: str,
+        controlled_joint_ids: torch.Tensor,
+    ) -> tuple[int, int]:
+        group = env.observation_funcs[OBS_KEY]
+        actor_offset = 0
+        if CMD_KEY in env.observation_spec.keys(True, True):
+            actor_offset = env.observation_spec[CMD_KEY].shape[-1]
+
+        local_offset = 0
+        for obs in group.funcs.values():
+            width = int(obs.compute().shape[-1])
+            class_name = type(obs).__name__
+            if self._matches_joint_obs_kind(class_name, kind):
+                joint_ids = torch.as_tensor(obs.joint_ids, device=controlled_joint_ids.device)
+                window = self._contiguous_joint_window(joint_ids, controlled_joint_ids)
+                if window is not None:
+                    start = actor_offset + local_offset + window
+                    return (start, start + controlled_joint_ids.numel())
+            local_offset += width
+
+        raise ValueError(f"could not infer {kind} q slice from observation group {OBS_KEY!r}")
+
+    @staticmethod
+    def _matches_joint_obs_kind(class_name: str, kind: str) -> bool:
+        if kind == "pos":
+            return class_name in {"joint_pos", "joint_pos_multistep"}
+        if kind == "vel":
+            return class_name in {"joint_vel", "joint_vel_multistep"}
+        raise ValueError(f"unknown joint observation kind {kind!r}")
+
+    @staticmethod
+    def _contiguous_joint_window(
+        term_joint_ids: torch.Tensor,
+        controlled_joint_ids: torch.Tensor,
+    ) -> int | None:
+        term_ids = [int(v) for v in term_joint_ids.detach().cpu().tolist()]
+        controlled_ids = [int(v) for v in controlled_joint_ids.detach().cpu().tolist()]
+        width = len(controlled_ids)
+        for start in range(len(term_ids) - width + 1):
+            if term_ids[start : start + width] == controlled_ids:
+                return start
+        return None
 
     @staticmethod
     def _iter_action_managers(action_manager):

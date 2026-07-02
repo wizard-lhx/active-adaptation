@@ -34,15 +34,16 @@ class EffImpedanceConfig:
         enabled: Enables the diagnostic probe. The default is false.
         action_space: ``"I"`` for position target actions or ``"II"`` for
             position target plus velocity feed-forward actions.
-        alpha: Action-to-position scale. A scalar matches the equations in the
-            task statement; a per-joint sequence is also accepted for this
-            codebase's per-joint ``action_scaling`` convention.
+        alpha: Action-to-position scale populated by ``ppo_symaug_eef`` from
+            the current action manager's per-joint ``action_scaling``.
         beta: Velocity feed-forward coefficient for action space II.
         dt: Control period for action space II.
         q_slice: Half-open column range for joint position in the mean-network
-            input tensor.
+            input tensor, populated by ``ppo_symaug_eef`` from the env
+            observation group.
         qd_slice: Half-open column range for actuated joint velocity in the
-            mean-network input tensor.
+            mean-network input tensor, populated by ``ppo_symaug_eef`` from the
+            env observation group.
         sample_stride: Keep one operating point every ``sample_stride`` points.
         max_points: Maximum cached operating points per log window.
         log_scalars: Log scalar summaries and per-joint diagonal means.
@@ -50,11 +51,11 @@ class EffImpedanceConfig:
 
     enabled: bool = False
     action_space: str = "I"
-    alpha: Any = 0.0
+    alpha: Any = None
     beta: float | None = None
     dt: float | None = None
-    q_slice: Any = (0, 0)
-    qd_slice: Any = (0, 0)
+    q_slice: Any = None
+    qd_slice: Any = None
     sample_stride: int = 1
     max_points: int = 4096
     log_scalars: bool = True
