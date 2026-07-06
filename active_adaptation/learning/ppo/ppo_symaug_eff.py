@@ -1,8 +1,8 @@
 """ppo_symaug variant with effective-impedance evaluation metrics.
 
 This file keeps the original ``ppo_symaug`` policy and ``scripts/train_ppo.py``
-unchanged. Select it explicitly with ``algo=ppo_symaug_eef`` to add the
-read-only effective impedance diagnostics implemented in ``ppo_eef.py``.
+unchanged. Select it explicitly with ``algo=ppo_symaug_eff`` to add the
+read-only effective impedance diagnostics implemented in ``ppo_eff.py``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 
 from active_adaptation.learning.ppo.common import CMD_KEY, OBS_KEY
-from active_adaptation.learning.ppo.ppo_eef import EffImpedanceConfig, EffImpedanceProbe
+from active_adaptation.learning.ppo.ppo_eff import EffImpedanceConfig, EffImpedanceProbe
 from active_adaptation.learning.ppo.ppo_symaug import PPOConfig as PPOBaseConfig
 from active_adaptation.learning.ppo.ppo_symaug import PPOPolicy as PPOBasePolicy
 
@@ -24,17 +24,17 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class PPOEEFConfig(PPOBaseConfig):
+class PPOEFFConfig(PPOBaseConfig):
     """Config for the ``ppo_symaug`` policy plus read-only impedance metrics."""
 
-    _target_: str = "active_adaptation.learning.ppo.ppo_symaug_eef.PPOPolicy"
-    name: str = "ppo_symaug_eef"
+    _target_: str = "active_adaptation.learning.ppo.ppo_symaug_eff.PPOPolicy"
+    name: str = "ppo_symaug_eff"
     eff_impedance: EffImpedanceConfig = field(default_factory=EffImpedanceConfig)
     eff_impedance_interval: int = 10
 
 
 cs = ConfigStore.instance()
-cs.store("ppo_symaug_eef", node=PPOEEFConfig, group="algo")
+cs.store("ppo_symaug_eff", node=PPOEFFConfig, group="algo")
 
 
 def _config_to_dict(cfg: Any) -> dict[str, Any]:
@@ -46,19 +46,19 @@ def _config_to_dict(cfg: Any) -> dict[str, Any]:
 class PPOPolicy(PPOBasePolicy):
     """``ppo_symaug`` policy that appends effective impedance metrics to logs."""
 
-    def __init__(self, cfg: PPOEEFConfig, *args, **kwargs) -> None:
+    def __init__(self, cfg: PPOEFFConfig, *args, **kwargs) -> None:
         cfg_dict = _config_to_dict(cfg)
         eff_cfg = EffImpedanceConfig.from_any(cfg_dict.pop("eff_impedance", None))
         interval = int(cfg_dict.pop("eff_impedance_interval", 10))
         super().__init__(cfg_dict, *args, **kwargs)
-        self.cfg = PPOEEFConfig(**cfg_dict, eff_impedance=eff_cfg, eff_impedance_interval=interval)
+        self.cfg = PPOEFFConfig(**cfg_dict, eff_impedance=eff_cfg, eff_impedance_interval=interval)
         self.eff_impedance_probe = EffImpedanceProbe(eff_cfg)
         self._eff_impedance_interval = max(interval, 1)
         self._eff_impedance_iter = 0
         self._eff_impedance_action_managers = []
 
     @classmethod
-    def from_env(cls, cfg: PPOEEFConfig, env: "_EnvBase", device: str):
+    def from_env(cls, cfg: PPOEFFConfig, env: "_EnvBase", device: str):
         policy = super().from_env(cfg, env, device)
         policy._eff_impedance_action_managers = list(policy._iter_action_managers(env.action_manager))
         policy._configure_eff_impedance_from_env(env)
@@ -117,7 +117,7 @@ class PPOPolicy(PPOBasePolicy):
         cfg_dict = _config_to_dict(self.cfg)
         cfg_dict.pop("eff_impedance", None)
         cfg_dict.pop("eff_impedance_interval", None)
-        self.cfg = PPOEEFConfig(
+        self.cfg = PPOEFFConfig(
             **cfg_dict,
             eff_impedance=cfg,
             eff_impedance_interval=self._eff_impedance_interval,

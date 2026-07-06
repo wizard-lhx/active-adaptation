@@ -34,15 +34,15 @@ class EffImpedanceConfig:
         enabled: Enables the diagnostic probe. The default is false.
         action_space: ``"I"`` for position target actions or ``"II"`` for
             position target plus velocity feed-forward actions.
-        alpha: Action-to-position scale populated by ``ppo_symaug_eef`` from
+        alpha: Action-to-position scale populated by ``ppo_symaug_eff`` from
             the current action manager's per-joint ``action_scaling``.
         beta: Velocity feed-forward coefficient for action space II.
         dt: Control period for action space II.
         q_slice: Half-open column range for joint position in the mean-network
-            input tensor, populated by ``ppo_symaug_eef`` from the env
+            input tensor, populated by ``ppo_symaug_eff`` from the env
             observation group.
         qd_slice: Half-open column range for actuated joint velocity in the
-            mean-network input tensor, populated by ``ppo_symaug_eef`` from the
+            mean-network input tensor, populated by ``ppo_symaug_eff`` from the
             env observation group.
         sample_stride: Keep one operating point every ``sample_stride`` points.
         max_points: Maximum cached operating points per log window.
