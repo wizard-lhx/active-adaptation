@@ -16,6 +16,7 @@ from typing import Any, List, Optional
 from omegaconf import OmegaConf
 from hydra.conf import HydraConf, RunDir
 from hydra.core.config_store import ConfigStore
+from hydra.core.hydra_config import HydraConfig
 
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 
@@ -82,7 +83,7 @@ class PlayConfig:
     """Task overrides applied on top of the selected task config."""
     exploration_type: ExplorationType = ExplorationType.MODE
     eff_impedance_play: bool = False
-    """Collect play operating points and print effective impedance matrices."""
+    """Record play-time effective impedance matrices for offline visualization."""
 
 
 cs = ConfigStore.instance()
@@ -144,9 +145,10 @@ def main(cfg: PlayConfig):
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
     rollout_policy = policy.get_rollout_policy("eval").to(env.device)
+    run_dir = Path(HydraConfig.get().runtime.output_dir)
     eff_impedance_reporter = None
     if cfg.eff_impedance_play:
-        eff_impedance_reporter = EffImpedancePlayReporter(policy)
+        eff_impedance_reporter = EffImpedancePlayReporter(policy, run_dir / "eff_impedance")
     
     env.base_env.eval()
     carry = env.reset()
@@ -159,7 +161,10 @@ def main(cfg: PlayConfig):
     # KeyboardInterrupt because the recorder is a context manager that flushes
     # buffered frames on exit.
     record_enabled = bool(cfg.get("record_video", False))
-    video_dir = FILE_PATH / "videos"
+    # video_dir = FILE_PATH / "videos"
+    video_dir = run_dir / "videos"
+    if record_enabled:
+        video_dir.mkdir(parents=True, exist_ok=True)
     time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
     video_path = video_dir / f"{cfg.task.name}-{time_str}.mp4"
     exploration_type = ExplorationType(cfg.get("exploration_type", "MODE"))
@@ -208,8 +213,10 @@ def main(cfg: PlayConfig):
                 try:
                     eff_impedance_reporter.report(f"final_step_{last_step + 1:06d}")
                 finally:
-                    eff_impedance_reporter.close()
-    
+                    eff_path = eff_impedance_reporter.close()
+                    if eff_path is not None:
+                        print(f"[eff_impedance] saved time-series to: {eff_path}")
+
     env.close()
 
 

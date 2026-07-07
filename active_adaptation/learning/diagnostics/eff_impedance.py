@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -79,12 +80,14 @@ class EffImpedanceConfig:
 
 @dataclass
 class EffImpedancePlayConfig:
-    """Default play-time live visualization behavior for effective impedance."""
+    """Default play-time recording behavior for effective impedance."""
 
-    update_interval: int = 10
+    update_interval: int = 1
     sample_mode: str = "latest"
     max_points: int = 256
-    show_viewer: bool = True
+    show_viewer: bool = False
+    record_npz: bool = True
+    autosave_interval: int = 1
 
 
 def _slice(bounds: tuple[int, int], name: str) -> slice:
@@ -435,17 +438,87 @@ class EffImpedanceMatrixViewer:
         fig.show()
 
 
+def _step_to_int(step: int | str) -> int:
+    if isinstance(step, int):
+        return step
+    digits = "".join(ch for ch in str(step) if ch.isdigit())
+    return int(digits) if digits else -1
+
+
+class EffImpedanceMatrixRecorder:
+    """In-memory time-series recorder for offline impedance visualization."""
+
+    def __init__(self) -> None:
+        self.steps: list[int] = []
+        self.num_points: list[int] = []
+        self._last_saved_count = 0
+        self.matrices: dict[str, list[np.ndarray]] = {
+            "Keff": [],
+            "Deff": [],
+            "Meff_delta": [],
+        }
+
+    def append(self, result: dict[str, Any], step: int | str) -> None:
+        if not result:
+            return
+        matrices = _mean_eff_matrices(result)
+        if "Keff" not in matrices or "Deff" not in matrices:
+            return
+
+        step_int = _step_to_int(step)
+        if self.steps and self.steps[-1] == step_int:
+            return
+
+        self.steps.append(step_int)
+        self.num_points.append(int(result.get("num_points", 0)))
+        for key, matrix in matrices.items():
+            self.matrices.setdefault(key, []).append(matrix.astype(np.float32, copy=False))
+
+    def save(self, path: Path) -> Path | None:
+        if not self.steps:
+            return None
+
+        payload: dict[str, np.ndarray] = {
+            "steps": np.asarray(self.steps, dtype=np.int64),
+            "num_points": np.asarray(self.num_points, dtype=np.int64),
+        }
+        for key, values in self.matrices.items():
+            if len(values) == len(self.steps):
+                payload[key] = np.stack(values, axis=0)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        with tmp_path.open("wb") as tmp_file:
+            np.savez_compressed(tmp_file, **payload)
+        tmp_path.replace(path)
+        self._last_saved_count = len(self.steps)
+        return path
+
+    def should_save(self, interval: int) -> bool:
+        if interval <= 0 or not self.steps:
+            return False
+        return len(self.steps) - self._last_saved_count >= interval
+
+
 class EffImpedancePlayReporter:
-    """Play-time wrapper for sampling and live impedance visualization."""
+    """Play-time wrapper for sampling, optional viewing, and NPZ recording."""
 
     def __init__(
         self,
         policy: Any,
+        output_dir: Path | None = None,
         cfg: EffImpedancePlayConfig | None = None,
     ) -> None:
         self.policy = policy
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.output_path = (
+            self.output_dir / "eff_impedance_timeseries.npz"
+            if self.output_dir is not None
+            else None
+        )
         self.cfg = cfg or EffImpedancePlayConfig()
         self.viewer = EffImpedanceMatrixViewer() if self.cfg.show_viewer else None
+        self.recorder = EffImpedanceMatrixRecorder() if self.cfg.record_npz else None
         self._configure_policy()
 
     def _configure_policy(self) -> None:
@@ -474,16 +547,30 @@ class EffImpedancePlayReporter:
         self.report(step)
 
     def report(self, step: int | str) -> dict[str, Any]:
-        if self.viewer is None:
+        if self.viewer is None and self.recorder is None:
             self.policy.eff_impedance_probe.reset()
             return {}
         result = self.policy.compute_eff_impedance_matrices(reset=True)
-        self.viewer.update(result, step)
+        if self.viewer is not None:
+            self.viewer.update(result, step)
+        if self.recorder is not None:
+            before = len(self.recorder.steps)
+            self.recorder.append(result, step)
+            if (
+                self.output_path is not None
+                and len(self.recorder.steps) > before
+                and self.recorder.should_save(self.cfg.autosave_interval)
+            ):
+                self.recorder.save(self.output_path)
         return result
 
-    def close(self) -> None:
+    def close(self) -> Path | None:
+        saved_path = None
+        if self.recorder is not None and self.output_path is not None:
+            saved_path = self.recorder.save(self.output_path)
         if self.viewer is not None:
             self.viewer.close()
+        return saved_path
 
 
 class _PpoSymaugMean(nn.Module):
