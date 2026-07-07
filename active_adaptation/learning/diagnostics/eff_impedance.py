@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -80,12 +79,12 @@ class EffImpedanceConfig:
 
 @dataclass
 class EffImpedancePlayConfig:
-    """Default play-time output behavior for effective impedance matrices."""
+    """Default play-time live visualization behavior for effective impedance."""
 
-    print_interval: int = 200
+    update_interval: int = 10
+    sample_mode: str = "latest"
     max_points: int = 256
-    save_heatmap: bool = True
-    save_npz: bool = True
+    show_viewer: bool = True
 
 
 def _slice(bounds: tuple[int, int], name: str) -> slice:
@@ -349,117 +348,109 @@ def impedance_diagnostics(eff: dict[str, Tensor], kp: Any, kd: Any) -> dict[str,
     return diagnostics
 
 
-def _eff_step_label(step: int | str) -> str:
-    if isinstance(step, int):
-        return f"step_{step:06d}"
-    return str(step)
-
-
-def _offdiag_abs_stats(matrix: np.ndarray) -> tuple[float, float]:
-    if matrix.ndim != 2 or min(matrix.shape) <= 1:
-        return 0.0, 0.0
-    mask = ~np.eye(matrix.shape[0], matrix.shape[1], dtype=bool)
-    values = np.abs(matrix[mask])
-    if values.size == 0:
-        return 0.0, 0.0
-    return float(values.mean()), float(values.max())
-
-
-def _save_matrix_heatmap(matrix: np.ndarray, title: str, path: Path) -> None:
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        print(f"[eff_impedance] Could not import matplotlib for heatmap: {exc}")
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(matrix, cmap="coolwarm")
-    fig.colorbar(im, ax=ax)
-    ax.set_title(title)
-    ax.set_xlabel("state joint")
-    ax.set_ylabel("action joint")
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-
-
-def _print_and_save_eff_impedance(
-    result: dict[str, Any],
-    output_dir: Path,
-    step: int | str,
-    cfg: EffImpedancePlayConfig,
-) -> None:
-    label = _eff_step_label(step)
-    if not result:
-        print(f"[eff_impedance] {label}: no cached operating points.")
-        return
-
+def _mean_eff_matrices(result: dict[str, Any]) -> dict[str, np.ndarray]:
     eff = result.get("eff", {})
-    if "Keff" not in eff or "Deff" not in eff:
-        print(f"[eff_impedance] {label}: missing Keff/Deff matrices.")
-        return
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    num_points = int(result.get("num_points", 0))
     matrices: dict[str, np.ndarray] = {}
-    means: dict[str, np.ndarray] = {}
-    for key, value in eff.items():
-        if torch.is_tensor(value):
-            arr = _to_numpy(value)
-            matrices[key] = arr
-            means[key] = arr.mean(axis=0)
-
-    print(f"\n[eff_impedance] {label}: num_points={num_points}")
     for key in ("Keff", "Deff", "Meff_delta"):
-        if key not in means:
-            continue
-        matrix = means[key]
-        diag = np.diagonal(matrix, axis1=-2, axis2=-1)
-        offdiag_mean, offdiag_max = _offdiag_abs_stats(matrix)
-        print(f"[eff_impedance] {key}_mean:")
-        print(np.array2string(matrix, precision=4, suppress_small=True))
-        print(f"[eff_impedance] {key}_diag: {np.array2string(diag, precision=4, suppress_small=True)}")
-        print(f"[eff_impedance] {key}_offdiag_abs_mean: {offdiag_mean:.6g}")
-        print(f"[eff_impedance] {key}_offdiag_abs_max: {offdiag_max:.6g}")
-        if cfg.save_heatmap:
-            _save_matrix_heatmap(matrix, f"{key} mean ({label})", output_dir / f"{label}_{key}.png")
+        value = eff.get(key)
+        if torch.is_tensor(value):
+            matrices[key] = _to_numpy(value).mean(axis=0)
+    return matrices
 
-    logs = result.get("logs", {})
-    for key in (
-        "eff_impedance/Keff_sym_min_eig_mean",
-        "eff_impedance/Deff_sym_min_eig_mean",
-        "eff_impedance/Keff_sym_cond_mean",
-        "eff_impedance/Deff_sym_cond_mean",
-        "eff_impedance/Keff_sym_neg_frac",
-        "eff_impedance/Deff_sym_neg_frac",
-    ):
-        if key in logs:
-            print(f"[eff_impedance] {key}: {logs[key]:.6g}")
 
-    if cfg.save_npz:
-        payload = {name: value for name, value in matrices.items()}
-        payload.update({f"{name}_mean": value for name, value in means.items()})
-        np.savez(output_dir / f"{label}_matrices.npz", **payload)
+class EffImpedanceMatrixViewer:
+    """Reusable matplotlib viewer for live effective impedance heatmaps."""
+
+    def __init__(self) -> None:
+        self._plt: Any | None = None
+        self._fig: Any | None = None
+        self._axes: dict[str, Any] = {}
+        self._images: dict[str, Any] = {}
+        self._keys = ("Keff", "Deff")
+        self._disabled = False
+
+    def update(self, result: dict[str, Any], step: int | str) -> None:
+        if self._disabled or not result:
+            return
+        matrices = _mean_eff_matrices(result)
+        if not all(key in matrices for key in self._keys):
+            return
+        if self._fig is None:
+            self._initialize(matrices)
+            if self._disabled:
+                return
+
+        num_points = int(result.get("num_points", 0))
+        for key in self._keys:
+            matrix = matrices[key]
+            image = self._images[key]
+            image.set_data(matrix)
+            vmin = float(np.nanmin(matrix))
+            vmax = float(np.nanmax(matrix))
+            if vmin == vmax:
+                pad = max(abs(vmin) * 0.01, 1e-6)
+                vmin -= pad
+                vmax += pad
+            image.set_clim(vmin, vmax)
+            self._axes[key].set_title(f"{key} mean | step={step} | n={num_points}")
+
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+        self._plt.pause(0.001)
+
+    def close(self) -> None:
+        if self._plt is not None and self._fig is not None:
+            self._plt.close(self._fig)
+        self._fig = None
+        self._axes.clear()
+        self._images.clear()
+
+    def _initialize(self, matrices: dict[str, np.ndarray]) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            self._disabled = True
+            return
+
+        plt.ion()
+        self._plt = plt
+        fig, axes = plt.subplots(1, len(self._keys), figsize=(12, 5))
+        if len(self._keys) == 1:
+            axes = [axes]
+        self._fig = fig
+        try:
+            fig.canvas.manager.set_window_title("Effective Impedance")
+        except Exception:
+            pass
+
+        for ax, key in zip(axes, self._keys, strict=True):
+            matrix = matrices[key]
+            image = ax.imshow(matrix, cmap="coolwarm", aspect="auto")
+            fig.colorbar(image, ax=ax)
+            ax.set_xlabel("state joint")
+            ax.set_ylabel("action joint")
+            self._axes[key] = ax
+            self._images[key] = image
+        fig.tight_layout()
+        fig.show()
 
 
 class EffImpedancePlayReporter:
-    """Play-time wrapper for sampling, printing, and saving impedance matrices."""
+    """Play-time wrapper for sampling and live impedance visualization."""
 
     def __init__(
         self,
         policy: Any,
-        output_dir: Path,
         cfg: EffImpedancePlayConfig | None = None,
     ) -> None:
         self.policy = policy
-        self.output_dir = Path(output_dir)
         self.cfg = cfg or EffImpedancePlayConfig()
+        self.viewer = EffImpedanceMatrixViewer() if self.cfg.show_viewer else None
         self._configure_policy()
 
     def _configure_policy(self) -> None:
+        if self.cfg.sample_mode not in {"latest", "window"}:
+            raise ValueError("eff_impedance sample_mode must be 'latest' or 'window'")
         if not hasattr(self.policy, "sample_eff_impedance_points") or not hasattr(
             self.policy,
             "compute_eff_impedance_matrices",
@@ -471,20 +462,28 @@ class EffImpedancePlayReporter:
         self.policy.eff_impedance_probe.cfg.enabled = True
         if self.cfg.max_points > 0:
             self.policy.eff_impedance_probe.cfg.max_points = self.cfg.max_points
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[eff_impedance] play diagnostics enabled; outputs: {self.output_dir}")
 
     def sample(self, tensordict: TensorDictBase) -> None:
+        if self.cfg.sample_mode == "latest":
+            self.policy.eff_impedance_probe.reset()
         self.policy.sample_eff_impedance_points(tensordict)
 
     def maybe_report(self, step: int) -> None:
-        if self.cfg.print_interval <= 0 or step % self.cfg.print_interval != 0:
+        if self.cfg.update_interval <= 0 or step % self.cfg.update_interval != 0:
             return
         self.report(step)
 
-    def report(self, step: int | str) -> None:
+    def report(self, step: int | str) -> dict[str, Any]:
+        if self.viewer is None:
+            self.policy.eff_impedance_probe.reset()
+            return {}
         result = self.policy.compute_eff_impedance_matrices(reset=True)
-        _print_and_save_eff_impedance(result, self.output_dir, step, self.cfg)
+        self.viewer.update(result, step)
+        return result
+
+    def close(self) -> None:
+        if self.viewer is not None:
+            self.viewer.close()
 
 
 class _PpoSymaugMean(nn.Module):

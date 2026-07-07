@@ -16,7 +16,6 @@ from typing import Any, List, Optional
 from omegaconf import OmegaConf
 from hydra.conf import HydraConf, RunDir
 from hydra.core.config_store import ConfigStore
-from hydra.core.hydra_config import HydraConfig
 
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 
@@ -147,8 +146,7 @@ def main(cfg: PlayConfig):
     rollout_policy = policy.get_rollout_policy("eval").to(env.device)
     eff_impedance_reporter = None
     if cfg.eff_impedance_play:
-        output_dir = Path(HydraConfig.get().runtime.output_dir) / "eff_impedance"
-        eff_impedance_reporter = EffImpedancePlayReporter(policy, output_dir)
+        eff_impedance_reporter = EffImpedancePlayReporter(policy)
     
     env.base_env.eval()
     carry = env.reset()
@@ -177,9 +175,9 @@ def main(cfg: PlayConfig):
                 last_step = i
                 with torch.inference_mode():
                     carry = rollout_policy(carry)
+                    td, carry = env.step_and_maybe_reset(carry)
                     if eff_impedance_reporter is not None:
                         eff_impedance_reporter.sample(carry)
-                    td, carry = env.step_and_maybe_reset(carry)
                     episode_stats.add(td)
 
                     if record_enabled:
@@ -207,7 +205,10 @@ def main(cfg: PlayConfig):
             print(f"Interrupted by user, video saved to: {video_path}" if record_enabled else "Interrupted by user.")
         finally:
             if eff_impedance_reporter is not None:
-                eff_impedance_reporter.report(f"final_step_{last_step + 1:06d}")
+                try:
+                    eff_impedance_reporter.report(f"final_step_{last_step + 1:06d}")
+                finally:
+                    eff_impedance_reporter.close()
     
     env.close()
 
