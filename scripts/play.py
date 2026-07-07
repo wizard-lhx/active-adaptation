@@ -16,6 +16,7 @@ from typing import Any, List, Optional
 from omegaconf import OmegaConf
 from hydra.conf import HydraConf, RunDir
 from hydra.core.config_store import ConfigStore
+from hydra.core.hydra_config import HydraConfig
 
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 
@@ -23,6 +24,7 @@ import active_adaptation as aa
 from active_adaptation.utils.export import export_onnx
 from active_adaptation.utils.timerfd import Timer
 from active_adaptation.utils.helpers import EpisodeStats
+from active_adaptation.learning.diagnostics.eff_impedance import EffImpedancePlayReporter
 from active_adaptation.learning.modules.vecnorm import VecNorm
 
 
@@ -80,6 +82,8 @@ class PlayConfig:
     task: PlayTaskOverride = field(default_factory=PlayTaskOverride)
     """Task overrides applied on top of the selected task config."""
     exploration_type: ExplorationType = ExplorationType.MODE
+    eff_impedance_play: bool = False
+    """Collect play operating points and print effective impedance matrices."""
 
 
 cs = ConfigStore.instance()
@@ -141,6 +145,10 @@ def main(cfg: PlayConfig):
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
     rollout_policy = policy.get_rollout_policy("eval").to(env.device)
+    eff_impedance_reporter = None
+    if cfg.eff_impedance_play:
+        output_dir = Path(HydraConfig.get().runtime.output_dir) / "eff_impedance"
+        eff_impedance_reporter = EffImpedancePlayReporter(policy, output_dir)
     
     env.base_env.eval()
     carry = env.reset()
@@ -157,26 +165,33 @@ def main(cfg: PlayConfig):
     time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
     video_path = video_dir / f"{cfg.task.name}-{time_str}.mp4"
     exploration_type = ExplorationType(cfg.get("exploration_type", "MODE"))
+    last_step = -1
 
     print_interval_s = 2.0
     last_print_time = time.perf_counter()
     last_print_step = -1
 
-    with env.get_recorder(video_path, enabled=record_enabled) as rec, \
-        torch.inference_mode(), set_exploration_type(exploration_type):
+    with env.get_recorder(video_path, enabled=record_enabled) as rec, set_exploration_type(exploration_type):
         try:
             for i in itertools.count():
-                carry = rollout_policy(carry)
-                td, carry = env.step_and_maybe_reset(carry)
-                episode_stats.add(td)
+                last_step = i
+                with torch.inference_mode():
+                    carry = rollout_policy(carry)
+                    if eff_impedance_reporter is not None:
+                        eff_impedance_reporter.sample(carry)
+                    td, carry = env.step_and_maybe_reset(carry)
+                    episode_stats.add(td)
 
-                if record_enabled:
-                    rec.add_frame()
+                    if record_enabled:
+                        rec.add_frame()
 
-                if len(episode_stats) >= env.num_envs:
-                    print("Step", i)
-                    for k, v in sorted(episode_stats.pop().items(True, True)):
-                        print(k, torch.mean(v).item())
+                    if len(episode_stats) >= env.num_envs:
+                        print("Step", i)
+                        for k, v in sorted(episode_stats.pop().items(True, True)):
+                            print(k, torch.mean(v).item())
+
+                if eff_impedance_reporter is not None:
+                    eff_impedance_reporter.maybe_report(i + 1)
 
                 now = time.perf_counter()
                 elapsed = now - last_print_time
@@ -190,10 +205,12 @@ def main(cfg: PlayConfig):
                 timer.sleep()
         except KeyboardInterrupt:
             print(f"Interrupted by user, video saved to: {video_path}" if record_enabled else "Interrupted by user.")
+        finally:
+            if eff_impedance_reporter is not None:
+                eff_impedance_reporter.report(f"final_step_{last_step + 1:06d}")
     
     env.close()
 
 
 if __name__ == "__main__":
     main()
-

@@ -1,4 +1,4 @@
-"""Effective impedance diagnostics for PPO policies.
+"""Effective impedance diagnostics for policies.
 
 This module is intentionally read-only with respect to training dynamics. It
 samples rollout operating points, computes the Jacobian of the policy mean with
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -75,6 +76,16 @@ class EffImpedanceConfig:
             if key in data and isinstance(data[key], list):
                 data[key] = tuple(data[key])
         return cls(**data)
+
+
+@dataclass
+class EffImpedancePlayConfig:
+    """Default play-time output behavior for effective impedance matrices."""
+
+    print_interval: int = 200
+    max_points: int = 256
+    save_heatmap: bool = True
+    save_npz: bool = True
 
 
 def _slice(bounds: tuple[int, int], name: str) -> slice:
@@ -338,6 +349,144 @@ def impedance_diagnostics(eff: dict[str, Tensor], kp: Any, kd: Any) -> dict[str,
     return diagnostics
 
 
+def _eff_step_label(step: int | str) -> str:
+    if isinstance(step, int):
+        return f"step_{step:06d}"
+    return str(step)
+
+
+def _offdiag_abs_stats(matrix: np.ndarray) -> tuple[float, float]:
+    if matrix.ndim != 2 or min(matrix.shape) <= 1:
+        return 0.0, 0.0
+    mask = ~np.eye(matrix.shape[0], matrix.shape[1], dtype=bool)
+    values = np.abs(matrix[mask])
+    if values.size == 0:
+        return 0.0, 0.0
+    return float(values.mean()), float(values.max())
+
+
+def _save_matrix_heatmap(matrix: np.ndarray, title: str, path: Path) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"[eff_impedance] Could not import matplotlib for heatmap: {exc}")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(matrix, cmap="coolwarm")
+    fig.colorbar(im, ax=ax)
+    ax.set_title(title)
+    ax.set_xlabel("state joint")
+    ax.set_ylabel("action joint")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def _print_and_save_eff_impedance(
+    result: dict[str, Any],
+    output_dir: Path,
+    step: int | str,
+    cfg: EffImpedancePlayConfig,
+) -> None:
+    label = _eff_step_label(step)
+    if not result:
+        print(f"[eff_impedance] {label}: no cached operating points.")
+        return
+
+    eff = result.get("eff", {})
+    if "Keff" not in eff or "Deff" not in eff:
+        print(f"[eff_impedance] {label}: missing Keff/Deff matrices.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    num_points = int(result.get("num_points", 0))
+    matrices: dict[str, np.ndarray] = {}
+    means: dict[str, np.ndarray] = {}
+    for key, value in eff.items():
+        if torch.is_tensor(value):
+            arr = _to_numpy(value)
+            matrices[key] = arr
+            means[key] = arr.mean(axis=0)
+
+    print(f"\n[eff_impedance] {label}: num_points={num_points}")
+    for key in ("Keff", "Deff", "Meff_delta"):
+        if key not in means:
+            continue
+        matrix = means[key]
+        diag = np.diagonal(matrix, axis1=-2, axis2=-1)
+        offdiag_mean, offdiag_max = _offdiag_abs_stats(matrix)
+        print(f"[eff_impedance] {key}_mean:")
+        print(np.array2string(matrix, precision=4, suppress_small=True))
+        print(f"[eff_impedance] {key}_diag: {np.array2string(diag, precision=4, suppress_small=True)}")
+        print(f"[eff_impedance] {key}_offdiag_abs_mean: {offdiag_mean:.6g}")
+        print(f"[eff_impedance] {key}_offdiag_abs_max: {offdiag_max:.6g}")
+        if cfg.save_heatmap:
+            _save_matrix_heatmap(matrix, f"{key} mean ({label})", output_dir / f"{label}_{key}.png")
+
+    logs = result.get("logs", {})
+    for key in (
+        "eff_impedance/Keff_sym_min_eig_mean",
+        "eff_impedance/Deff_sym_min_eig_mean",
+        "eff_impedance/Keff_sym_cond_mean",
+        "eff_impedance/Deff_sym_cond_mean",
+        "eff_impedance/Keff_sym_neg_frac",
+        "eff_impedance/Deff_sym_neg_frac",
+    ):
+        if key in logs:
+            print(f"[eff_impedance] {key}: {logs[key]:.6g}")
+
+    if cfg.save_npz:
+        payload = {name: value for name, value in matrices.items()}
+        payload.update({f"{name}_mean": value for name, value in means.items()})
+        np.savez(output_dir / f"{label}_matrices.npz", **payload)
+
+
+class EffImpedancePlayReporter:
+    """Play-time wrapper for sampling, printing, and saving impedance matrices."""
+
+    def __init__(
+        self,
+        policy: Any,
+        output_dir: Path,
+        cfg: EffImpedancePlayConfig | None = None,
+    ) -> None:
+        self.policy = policy
+        self.output_dir = Path(output_dir)
+        self.cfg = cfg or EffImpedancePlayConfig()
+        self._configure_policy()
+
+    def _configure_policy(self) -> None:
+        if not hasattr(self.policy, "sample_eff_impedance_points") or not hasattr(
+            self.policy,
+            "compute_eff_impedance_matrices",
+        ):
+            raise TypeError("eff_impedance_play requires a policy with effective impedance diagnostics")
+        if not hasattr(self.policy, "eff_impedance_probe"):
+            raise TypeError("eff_impedance_play requires policy.eff_impedance_probe")
+
+        self.policy.eff_impedance_probe.cfg.enabled = True
+        if self.cfg.max_points > 0:
+            self.policy.eff_impedance_probe.cfg.max_points = self.cfg.max_points
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[eff_impedance] play diagnostics enabled; outputs: {self.output_dir}")
+
+    def sample(self, tensordict: TensorDictBase) -> None:
+        self.policy.sample_eff_impedance_points(tensordict)
+
+    def maybe_report(self, step: int) -> None:
+        if self.cfg.print_interval <= 0 or step % self.cfg.print_interval != 0:
+            return
+        self.report(step)
+
+    def report(self, step: int | str) -> None:
+        result = self.policy.compute_eff_impedance_matrices(reset=True)
+        _print_and_save_eff_impedance(result, self.output_dir, step, self.cfg)
+
+
 class _PpoSymaugMean(nn.Module):
     """Mean-network adapter for ppo_symaug using raw concatenated actor input."""
 
@@ -451,24 +600,40 @@ class EffImpedanceProbe:
 
         if not self.enabled or not self._obs_chunks:
             return {}
-        if self._policy is None:
-            raise RuntimeError("EffImpedanceProbe has cached observations but no policy")
-
-        obs_cpu = torch.cat(self._obs_chunks, dim=0)
-        mean_net = self._build_mean_net(self._policy)
-        device = self._module_device(mean_net, obs_cpu.device)
-        obs = obs_cpu.to(device=device)
-        kp = self._merge_param_chunks(self._kp_chunks, obs.shape[0]).to(device=device)
-        kd = self._merge_param_chunks(self._kd_chunks, obs.shape[0]).to(device=device)
-
-        jacs = compute_policy_jacobians(mean_net, obs, self.cfg)
-        eff = assemble_effective_impedance(jacs, kp, kd, self.cfg)
-        diagnostics = impedance_diagnostics(eff, kp, kd)
+        eff, diagnostics = self._compute_effective_impedance()
         logs = self._scalar_logs(diagnostics, prefix="eff_impedance")
 
         self._write_logs(logger, logs, global_step)
         self.reset()
         return logs
+
+    def compute_matrices(self, reset: bool = True) -> dict[str, Any]:
+        """Compute full effective impedance matrices from cached points.
+
+        Args:
+            reset: Clear cached operating points after computing.
+
+        Returns:
+            A dict with ``eff`` matrices, ``diagnostics`` arrays/scalars, scalar
+            ``logs``, and ``num_points``. Returns an empty dict if the probe is
+            disabled or has no cached points.
+        """
+
+        if not self.enabled or not self._obs_chunks:
+            return {}
+
+        num_points = self.num_points
+        eff, diagnostics = self._compute_effective_impedance()
+        logs = self._scalar_logs(diagnostics, prefix="eff_impedance")
+        result = {
+            "eff": eff,
+            "diagnostics": diagnostics,
+            "logs": logs,
+            "num_points": num_points,
+        }
+        if reset:
+            self.reset()
+        return result
 
     def reset(self) -> None:
         """Clear cached operating points."""
@@ -504,6 +669,22 @@ class EffImpedanceProbe:
         if all(chunk.ndim >= 2 for chunk in chunks) and sum(chunk.shape[0] for chunk in chunks) == total:
             return torch.cat(chunks, dim=0)
         return chunks[-1]
+
+    def _compute_effective_impedance(self) -> tuple[dict[str, Tensor], dict[str, np.ndarray | float]]:
+        if self._policy is None:
+            raise RuntimeError("EffImpedanceProbe has cached observations but no policy")
+
+        obs_cpu = torch.cat(self._obs_chunks, dim=0)
+        mean_net = self._build_mean_net(self._policy)
+        device = self._module_device(mean_net, obs_cpu.device)
+        obs = obs_cpu.to(device=device)
+        kp = self._merge_param_chunks(self._kp_chunks, obs.shape[0]).to(device=device)
+        kd = self._merge_param_chunks(self._kd_chunks, obs.shape[0]).to(device=device)
+
+        jacs = compute_policy_jacobians(mean_net, obs, self.cfg)
+        eff = assemble_effective_impedance(jacs, kp, kd, self.cfg)
+        diagnostics = impedance_diagnostics(eff, kp, kd)
+        return eff, diagnostics
 
     @staticmethod
     def _module_device(module: nn.Module, fallback: torch.device) -> torch.device:

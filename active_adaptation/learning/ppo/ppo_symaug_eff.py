@@ -2,7 +2,8 @@
 
 This file keeps the original ``ppo_symaug`` policy and ``scripts/train_ppo.py``
 unchanged. Select it explicitly with ``algo=ppo_symaug_eff`` to add the
-read-only effective impedance diagnostics implemented in ``ppo_eff.py``.
+read-only effective impedance diagnostics implemented in
+``learning/diagnostics/eff_impedance.py``.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 
 from active_adaptation.learning.ppo.common import CMD_KEY, OBS_KEY
-from active_adaptation.learning.ppo.ppo_eff import EffImpedanceConfig, EffImpedanceProbe
+from active_adaptation.learning.diagnostics.eff_impedance import EffImpedanceConfig, EffImpedanceProbe
 from active_adaptation.learning.ppo.ppo_symaug import PPOConfig as PPOBaseConfig
 from active_adaptation.learning.ppo.ppo_symaug import PPOPolicy as PPOBasePolicy
 
@@ -79,9 +80,21 @@ class PPOPolicy(PPOBasePolicy):
         self._eff_impedance_iter += 1
         if iter_idx % self._eff_impedance_interval != 0:
             return {}
+        self.sample_eff_impedance_points(tensordict)
+        return self.eff_impedance_probe.compute_and_log({}, iter_idx)
+
+    def sample_eff_impedance_points(self, tensordict: TensorDict) -> None:
+        """Cache operating points for later effective impedance computation."""
+
+        if not self.eff_impedance_probe.enabled:
+            return
         kp, kd = self._eff_impedance_gains()
         self.eff_impedance_probe.sample_operating_points(self, tensordict, kp, kd)
-        return self.eff_impedance_probe.compute_and_log({}, iter_idx)
+
+    def compute_eff_impedance_matrices(self, reset: bool = True) -> dict[str, Any]:
+        """Return full effective impedance matrices from cached play/rollout points."""
+
+        return self.eff_impedance_probe.compute_matrices(reset=reset)
 
     def _eff_impedance_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
         kp_chunks = []
