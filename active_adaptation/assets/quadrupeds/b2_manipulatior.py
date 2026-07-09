@@ -200,7 +200,11 @@ ARM_SHOULDER_DAMPING = 1.0
 GRIPPER_STIFFNESS = 80.0
 
 
-def make_isaaclab_cfg(self_collisions: bool = False):
+def make_isaaclab_cfg(
+    self_collisions: bool = False,
+    leg_kp: float | None = None,
+    leg_kd: float | None = None,
+):
     from isaaclab.sensors import ContactSensorCfg
     from active_adaptation.assets.asset_cfg import (
         ArticulationCfg,
@@ -209,6 +213,8 @@ def make_isaaclab_cfg(self_collisions: bool = False):
     )
 
     USD_PATH = ROBOT_MODEL_DIR / "b2z1" / "b2z1_eef_collisionv2.usd"  # do not change
+    leg_stiffness = LEGS_STIFFNESS if leg_kp is None else float(leg_kp)
+    leg_damping = LEGS_DAMPING if leg_kd is None else float(leg_kd)
 
     asset_cfg = ArticulationCfg(
         spawn=sim_utils.UsdFileCfg(
@@ -243,8 +249,8 @@ def make_isaaclab_cfg(self_collisions: bool = False):
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint"],
                 effort_limit_sim=LEG_HIP_THIGH_EFFORT,
                 velocity_limit_sim=LEG_VELOCITY_LIMIT,
-                stiffness=LEGS_STIFFNESS,
-                damping=LEGS_DAMPING,
+                stiffness=leg_stiffness,
+                damping=leg_damping,
                 friction=0.01,
                 armature=0.01,
             ),
@@ -252,8 +258,8 @@ def make_isaaclab_cfg(self_collisions: bool = False):
                 joint_names_expr=[".*_calf_joint"],
                 effort_limit_sim=LEG_CALF_EFFORT,
                 velocity_limit_sim=LEG_VELOCITY_LIMIT,
-                stiffness=LEGS_STIFFNESS,
-                damping=LEGS_DAMPING,
+                stiffness=leg_stiffness,
+                damping=leg_damping,
                 friction=0.01,
                 armature=0.01,
             ),
@@ -419,9 +425,9 @@ def make_mjlab_cfg(self_collisions: bool = False):
     return cfg, sensors
 
 
-def make_cfg(backend: Literal["isaaclab", "mjlab"]):
+def make_cfg(backend: Literal["isaaclab", "mjlab"], **kwargs):
     if backend == "isaaclab":
-        return make_isaaclab_cfg()
+        return make_isaaclab_cfg(**kwargs)
     elif backend == "mjlab":
         return make_mjlab_cfg()
     else:

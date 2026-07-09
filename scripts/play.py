@@ -149,6 +149,59 @@ def main(cfg: PlayConfig):
 
     timer = Timer(env.step_dt)
 
+    # Velocity tracking diagnostics -------------------------------------------------
+    # A valid sample is one env-step whose commanded xy speed is greater than 0.3 m/s.
+    # mean_ratio: mean(||base_xy_velocity|| / ||command_xy_velocity||) over valid samples.
+    # steps_ratio>0.4: fraction of valid samples whose speed ratio is greater than 0.4.
+    # valid_steps: number of valid env-steps accumulated in the current print window.
+    base_env = env.base_env
+    robot = base_env.scene.articulations.get("robot")
+    command_manager = base_env.command_manager
+    vel_tracking_enabled = (
+        robot is not None
+        and hasattr(robot.data, "root_com_lin_vel_w")
+        and hasattr(command_manager, "cmd_linvel_w")
+    )
+    vel_tracking_print_interval = 1000
+    vel_ratio_sum = torch.zeros((), device=env.device)
+    vel_ratio_good = torch.zeros((), device=env.device)
+    vel_ratio_steps = torch.zeros((), device=env.device)
+
+    def reset_vel_tracking_stats():
+        vel_ratio_sum.zero_()
+        vel_ratio_good.zero_()
+        vel_ratio_steps.zero_()
+
+    def update_vel_tracking_stats():
+        if not vel_tracking_enabled:
+            return
+        cmd_speed = command_manager.cmd_linvel_w[:, :2].norm(dim=-1)
+        valid = cmd_speed > 0.3
+        base_speed = robot.data.root_com_lin_vel_w[:, :2].norm(dim=-1)
+        ratio = base_speed[valid] / cmd_speed[valid].clamp_min(1e-6)
+        vel_ratio_sum.add_(ratio.sum())
+        vel_ratio_good.add_((ratio > 0.4).float().sum())
+        vel_ratio_steps.add_(valid.float().sum())
+
+    def print_vel_tracking_summary(step: int, *, force: bool = False):
+        if not vel_tracking_enabled:
+            return
+        valid_steps = int(vel_ratio_steps.item())
+        if valid_steps == 0 and not force:
+            return
+        if valid_steps:
+            mean_ratio = (vel_ratio_sum / vel_ratio_steps).item()
+            good_ratio = (vel_ratio_good / vel_ratio_steps).item()
+        else:
+            mean_ratio = 0.0
+            good_ratio = 0.0
+        print(
+            f"[vel-track step={step}] mean_ratio={mean_ratio:.2f}  "
+            f"steps_ratio>0.4={good_ratio:.0%}  "
+            f"valid_steps={valid_steps}"
+        )
+        reset_vel_tracking_stats()
+
     # Optional video recording (Isaac backend only). This remains safe under
     # KeyboardInterrupt because the recorder is a context manager that flushes
     # buffered frames on exit.
@@ -166,6 +219,9 @@ def main(cfg: PlayConfig):
         torch.inference_mode(), set_exploration_type(exploration_type):
         try:
             for i in itertools.count():
+                update_vel_tracking_stats()
+                if i % vel_tracking_print_interval == 0:
+                    print_vel_tracking_summary(i + 1, force=True)
                 carry = rollout_policy(carry)
                 td, carry = env.step_and_maybe_reset(carry)
                 episode_stats.add(td)
@@ -190,10 +246,11 @@ def main(cfg: PlayConfig):
                 timer.sleep()
         except KeyboardInterrupt:
             print(f"Interrupted by user, video saved to: {video_path}" if record_enabled else "Interrupted by user.")
+        finally:
+            print_vel_tracking_summary(i, force=False)
     
     env.close()
 
 
 if __name__ == "__main__":
     main()
-

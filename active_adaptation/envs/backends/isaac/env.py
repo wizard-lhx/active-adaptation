@@ -56,8 +56,14 @@ class IsaacBackendEnv(_EnvBase):
             ),
         )
 
-        asset_cfg = registry.get("asset", self.cfg.robot.name)
-        asset_cfg, sensors = asset_cfg(backend="isaaclab")
+        asset_fn = registry.get("asset", self.cfg.robot.name)
+        robot_cfg = self.cfg.get("robot", {})
+        leg_pd_kwargs = {}
+        for key in ("leg_kp", "leg_kd"):
+            value = robot_cfg.get(key, None)
+            if value is not None:
+                leg_pd_kwargs[key] = float(value)
+        asset_cfg, sensors = asset_fn(backend="isaaclab", **leg_pd_kwargs)
         scene_cfg.robot = asset_cfg
         for name, sensor_cfg in sensors.items():
             setattr(scene_cfg, name, sensor_cfg)
