@@ -40,15 +40,20 @@ class EffImpedanceReplayViewer:
             self.Deff_sym_neg_frac = data["Deff_sym_neg_frac"]
 
         video_meta = iio.immeta(video_path)
+        self.video_fps = float(video_meta["fps"])
         self.frame_count = int(round(float(video_meta["duration"]) * float(video_meta["fps"])))
         self.video_reader = iio.imopen(video_path, "r")
         self.current_video_step = 1
-        self.held_keys: set[str] = set()
+        self.pressed_keys: set[str] = set()
+        self.is_playing = False
+        self.show_values = False
         self._updating_slider = False
 
         self._build_figure()
         self.key_timer = self.fig.canvas.new_timer(interval=50)
         self.key_timer.add_callback(self._repeat_held_key)
+        self.play_timer = self.fig.canvas.new_timer(interval=int(round(1000.0 / self.video_fps)))
+        self.play_timer.add_callback(self._advance_playback)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
         self.fig.canvas.mpl_connect("key_release_event", self._on_key_release)
         self._update_video_step(1)
@@ -105,6 +110,19 @@ class EffImpedanceReplayViewer:
             axis.set_ylabel("action joint")
         self.keff_ax = keff_ax
         self.deff_ax = deff_ax
+        self.matrix_value_texts = {
+            "Keff": [
+                keff_ax.text(col, row, "", ha="center", va="center", fontsize=5, visible=False)
+                for row in range(self.Keff.shape[-2])
+                for col in range(self.Keff.shape[-1])
+            ],
+            "Deff": [
+                deff_ax.text(col, row, "", ha="center", va="center", fontsize=5, visible=False)
+                for row in range(self.Deff.shape[-2])
+                for col in range(self.Deff.shape[-1])
+            ],
+        }
+        self.matrix_value_limits = {"Keff": keff_limit, "Deff": deff_limit}
 
         eig_ids = np.arange(self.Keff_sym_eigvals.shape[-1])
         (self.keff_eig_line,) = eig_ax.plot(
@@ -122,12 +140,22 @@ class EffImpedanceReplayViewer:
         eig_min = min(float(np.nanmin(self.Keff_sym_eigvals)), float(np.nanmin(self.Deff_sym_eigvals)), 0.0)
         eig_max = max(float(np.nanmax(self.Keff_sym_eigvals)), float(np.nanmax(self.Deff_sym_eigvals)), 0.0)
         eig_pad = 0.05 * (eig_max - eig_min)
+        eig_ax.set_xlim(eig_ids[0] - 0.5, eig_ids[-1] + 0.5)
         eig_ax.set_ylim(eig_min - eig_pad, eig_max + eig_pad)
+        eig_ax.set_xticks(eig_ids)
         eig_ax.axhline(0.0, color="black", linewidth=1.0)
         eig_ax.set_xlabel("eigenvalue index")
         eig_ax.set_ylabel("symmetric eigenvalue")
         eig_ax.set_title("current eigenvalue spectrum")
         eig_ax.legend()
+        self.keff_eig_texts = [
+            eig_ax.text(idx, 0.0, "", ha="center", va="bottom", fontsize=7, visible=False)
+            for idx in eig_ids
+        ]
+        self.deff_eig_texts = [
+            eig_ax.text(idx, 0.0, "", ha="center", va="top", fontsize=7, visible=False)
+            for idx in eig_ids
+        ]
 
         min_eig_ax.plot(self.steps, self.Keff_sym_min_eig, label="Keff")
         min_eig_ax.plot(self.steps, self.Deff_sym_min_eig, label="Deff")
@@ -158,10 +186,10 @@ class EffImpedanceReplayViewer:
             valstep=1,
         )
         self.slider.on_changed(self._on_slider)
-        self.fig.text(
+        self.controls_text = self.fig.text(
             0.5,
             0.095,
-            "drag slider | hold left/right: play steps",
+            "PAUSED | SPACE: play/pause | hold LEFT/RIGHT: play steps | V: values off",
             ha="center",
         )
 
@@ -211,6 +239,7 @@ class EffImpedanceReplayViewer:
                 f"negative={int(self.Deff_sym_neg_count[matrix_idx])} "
                 f"({self.Deff_sym_neg_frac[matrix_idx]:.1%})"
             )
+        self._update_value_annotations(matrix_idx)
 
         if int(self.slider.val) != video_step:
             self._updating_slider = True
@@ -220,31 +249,98 @@ class EffImpedanceReplayViewer:
 
     def _on_slider(self, value: float) -> None:
         if not self._updating_slider:
+            self._set_playing(False)
             self._update_video_step(int(value))
 
     def _on_key_press(self, event) -> None:
         key = event.key
-        if key not in {"left", "right"} or key in self.held_keys:
+        if key == " ":
+            self.pressed_keys.difference_update({"left", "right"})
+            self.key_timer.stop()
+            self._set_playing(not self.is_playing)
             return
-        self.held_keys.add(key)
+        if key == "v":
+            self.show_values = not self.show_values
+            matrix_idx = _matrix_index_for_video_step(self.steps, self.current_video_step)
+            self._update_value_annotations(matrix_idx)
+            self._update_controls_text()
+            self.fig.canvas.draw_idle()
+            return
+        if key not in {"left", "right"} or key in self.pressed_keys:
+            return
+        self.pressed_keys.add(key)
+        self._set_playing(False)
         self._repeat_held_key()
         self.key_timer.start()
 
     def _on_key_release(self, event) -> None:
-        self.held_keys.discard(event.key)
-        if not self.held_keys:
+        self.pressed_keys.discard(event.key)
+        if not self.pressed_keys.intersection({"left", "right"}):
             self.key_timer.stop()
 
     def _repeat_held_key(self) -> None:
-        if "right" in self.held_keys:
+        if "right" in self.pressed_keys:
             self._update_video_step(self.current_video_step + 1)
-        elif "left" in self.held_keys:
+        elif "left" in self.pressed_keys:
             self._update_video_step(self.current_video_step - 1)
+
+    def _advance_playback(self) -> None:
+        if self.current_video_step >= self.frame_count:
+            self._set_playing(False)
+            return
+        self._update_video_step(self.current_video_step + 1)
+        if self.current_video_step >= self.frame_count:
+            self._set_playing(False)
+
+    def _set_playing(self, playing: bool) -> None:
+        if self.is_playing == playing:
+            return
+        self.is_playing = playing
+        if playing:
+            self.play_timer.start()
+        else:
+            self.play_timer.stop()
+        self._update_controls_text()
+        self.fig.canvas.draw_idle()
+
+    def _update_controls_text(self) -> None:
+        playback = "PLAYING" if self.is_playing else "PAUSED"
+        values = "on" if self.show_values else "off"
+        self.controls_text.set_text(
+            f"{playback} | SPACE: play/pause | hold LEFT/RIGHT: play steps | V: values {values}"
+        )
+
+    def _update_value_annotations(self, matrix_idx: int | None) -> None:
+        visible = self.show_values and matrix_idx is not None
+        matrices = {"Keff": self.Keff, "Deff": self.Deff}
+        for key, texts in self.matrix_value_texts.items():
+            values = matrices[key][matrix_idx].reshape(-1) if visible else ()
+            limit = self.matrix_value_limits[key]
+            for idx, text in enumerate(texts):
+                text.set_visible(visible)
+                if visible:
+                    value = float(values[idx])
+                    text.set_text(f"{value:.2g}")
+                    text.set_color("white" if abs(value) > 0.55 * limit else "black")
+
+        eig_groups = (
+            (self.keff_eig_texts, self.Keff_sym_eigvals),
+            (self.deff_eig_texts, self.Deff_sym_eigvals),
+        )
+        for texts, eigvals in eig_groups:
+            values = eigvals[matrix_idx] if visible else ()
+            for idx, text in enumerate(texts):
+                text.set_visible(visible)
+                if visible:
+                    value = float(values[idx])
+                    text.set_position((idx, value))
+                    text.set_text(f"{value:.2g}")
 
     def show(self) -> None:
         try:
             plt.show()
         finally:
+            self.play_timer.stop()
             self.key_timer.stop()
             self._read_frame.cache_clear()
             self.video_reader.close()

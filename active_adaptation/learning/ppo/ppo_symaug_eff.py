@@ -165,7 +165,7 @@ class PPOPolicy(PPOBasePolicy):
         kind: str,
         controlled_joint_ids: torch.Tensor,
     ) -> tuple[int, int]:
-        group = env.observation_funcs[OBS_KEY]
+        group = env.observation_groups[OBS_KEY]
         actor_offset = 0
         if CMD_KEY in env.observation_spec.keys(True, True):
             actor_offset = env.observation_spec[CMD_KEY].shape[-1]

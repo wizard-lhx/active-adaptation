@@ -37,7 +37,7 @@ command:
   angvel_range:   [-2.0, 2.0]
   yaw_stiffness_range: [0.5, 1.1]
   use_stiffness_ratio: 0.99
-  base_height_range: [0.1, 0.52]
+  base_height_range: [0.45, 0.45]
   locomotion_height_threshold: 0.30
   resample_interval: 250
   resample_prob: 0.5
