@@ -283,6 +283,42 @@ def _nominal_gain(value: Any, batch: int, joints: int) -> np.ndarray:
     raise ValueError(f"gain must be scalar, (n,), or (B, n), got {arr.shape}")
 
 
+def effective_impedance_matrix_diagnostics(eff: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Compute diagnostics that depend only on effective impedance matrices."""
+
+    Keff = _to_numpy(eff["Keff"])
+    Deff = _to_numpy(eff["Deff"])
+    if Keff.ndim == 2:
+        Keff = Keff[None, ...]
+    if Deff.ndim == 2:
+        Deff = Deff[None, ...]
+
+    Kdiag = np.diagonal(Keff, axis1=-2, axis2=-1)
+    Ddiag = np.diagonal(Deff, axis1=-2, axis2=-1)
+    sym_K = 0.5 * (Keff + np.swapaxes(Keff, -1, -2))
+    sym_D = 0.5 * (Deff + np.swapaxes(Deff, -1, -2))
+    eig_K = np.linalg.eigvalsh(sym_K)
+    eig_D = np.linalg.eigvalsh(sym_D)
+
+    cond_K = np.asarray(np.linalg.cond(sym_K), dtype=np.float32)
+    cond_D = np.asarray(np.linalg.cond(sym_D), dtype=np.float32)
+
+    return {
+        "Keff_diag": Kdiag,
+        "Deff_diag": Ddiag,
+        "Keff_sym_eigvals": eig_K,
+        "Deff_sym_eigvals": eig_D,
+        "Keff_sym_min_eig": eig_K[..., 0],
+        "Deff_sym_min_eig": eig_D[..., 0],
+        "Keff_sym_cond": cond_K,
+        "Deff_sym_cond": cond_D,
+        "Keff_sym_neg_count": np.count_nonzero(eig_K < 0.0, axis=-1),
+        "Deff_sym_neg_count": np.count_nonzero(eig_D < 0.0, axis=-1),
+        "Keff_sym_neg_frac": np.mean(eig_K < 0.0, axis=-1),
+        "Deff_sym_neg_frac": np.mean(eig_D < 0.0, axis=-1),
+    }
+
+
 def impedance_diagnostics(eff: dict[str, Tensor], kp: Any, kd: Any) -> dict[str, np.ndarray | float]:
     """Reduce effective impedance matrices to logging-friendly diagnostics.
 
@@ -298,20 +334,17 @@ def impedance_diagnostics(eff: dict[str, Tensor], kp: Any, kd: Any) -> dict[str,
         fraction of sampled points where that minimum is negative.
     """
 
-    Keff = _to_numpy(eff["Keff"])
-    Deff = _to_numpy(eff["Deff"])
-    batch, joints, _ = Deff.shape
+    matrix_diagnostics = effective_impedance_matrix_diagnostics(eff)
+    batch, joints = matrix_diagnostics["Deff_diag"].shape
     kp_nom = _nominal_gain(kp, batch, joints)
     kd_nom = _nominal_gain(kd, batch, joints)
 
-    Kdiag = np.diagonal(Keff, axis1=-2, axis2=-1)
-    Ddiag = np.diagonal(Deff, axis1=-2, axis2=-1)
-    sym_K = 0.5 * (Keff + np.swapaxes(Keff, -1, -2))
-    sym_D = 0.5 * (Deff + np.swapaxes(Deff, -1, -2))
-    eig_K = np.linalg.eigvalsh(sym_K)
-    eig_D = np.linalg.eigvalsh(sym_D)
-    min_K = eig_K[:, 0]
-    min_D = eig_D[:, 0]
+    Kdiag = matrix_diagnostics["Keff_diag"]
+    Ddiag = matrix_diagnostics["Deff_diag"]
+    eig_K = matrix_diagnostics["Keff_sym_eigvals"]
+    eig_D = matrix_diagnostics["Deff_sym_eigvals"]
+    min_K = matrix_diagnostics["Keff_sym_min_eig"]
+    min_D = matrix_diagnostics["Deff_sym_min_eig"]
 
     diagnostics: dict[str, np.ndarray | float] = {
         "Keff_diag": Kdiag,
@@ -343,11 +376,10 @@ def impedance_diagnostics(eff: dict[str, Tensor], kp: Any, kd: Any) -> dict[str,
             diagnostics[f"{key}_diag_mean"] = float(diag.mean())
             diagnostics[f"{key}_diag_min"] = float(diag.min())
             diagnostics[f"{key}_diag_max"] = float(diag.max())
-    try:
-        diagnostics["Deff_sym_cond_mean"] = float(np.linalg.cond(sym_D).mean())
-        diagnostics["Keff_sym_cond_mean"] = float(np.linalg.cond(sym_K).mean())
-    except np.linalg.LinAlgError:
-        pass
+    cond_D = matrix_diagnostics["Deff_sym_cond"]
+    cond_K = matrix_diagnostics["Keff_sym_cond"]
+    diagnostics["Deff_sym_cond_mean"] = float(cond_D.mean())
+    diagnostics["Keff_sym_cond_mean"] = float(cond_K.mean())
     return diagnostics
 
 
@@ -457,6 +489,7 @@ class EffImpedanceMatrixRecorder:
             "Deff": [],
             "Meff_delta": [],
         }
+        self.diagnostics: dict[str, list[np.ndarray]] = {}
 
     def append(self, result: dict[str, Any], step: int | str) -> None:
         if not result:
@@ -473,6 +506,9 @@ class EffImpedanceMatrixRecorder:
         self.num_points.append(int(result.get("num_points", 0)))
         for key, matrix in matrices.items():
             self.matrices.setdefault(key, []).append(matrix.astype(np.float32, copy=False))
+        diagnostics = effective_impedance_matrix_diagnostics(matrices)
+        for key, value in diagnostics.items():
+            self.diagnostics.setdefault(key, []).append(np.asarray(value[0]))
 
     def save(self, path: Path) -> Path | None:
         if not self.steps:
@@ -483,6 +519,9 @@ class EffImpedanceMatrixRecorder:
             "num_points": np.asarray(self.num_points, dtype=np.int64),
         }
         for key, values in self.matrices.items():
+            if len(values) == len(self.steps):
+                payload[key] = np.stack(values, axis=0)
+        for key, values in self.diagnostics.items():
             if len(values) == len(self.steps):
                 payload[key] = np.stack(values, axis=0)
 
