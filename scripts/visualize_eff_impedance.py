@@ -11,6 +11,28 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import Slider
 
+from active_adaptation.learning.diagnostics.negative_mode import (
+    compute_negative_mode,
+    contact_count_lambda_medians,
+    verdict as negative_mode_verdict,
+)
+
+
+JOINT_LABELS = (
+    "FL-H",
+    "FR-H",
+    "RL-H",
+    "RR-H",
+    "FL-T",
+    "FR-T",
+    "RL-T",
+    "RR-T",
+    "FL-C",
+    "FR-C",
+    "RL-C",
+    "RR-C",
+)
+
 
 def _matrix_index_for_video_step(steps: np.ndarray, video_step: int) -> int | None:
     idx = int(np.searchsorted(steps, video_step, side="right") - 1)
@@ -38,6 +60,36 @@ class EffImpedanceReplayViewer:
             self.Deff_sym_neg_count = data["Deff_sym_neg_count"]
             self.Keff_sym_neg_frac = data["Keff_sym_neg_frac"]
             self.Deff_sym_neg_frac = data["Deff_sym_neg_frac"]
+            negative_mode_keys = {
+                "joint_vel",
+                "contact",
+                "done",
+                "episode_id",
+                "control_dt",
+                "contact_body_names",
+            }
+            if negative_mode_keys <= set(data.files):
+                self.joint_vel = data["joint_vel"]
+                self.contact = data["contact"]
+                self.done = data["done"]
+                self.episode_id = data["episode_id"]
+                self.control_dt = float(data["control_dt"])
+                self.contact_body_names = data["contact_body_names"]
+                self.neg_mode = compute_negative_mode(
+                    self.Deff,
+                    self.joint_vel,
+                    self.done,
+                    self.control_dt,
+                )
+                self.neg_verdict = negative_mode_verdict(
+                    self.neg_mode["median_consistency"],
+                    self.neg_mode["f_peak"],
+                    self.neg_mode["band_frac"],
+                    self.neg_mode["psd_f"],
+                    self.neg_mode["psd"],
+                )
+            else:
+                self.neg_mode = None
 
         video_meta = iio.immeta(video_path)
         self.video_fps = float(video_meta["fps"])
@@ -47,7 +99,26 @@ class EffImpedanceReplayViewer:
         self.pressed_keys: set[str] = set()
         self.is_playing = False
         self.show_values = False
+        self.show_negative_mode = False
         self._updating_slider = False
+
+        if self.neg_mode is None:
+            self.neg_mode_title = "neg-mode: N/A"
+        else:
+            self.neg_mode_title = (
+                f"neg-mode: cons={self.neg_mode['median_consistency']:.2f} | "
+                f"f_peak={self.neg_mode['f_peak']:.1f} Hz | "
+                f"band={self.neg_mode['band_frac']:.0%} | verdict={self.neg_verdict}"
+            )
+            contact_medians = contact_count_lambda_medians(
+                self.neg_mode["lam_min"],
+                self.contact,
+                self.neg_mode["valid"],
+            )
+            print(
+                "[negative_mode] lambda_min median by contacting feet 0..4: "
+                + np.array2string(contact_medians, precision=5)
+            )
 
         self._build_figure()
         self.key_timer = self.fig.canvas.new_timer(interval=50)
@@ -108,6 +179,13 @@ class EffImpedanceReplayViewer:
         for axis in (keff_ax, deff_ax):
             axis.set_xlabel("state joint")
             axis.set_ylabel("action joint")
+            axis.set_xticks(
+                np.arange(len(JOINT_LABELS)),
+                JOINT_LABELS,
+                rotation=90,
+                fontsize=6,
+            )
+            axis.set_yticks(np.arange(len(JOINT_LABELS)), JOINT_LABELS, fontsize=6)
         self.keff_ax = keff_ax
         self.deff_ax = deff_ax
         self.matrix_value_texts = {
@@ -148,6 +226,7 @@ class EffImpedanceReplayViewer:
         eig_ax.set_ylabel("symmetric eigenvalue")
         eig_ax.set_title("current eigenvalue spectrum")
         eig_ax.legend()
+        self.eig_ax = eig_ax
         self.keff_eig_texts = [
             eig_ax.text(idx, 0.0, "", ha="center", va="bottom", fontsize=7, visible=False)
             for idx in eig_ids
@@ -165,6 +244,25 @@ class EffImpedanceReplayViewer:
         (self.deff_min_marker,) = min_eig_ax.plot([], [], "o")
         min_eig_ax.set_ylabel("min eigenvalue")
         min_eig_ax.legend(loc="best")
+        if self.neg_mode is not None:
+            contact_count = self.contact.sum(axis=1)
+            ymin, ymax = min_eig_ax.get_ylim()
+            min_eig_ax.imshow(
+                contact_count[None, :],
+                cmap="Greys",
+                aspect="auto",
+                interpolation="nearest",
+                vmin=0,
+                vmax=4,
+                extent=(
+                    self.steps[0] - 0.5,
+                    self.steps[-1] + 0.5,
+                    ymin,
+                    ymin + 0.08 * (ymax - ymin),
+                ),
+                zorder=0,
+            )
+            min_eig_ax.set_ylim(ymin, ymax)
 
         cond_ax.plot(self.steps, self.Keff_sym_cond, label="Keff")
         cond_ax.plot(self.steps, self.Deff_sym_cond, label="Deff")
@@ -175,6 +273,34 @@ class EffImpedanceReplayViewer:
         cond_ax.set_xlabel("play step")
         cond_ax.set_ylabel("condition number")
         cond_ax.legend(loc="best")
+
+        if self.neg_mode is not None:
+            self.neg_ax = self.fig.add_subplot(grid[1, 2])
+            mode_limit = float(np.nanmax(np.abs(self.neg_mode["v_min"])))
+            self.neg_image = self.neg_ax.imshow(
+                self.neg_mode["v_min"].T,
+                cmap="coolwarm",
+                aspect="auto",
+                interpolation="nearest",
+                vmin=-mode_limit,
+                vmax=mode_limit,
+                extent=(
+                    self.steps[0] - 0.5,
+                    self.steps[-1] + 0.5,
+                    len(JOINT_LABELS) - 0.5,
+                    -0.5,
+                ),
+            )
+            self.neg_ax.set_xlabel("play step")
+            self.neg_ax.set_ylabel("mode joint")
+            self.neg_ax.set_yticks(
+                np.arange(len(JOINT_LABELS)), JOINT_LABELS, fontsize=7
+            )
+            self.neg_ax.set_title("minimum Deff mode | blue < 0 < red")
+            self.neg_cursor = self.neg_ax.axvline(1, color="black", linestyle="--")
+            self.neg_colorbar = self.fig.colorbar(self.neg_image, ax=self.neg_ax)
+            self.neg_ax.set_visible(False)
+            self.neg_colorbar.ax.set_visible(False)
 
         slider_ax = self.fig.add_axes((0.10, 0.045, 0.80, 0.03))
         self.slider = Slider(
@@ -189,7 +315,7 @@ class EffImpedanceReplayViewer:
         self.controls_text = self.fig.text(
             0.5,
             0.095,
-            "PAUSED | SPACE: play/pause | hold LEFT/RIGHT: play steps | V: values off",
+            "PAUSED | SPACE: play/pause | hold LEFT/RIGHT: play steps | V: values off | M: neg-mode panel",
             ha="center",
         )
 
@@ -215,7 +341,7 @@ class EffImpedanceReplayViewer:
                 marker.set_data([], [])
             self.keff_ax.set_title("Keff | blue < 0 < red")
             self.deff_ax.set_title("Deff | blue < 0 < red")
-            self.fig.suptitle(f"video step={video_step}")
+            self.fig.suptitle(f"video step={video_step}\n{self.neg_mode_title}")
         else:
             matrix_step = int(self.steps[matrix_idx])
             self.keff_image.set_data(self.Keff[matrix_idx])
@@ -228,6 +354,11 @@ class EffImpedanceReplayViewer:
             self.deff_cond_marker.set_data([matrix_step], [self.Deff_sym_cond[matrix_idx]])
             self.keff_ax.set_title(f"Keff | step={matrix_step} | blue < 0 < red")
             self.deff_ax.set_title(f"Deff | step={matrix_step} | blue < 0 < red")
+            if self.neg_mode is not None:
+                self.neg_cursor.set_xdata([matrix_step, matrix_step])
+                self.neg_cursor.set_color(
+                    "black" if self.neg_mode["valid"][matrix_idx] else "gray"
+                )
             self.fig.suptitle(
                 f"video step={video_step} | matrix step={matrix_step} | n={int(self.num_points[matrix_idx])}\n"
                 f"K: min eig={self.Keff_sym_min_eig[matrix_idx]:.5g}, "
@@ -237,7 +368,8 @@ class EffImpedanceReplayViewer:
                 f"D: min eig={self.Deff_sym_min_eig[matrix_idx]:.5g}, "
                 f"cond={self.Deff_sym_cond[matrix_idx]:.5g}, "
                 f"negative={int(self.Deff_sym_neg_count[matrix_idx])} "
-                f"({self.Deff_sym_neg_frac[matrix_idx]:.1%})"
+                f"({self.Deff_sym_neg_frac[matrix_idx]:.1%})\n"
+                f"{self.neg_mode_title}"
             )
         self._update_value_annotations(matrix_idx)
 
@@ -264,6 +396,13 @@ class EffImpedanceReplayViewer:
             matrix_idx = _matrix_index_for_video_step(self.steps, self.current_video_step)
             self._update_value_annotations(matrix_idx)
             self._update_controls_text()
+            self.fig.canvas.draw_idle()
+            return
+        if key == "m" and self.neg_mode is not None:
+            self.show_negative_mode = not self.show_negative_mode
+            self.eig_ax.set_visible(not self.show_negative_mode)
+            self.neg_ax.set_visible(self.show_negative_mode)
+            self.neg_colorbar.ax.set_visible(self.show_negative_mode)
             self.fig.canvas.draw_idle()
             return
         if key not in {"left", "right"} or key in self.pressed_keys:
@@ -307,7 +446,8 @@ class EffImpedanceReplayViewer:
         playback = "PLAYING" if self.is_playing else "PAUSED"
         values = "on" if self.show_values else "off"
         self.controls_text.set_text(
-            f"{playback} | SPACE: play/pause | hold LEFT/RIGHT: play steps | V: values {values}"
+            f"{playback} | SPACE: play/pause | hold LEFT/RIGHT: play steps | "
+            f"V: values {values} | M: neg-mode panel"
         )
 
     def _update_value_annotations(self, matrix_idx: int | None) -> None:

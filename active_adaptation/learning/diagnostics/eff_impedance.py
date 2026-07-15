@@ -480,9 +480,15 @@ def _step_to_int(step: int | str) -> int:
 class EffImpedanceMatrixRecorder:
     """In-memory time-series recorder for offline impedance visualization."""
 
-    def __init__(self) -> None:
+    def __init__(self, control_dt: float, contact_body_names: list[str]) -> None:
         self.steps: list[int] = []
         self.num_points: list[int] = []
+        self.joint_vel: list[np.ndarray] = []
+        self.contact: list[np.ndarray] = []
+        self.done: list[bool] = []
+        self.episode_id: list[int] = []
+        self.control_dt = float(control_dt)
+        self.contact_body_names = list(contact_body_names)
         self._last_saved_count = 0
         self.matrices: dict[str, list[np.ndarray]] = {
             "Keff": [],
@@ -491,7 +497,15 @@ class EffImpedanceMatrixRecorder:
         }
         self.diagnostics: dict[str, list[np.ndarray]] = {}
 
-    def append(self, result: dict[str, Any], step: int | str) -> None:
+    def append(
+        self,
+        result: dict[str, Any],
+        step: int | str,
+        joint_vel: Tensor,
+        contact: Tensor,
+        done: bool,
+        episode_id: int,
+    ) -> None:
         if not result:
             return
         matrices = _mean_eff_matrices(result)
@@ -504,6 +518,10 @@ class EffImpedanceMatrixRecorder:
 
         self.steps.append(step_int)
         self.num_points.append(int(result.get("num_points", 0)))
+        self.joint_vel.append(_to_numpy(joint_vel).reshape(-1))
+        self.contact.append(_to_numpy(contact).reshape(-1).astype(bool))
+        self.done.append(done)
+        self.episode_id.append(episode_id)
         for key, matrix in matrices.items():
             self.matrices.setdefault(key, []).append(matrix.astype(np.float32, copy=False))
         diagnostics = effective_impedance_matrix_diagnostics(matrices)
@@ -517,6 +535,12 @@ class EffImpedanceMatrixRecorder:
         payload: dict[str, np.ndarray] = {
             "steps": np.asarray(self.steps, dtype=np.int64),
             "num_points": np.asarray(self.num_points, dtype=np.int64),
+            "joint_vel": np.stack(self.joint_vel, axis=0).astype(np.float32, copy=False),
+            "contact": np.stack(self.contact, axis=0).astype(bool, copy=False),
+            "done": np.asarray(self.done, dtype=bool),
+            "episode_id": np.asarray(self.episode_id, dtype=np.int64),
+            "control_dt": np.asarray(self.control_dt, dtype=np.float32),
+            "contact_body_names": np.asarray(self.contact_body_names),
         }
         for key, values in self.matrices.items():
             if len(values) == len(self.steps):
@@ -548,6 +572,8 @@ class EffImpedancePlayReporter:
         output_dir: Path | None = None,
         cfg: EffImpedancePlayConfig | None = None,
     ) -> None:
+        from active_adaptation.envs.utils import find_sensor_bodies
+
         self.policy = policy
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.output_path = (
@@ -557,8 +583,26 @@ class EffImpedancePlayReporter:
         )
         self.cfg = cfg or EffImpedancePlayConfig()
         self.viewer = EffImpedanceMatrixViewer() if self.cfg.show_viewer else None
-        self.recorder = EffImpedanceMatrixRecorder() if self.cfg.record_npz else None
         self._configure_policy()
+        action_managers = self.policy._eff_impedance_action_managers
+        self.env = action_managers[0].env
+        assert self.env.num_envs == 1, (
+            "eff_impedance_play requires task.num_envs=1 for aligned diagnostics"
+        )
+        self.action_managers = action_managers
+        self.contact_sensor = self.env.scene.sensors["contact_forces"]
+        foot_ids, contact_body_names = find_sensor_bodies(
+            action_managers[0].asset,
+            self.contact_sensor,
+            ".*_foot",
+        )
+        self.foot_ids = torch.as_tensor(foot_ids, device=self.env.device)
+        self.recorder = (
+            EffImpedanceMatrixRecorder(self.env.step_dt, contact_body_names)
+            if self.cfg.record_npz
+            else None
+        )
+        self.env._update_callbacks.append(self._capture_state)
 
     def _configure_policy(self) -> None:
         if self.cfg.sample_mode not in {"latest", "window"}:
@@ -575,10 +619,29 @@ class EffImpedancePlayReporter:
         if self.cfg.max_points > 0:
             self.policy.eff_impedance_probe.cfg.max_points = self.cfg.max_points
 
-    def sample(self, tensordict: TensorDictBase) -> None:
+    def _capture_state(self) -> None:
+        self._joint_vel = torch.cat(
+            [
+                manager.asset.data.joint_vel[:, manager.joint_ids]
+                for manager in self.action_managers
+            ],
+            dim=-1,
+        ).detach().cpu()
+        self._contact = (
+            self.contact_sensor.data.current_contact_time[:, self.foot_ids] > 0.0
+        ).detach().cpu()
+
+    def sample(
+        self,
+        tensordict: TensorDictBase,
+        done: Tensor,
+        episode_id: Tensor,
+    ) -> None:
         if self.cfg.sample_mode == "latest":
             self.policy.eff_impedance_probe.reset()
         self.policy.sample_eff_impedance_points(tensordict)
+        self._done = bool(done.reshape(-1)[0].item())
+        self._episode_id = int(episode_id.reshape(-1)[0].item())
 
     def maybe_report(self, step: int) -> None:
         if self.cfg.update_interval <= 0 or step % self.cfg.update_interval != 0:
@@ -594,7 +657,14 @@ class EffImpedancePlayReporter:
             self.viewer.update(result, step)
         if self.recorder is not None:
             before = len(self.recorder.steps)
-            self.recorder.append(result, step)
+            self.recorder.append(
+                result,
+                step,
+                self._joint_vel[0],
+                self._contact[0],
+                self._done,
+                self._episode_id,
+            )
             if (
                 self.output_path is not None
                 and len(self.recorder.steps) > before

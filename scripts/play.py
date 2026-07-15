@@ -182,7 +182,12 @@ def main(cfg: PlayConfig):
                     carry = rollout_policy(carry)
                     td, carry = env.step_and_maybe_reset(carry)
                     if eff_impedance_reporter is not None:
-                        eff_impedance_reporter.sample(carry)
+                        next_td = td["next"]
+                        eff_impedance_reporter.sample(
+                            next_td,
+                            next_td["done"],
+                            next_td["episode_id"],
+                        )
                     episode_stats.add(td)
 
                     if record_enabled:
