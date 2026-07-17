@@ -1,4 +1,4 @@
-"""Isaac-only locomotion command with an interactive vertical support sling."""
+"""Isaac-only locomotion command with an interactive four-point support sling."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import math
 import torch
 from typing_extensions import override
 
+from active_adaptation.utils.math import quat_rotate
+
 from .locomotion import Twist
 
 
 class InteractiveTwist(Twist):
-    """Add a keyboard-controlled vertical spring sling to ``Twist`` teleoperation."""
+    """Add a keyboard-controlled four-point spring sling to ``Twist`` teleoperation."""
 
     supported_backends = ("isaac",)
 
@@ -24,6 +26,7 @@ class InteractiveTwist(Twist):
         sling_frequency_hz: float = 1.5,
         sling_damping_ratio: float = 0.7,
         sling_max_force_weight_ratio: float = 3.0,
+        sling_half_extents: tuple[float, float, float] = (0.25, 0.14, 0.075),
         mouse_grab_force: float = 1.0,
         mouse_push_acceleration: float = 100.0,
         **kwargs,
@@ -35,6 +38,7 @@ class InteractiveTwist(Twist):
         self.sling_frequency_hz = sling_frequency_hz
         self.sling_damping_ratio = sling_damping_ratio
         self.sling_max_force_weight_ratio = sling_max_force_weight_ratio
+        self.sling_half_extents = sling_half_extents
         self.mouse_grab_force = mouse_grab_force
         self.mouse_push_acceleration = mouse_push_acceleration
 
@@ -61,8 +65,24 @@ class InteractiveTwist(Twist):
         self._spring_stiffness = torch.zeros(1, device=self.device)
         self._spring_damping = torch.zeros(1, device=self.device)
         self._max_sling_force = torch.zeros(1, device=self.device)
+        half_x, half_y, half_z = self.sling_half_extents
+        self._sling_corner_offsets_b = torch.tensor(
+            [
+                [
+                    [half_x, half_y, half_z],
+                    [half_x, -half_y, half_z],
+                    [-half_x, half_y, half_z],
+                    [-half_x, -half_y, half_z],
+                ]
+            ],
+            device=self.device,
+        )
+        self._sling_corner_offsets_w = torch.zeros(1, 4, 3, device=self.device)
+        self._sling_corner_pos_w = torch.zeros(1, 4, 3, device=self.device)
+        self._sling_target_pos_w = torch.zeros(1, 4, 3, device=self.device)
+        self._sling_corner_forces_w = torch.zeros(1, 4, 3, device=self.device)
         self._sling_force_w = torch.zeros(1, 1, 3, device=self.device)
-        self._zero_torque_w = torch.zeros_like(self._sling_force_w)
+        self._sling_torque_w = torch.zeros_like(self._sling_force_w)
 
         import carb.settings
         import omni.physx.bindings._physx as physx_bindings
@@ -79,6 +99,9 @@ class InteractiveTwist(Twist):
         super().reset(env_ids)
         self.sling_enabled = False
         self._h_pressed = self.keyboard_manager.key_pressed["H"]
+        self._sling_corner_forces_w.zero_()
+        self._sling_force_w.zero_()
+        self._sling_torque_w.zero_()
 
         self._total_mass.copy_(self.asset.root_physx_view.get_masses()[0].sum())
         omega = 2.0 * math.pi * self.sling_frequency_hz
@@ -97,12 +120,15 @@ class InteractiveTwist(Twist):
         if h_pressed and not self._h_pressed:
             self.sling_enabled = not self.sling_enabled
             if self.sling_enabled:
-                height = self.asset.data.body_com_pos_w[0, self.sling_body_id, 2]
+                height = self.asset.data.body_link_pos_w[0, self.sling_body_id, 2]
                 self._sling_reference_height.copy_(height)
                 self._sling_target_height.copy_(height)
         self._h_pressed = h_pressed
 
         if not self.sling_enabled:
+            self._sling_corner_forces_w.zero_()
+            self._sling_force_w.zero_()
+            self._sling_torque_w.zero_()
             return
 
         height_direction = float(keys["UP"]) - float(keys["DOWN"])
@@ -114,22 +140,54 @@ class InteractiveTwist(Twist):
             self._sling_reference_height + self.sling_height_range,
         )
 
-        body_height = self.asset.data.body_com_pos_w[0, self.sling_body_id, 2]
-        body_vertical_velocity = self.asset.data.body_com_lin_vel_w[
-            0, self.sling_body_id, 2
-        ]
-        force_z = (
-            self._total_mass * 9.81
-            + self._spring_stiffness * (self._sling_target_height - body_height)
-            - self._spring_damping * body_vertical_velocity
-        ).clamp_min_(0.0)
-        force_z = torch.minimum(force_z, self._max_sling_force)
+        body_pos_w = self.asset.data.body_link_pos_w[:, self.sling_body_id]
+        body_quat_w = self.asset.data.body_link_quat_w[:, self.sling_body_id]
+        body_lin_vel_w = self.asset.data.body_link_lin_vel_w[:, self.sling_body_id]
+        body_ang_vel_w = self.asset.data.body_link_ang_vel_w[:, self.sling_body_id]
+        self._sling_corner_offsets_w.copy_(
+            quat_rotate(
+                body_quat_w[:, None].expand(-1, 4, -1),
+                self._sling_corner_offsets_b,
+            )
+        )
+        self._sling_corner_pos_w.copy_(
+            body_pos_w[:, None] + self._sling_corner_offsets_w
+        )
+        corner_vel_w = body_lin_vel_w[:, None] + torch.linalg.cross(
+            body_ang_vel_w[:, None].expand(-1, 4, -1),
+            self._sling_corner_offsets_w,
+            dim=-1,
+        )
+        self._sling_target_pos_w.copy_(self._sling_corner_pos_w)
+        target_corner_height = (
+            self._sling_target_height + self.sling_half_extents[2]
+        )
+        self._sling_target_pos_w[..., 2] = target_corner_height[:, None]
 
-        self._sling_force_w.zero_()
-        self._sling_force_w[0, 0, 2] = force_z[0]
+        force_z = 0.25 * (
+            self._total_mass[:, None] * 9.81
+            + self._spring_stiffness[:, None]
+            * (target_corner_height[:, None] - self._sling_corner_pos_w[..., 2])
+            - self._spring_damping[:, None] * corner_vel_w[..., 2]
+        )
+        force_z.clamp_min_(0.0)
+        force_z = torch.minimum(force_z, 0.25 * self._max_sling_force[:, None])
+
+        self._sling_corner_forces_w.zero_()
+        self._sling_corner_forces_w[..., 2] = force_z
+        self._sling_force_w.copy_(
+            self._sling_corner_forces_w.sum(dim=1, keepdim=True)
+        )
+        self._sling_torque_w.copy_(
+            torch.linalg.cross(
+                self._sling_corner_offsets_w,
+                self._sling_corner_forces_w,
+                dim=-1,
+            ).sum(dim=1, keepdim=True)
+        )
         self.asset.instantaneous_wrench_composer.set_forces_and_torques(
             forces=self._sling_force_w,
-            torques=self._zero_torque_w,
+            torques=self._sling_torque_w,
             body_ids=[self.sling_body_id],
             is_global=True,
         )
@@ -140,18 +198,21 @@ class InteractiveTwist(Twist):
         if not self.sling_enabled:
             return
 
-        body_pos = self.asset.data.body_com_pos_w[:, self.sling_body_id]
-        target_pos = body_pos.clone()
-        target_pos[:, 2] = self._sling_target_height
+        corner_pos = self._sling_corner_pos_w.reshape(-1, 3)
+        target_pos = self._sling_target_pos_w.reshape(-1, 3)
         self.env.debug_draw.vector(
-            body_pos,
-            target_pos - body_pos,
+            corner_pos,
+            target_pos - corner_pos,
             color=(0.2, 1.0, 0.2, 1.0),
         )
-        self.env.debug_draw.point(target_pos, color=(0.2, 1.0, 0.2, 1.0), size=12.0)
+        self.env.debug_draw.point(
+            target_pos, color=(0.2, 1.0, 0.2, 1.0), size=12.0
+        )
         self.env.debug_draw.vector(
-            body_pos,
-            0.2 * self._sling_force_w[:, 0] / (self._total_mass * 9.81),
+            corner_pos,
+            0.2
+            * self._sling_corner_forces_w.reshape(-1, 3)
+            / (0.25 * self._total_mass * 9.81),
             color=(1.0, 0.5, 0.1, 1.0),
         )
 
