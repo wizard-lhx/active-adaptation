@@ -1,4 +1,4 @@
-"""Run the existing policy player with interactive push and sling controls."""
+"""Run clamp-capable policy play with interactive push and sling controls."""
 
 from __future__ import annotations
 
@@ -24,10 +24,16 @@ def main() -> None:
         "  W / A / S / D     locomotion command\n"
         "  LEFT / RIGHT      yaw command\n"
         "  SHIFT + left drag spring-grab any rigid body (CPU PhysX)\n"
-        "  SHIFT + double click push the pointed rigid body"
+        "  SHIFT + double click push the pointed rigid body\n"
+        "Effective-damping clamp (CLI):\n"
+        "  off       algo.eff_impedance.clamp.enabled=false (default)\n"
+        "  baseline  algo.eff_impedance.clamp.enabled=true "
+        "algo.eff_impedance.clamp.baseline_mode=true\n"
+        "  active    algo.eff_impedance.clamp.enabled=true "
+        "algo.eff_impedance.clamp.baseline_mode=false"
     )
 
-    from play import main as play_main
+    from play_clamp import main as play_main
 
     play_main()
 
