@@ -11,7 +11,7 @@ optimizer steps.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,8 @@ from tensordict import TensorDict, TensorDictBase
 
 from active_adaptation.learning.modules import VecNorm
 from active_adaptation.learning.ppo.common import CMD_KEY, OBS_KEY
+
+from .eff_clamp import EffClampConfig
 
 
 Tensor = torch.Tensor
@@ -48,6 +50,7 @@ class EffImpedanceConfig:
         sample_stride: Keep one operating point every ``sample_stride`` points.
         max_points: Maximum cached operating points per log window.
         log_scalars: Log scalar summaries and per-joint diagonal means.
+        clamp: Closed-loop effective damping clamp configuration.
     """
 
     enabled: bool = False
@@ -60,6 +63,7 @@ class EffImpedanceConfig:
     sample_stride: int = 1
     max_points: int = 4096
     log_scalars: bool = True
+    clamp: EffClampConfig = field(default_factory=EffClampConfig)
 
     @classmethod
     def from_any(cls, value: Any) -> "EffImpedanceConfig":
@@ -70,6 +74,7 @@ class EffImpedanceConfig:
         if value is None:
             return cls()
         data = dict(value)
+        data["clamp"] = EffClampConfig.from_any(data.get("clamp"))
         if "alpha" in data and isinstance(data["alpha"], list):
             data["alpha"] = tuple(data["alpha"])
         for key in ("q_slice", "qd_slice"):
@@ -490,8 +495,20 @@ class EffImpedanceMatrixRecorder:
             "Meff_delta": [],
         }
         self.diagnostics: dict[str, list[np.ndarray]] = {}
+        self.clamp_records: dict[str, list[np.ndarray]] = {
+            "tau_corr": [],
+            "joint_vel_substep": [],
+            "p_neg_substep": [],
+            "delta_d_eigvals": [],
+            "clamp_applied": [],
+        }
 
-    def append(self, result: dict[str, Any], step: int | str) -> None:
+    def append(
+        self,
+        result: dict[str, Any],
+        step: int | str,
+        clamp_record: dict[str, Any] | None = None,
+    ) -> None:
         if not result:
             return
         matrices = _mean_eff_matrices(result)
@@ -509,6 +526,13 @@ class EffImpedanceMatrixRecorder:
         diagnostics = effective_impedance_matrix_diagnostics(matrices)
         for key, value in diagnostics.items():
             self.diagnostics.setdefault(key, []).append(np.asarray(value[0]))
+        if clamp_record is not None:
+            for key, values in self.clamp_records.items():
+                value = clamp_record[key]
+                if torch.is_tensor(value):
+                    value = value.detach().cpu().numpy()
+                dtype = np.bool_ if key == "clamp_applied" else np.float32
+                values.append(np.asarray(value, dtype=dtype))
 
     def save(self, path: Path) -> Path | None:
         if not self.steps:
@@ -522,6 +546,9 @@ class EffImpedanceMatrixRecorder:
             if len(values) == len(self.steps):
                 payload[key] = np.stack(values, axis=0)
         for key, values in self.diagnostics.items():
+            if len(values) == len(self.steps):
+                payload[key] = np.stack(values, axis=0)
+        for key, values in self.clamp_records.items():
             if len(values) == len(self.steps):
                 payload[key] = np.stack(values, axis=0)
 
@@ -547,8 +574,10 @@ class EffImpedancePlayReporter:
         policy: Any,
         output_dir: Path | None = None,
         cfg: EffImpedancePlayConfig | None = None,
+        clamp_controller: Any | None = None,
     ) -> None:
         self.policy = policy
+        self.clamp_controller = clamp_controller
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.output_path = (
             self.output_dir / "eff_impedance_timeseries.npz"
@@ -581,11 +610,20 @@ class EffImpedancePlayReporter:
         self.policy.sample_eff_impedance_points(tensordict)
 
     def maybe_report(self, step: int) -> None:
+        clamp_record = (
+            self.clamp_controller.pop_step_record()
+            if self.clamp_controller is not None
+            else None
+        )
         if self.cfg.update_interval <= 0 or step % self.cfg.update_interval != 0:
             return
-        self.report(step)
+        self.report(step, clamp_record)
 
-    def report(self, step: int | str) -> dict[str, Any]:
+    def report(
+        self,
+        step: int | str,
+        clamp_record: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if self.viewer is None and self.recorder is None:
             self.policy.eff_impedance_probe.reset()
             return {}
@@ -594,7 +632,7 @@ class EffImpedancePlayReporter:
             self.viewer.update(result, step)
         if self.recorder is not None:
             before = len(self.recorder.steps)
-            self.recorder.append(result, step)
+            self.recorder.append(result, step, clamp_record)
             if (
                 self.output_path is not None
                 and len(self.recorder.steps) > before
