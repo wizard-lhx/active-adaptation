@@ -485,9 +485,15 @@ def _step_to_int(step: int | str) -> int:
 class EffImpedanceMatrixRecorder:
     """In-memory time-series recorder for offline impedance visualization."""
 
-    def __init__(self, tau_limit: float, physics_dt: float) -> None:
+    def __init__(
+        self,
+        tau_limit: float,
+        physics_dt: float,
+        override_diag_c: float,
+    ) -> None:
         self.tau_limit = float(tau_limit)
         self.physics_dt = float(physics_dt)
+        self.override_diag_c = float(override_diag_c)
         self.steps: list[int] = []
         self.num_points: list[int] = []
         self._last_saved_count = 0
@@ -545,6 +551,7 @@ class EffImpedanceMatrixRecorder:
             "num_points": np.asarray(self.num_points, dtype=np.int64),
             "tau_limit": np.asarray(self.tau_limit, dtype=np.float32),
             "physics_dt": np.asarray(self.physics_dt, dtype=np.float32),
+            "override_diag_c": np.asarray(self.override_diag_c, dtype=np.float32),
         }
         for key, values in self.matrices.items():
             if len(values) == len(self.steps):
@@ -592,9 +599,14 @@ class EffImpedancePlayReporter:
         self.viewer = EffImpedanceMatrixViewer() if self.cfg.show_viewer else None
         clamp_cfg = self.policy.eff_impedance_probe.cfg.clamp
         tau_limit = float(clamp_cfg.tau_limit) if clamp_cfg.enabled else float("nan")
+        override_diag_c = float(clamp_cfg.override_diag_c) if clamp_cfg.enabled else 0.0
         physics_dt = float(self.policy._eff_impedance_action_managers[0].env.physics_dt)
         self.recorder = (
-            EffImpedanceMatrixRecorder(tau_limit=tau_limit, physics_dt=physics_dt)
+            EffImpedanceMatrixRecorder(
+                tau_limit=tau_limit,
+                physics_dt=physics_dt,
+                override_diag_c=override_diag_c,
+            )
             if self.cfg.record_npz
             else None
         )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze clamp saturation and energy accounting from a recorded NPZ rollout."""
+"""Analyze clamp saturation, energy accounting, and diagonal-damping dose response."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.signal import welch
 
 
 REQUIRED_KEYS = (
@@ -41,21 +42,31 @@ JOINT_NAMES = (
 )
 
 
-def _finite_npz_scalar(data: np.lib.npyio.NpzFile, key: str, fallback: float) -> float:
+def _npz_scalar(
+    data: np.lib.npyio.NpzFile,
+    key: str,
+    fallback: float | None,
+) -> float:
     if key not in data.files:
+        if fallback is None:
+            raise ValueError(f"NPZ key {key!r} is missing and no CLI fallback was provided")
         return float(fallback)
     value = np.asarray(data[key])
     if value.size != 1:
         raise ValueError(f"NPZ key {key!r} must be a scalar, got shape {value.shape}")
     scalar = float(value.reshape(-1)[0])
-    return scalar if np.isfinite(scalar) else float(fallback)
+    if np.isfinite(scalar):
+        return scalar
+    if fallback is None:
+        raise ValueError(f"NPZ key {key!r} is not finite and no CLI fallback was provided")
+    return float(fallback)
 
 
 def _load_rollout(
     npz_path: Path,
-    tau_limit_fallback: float,
+    tau_limit_fallback: float | None,
     physics_dt_fallback: float,
-) -> tuple[dict[str, np.ndarray], float, float]:
+) -> tuple[dict[str, np.ndarray], float, float, float]:
     with np.load(npz_path) as data:
         available = list(data.files)
         missing = [key for key in REQUIRED_KEYS if key not in data.files]
@@ -64,20 +75,21 @@ def _load_rollout(
                 f"missing required NPZ keys: {missing}; actual keys: {available}"
             )
         arrays = {key: np.asarray(data[key]).copy() for key in REQUIRED_KEYS}
-        tau_limit = _finite_npz_scalar(data, "tau_limit", tau_limit_fallback)
-        physics_dt = _finite_npz_scalar(data, "physics_dt", physics_dt_fallback)
+        tau_limit = _npz_scalar(data, "tau_limit", tau_limit_fallback)
+        physics_dt = _npz_scalar(data, "physics_dt", physics_dt_fallback)
+        override_diag_c = _npz_scalar(data, "override_diag_c", 0.0)
 
     steps = arrays["steps"]
     if steps.ndim != 1 or steps.size == 0:
         raise ValueError(f"steps must have shape (T,) with T > 0, got {steps.shape}")
-    T = steps.shape[0]
+    num_steps = steps.shape[0]
     expected_shapes = {
-        "tau_corr": (T, 4, 12),
-        "joint_vel_substep": (T, 4, 12),
-        "p_neg_substep": (T, 4),
-        "delta_d_eigvals": (T, 12),
-        "clamp_applied": (T,),
-        "steps": (T,),
+        "tau_corr": (num_steps, 4, 12),
+        "joint_vel_substep": (num_steps, 4, 12),
+        "p_neg_substep": (num_steps, 4),
+        "delta_d_eigvals": (num_steps, 12),
+        "clamp_applied": (num_steps,),
+        "steps": (num_steps,),
     }
     bad_shapes = [
         f"{key}: expected {shape}, got {arrays[key].shape}"
@@ -86,7 +98,7 @@ def _load_rollout(
     ]
     if bad_shapes:
         raise ValueError("invalid NPZ shapes: " + "; ".join(bad_shapes))
-    if T > 1 and not np.all(np.diff(steps) == 1):
+    if num_steps > 1 and not np.all(np.diff(steps) == 1):
         raise ValueError(
             "steps must be a consecutive sequence with increment 1; "
             "update_interval>1 caused holes in clamp records, so this rollout cannot be used "
@@ -96,7 +108,7 @@ def _load_rollout(
         raise ValueError(f"tau_limit must be positive, got {tau_limit}")
     if physics_dt <= 0.0:
         raise ValueError(f"physics_dt must be positive, got {physics_dt}")
-    return arrays, tau_limit, physics_dt
+    return arrays, tau_limit, physics_dt, override_diag_c
 
 
 def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
@@ -121,6 +133,14 @@ def _ratio(numerator: float, denominator: float) -> float | None:
     return float(numerator / denominator) if denominator != 0.0 else None
 
 
+def _distribution(values: np.ndarray) -> dict[str, int]:
+    unique, counts = np.unique(values, return_counts=True)
+    return {
+        str(value.item()): int(count)
+        for value, count in zip(unique, counts, strict=True)
+    }
+
+
 def _add_control_step_axis(axis: plt.Axes, physics_dt: float) -> None:
     control_dt = 4.0 * physics_dt
     secondary = axis.secondary_xaxis(
@@ -140,7 +160,13 @@ def _plot_saturation(
 ) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={"height_ratios": (2, 1)})
     max_tau = np.abs(tau_sub).max(axis=-1)
-    axes[0].plot(t_sub, max_tau, linewidth=0.8, color="tab:blue", label=r"$\max_j|\tau_{corr,j}|$")
+    axes[0].plot(
+        t_sub,
+        max_tau,
+        linewidth=0.8,
+        color="tab:blue",
+        label=r"$\max_j|\tau_{corr,j}|$",
+    )
     axes[0].axhline(tau_limit, color="tab:red", linestyle="--", label="tau limit")
     axes[0].set_ylabel("torque (Nm)")
     axes[0].set_xlabel("time (s)")
@@ -172,6 +198,8 @@ def _plot_energy_ledger(
     saturated_substep: np.ndarray,
     physics_dt: float,
     baseline_tau_zero: bool,
+    reference_power: np.ndarray,
+    reference_name: str,
 ) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13, 10))
     axes[0].plot(t_sub, np.abs(p_corr), linewidth=0.7, alpha=0.8, label=r"$|P_{corr}|$")
@@ -207,18 +235,31 @@ def _plot_energy_ledger(
             fontsize=12,
         )
     else:
-        x = p_neg[trim_mask]
+        x = reference_power[trim_mask]
         y = p_corr[trim_mask]
         sat = saturated_substep[trim_mask]
         axes[1].scatter(x[~sat], y[~sat], s=8, alpha=0.35, label="not saturated")
-        axes[1].scatter(x[sat], y[sat], s=10, alpha=0.55, color="tab:red", label="saturated")
+        axes[1].scatter(
+            x[sat],
+            y[sat],
+            s=10,
+            alpha=0.55,
+            color="tab:red",
+            label="saturated",
+        )
         line_min = min(float(x.min()), float(y.min()))
         line_max = max(float(x.max()), float(y.max()))
-        axes[1].plot([line_min, line_max], [line_min, line_max], "k--", linewidth=1.0, label="y = x")
+        axes[1].plot(
+            [line_min, line_max],
+            [line_min, line_max],
+            "k--",
+            linewidth=1.0,
+            label="y = x",
+        )
         axes[1].legend(loc="best")
-    axes[1].set_xlabel(r"$P_{neg}$ (W)")
+    axes[1].set_xlabel(f"{reference_name} (W)")
     axes[1].set_ylabel(r"$P_{corr}$ (W)")
-    axes[1].set_title("Applied versus theoretical negative-mode power after trim")
+    axes[1].set_title(f"Applied versus {reference_name} power after trim")
     axes[1].grid(alpha=0.25)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
@@ -245,6 +286,8 @@ def _write_summary(out_dir: Path, summary: dict[str, object]) -> None:
     lines = [
         f"roll_name: {summary['roll_name']}",
         f"npz_path: {summary['npz_path']}",
+        f"mode: {summary['mode']}",
+        f"override_diag_c: {_format_value(summary['override_diag_c'])}",
         f"T: {summary['T']}",
         f"duration_s: {_format_value(summary['duration_s'])}",
         f"tau_limit: {_format_value(summary['tau_limit'])}",
@@ -289,6 +332,23 @@ def _write_summary(out_dir: Path, summary: dict[str, object]) -> None:
             f"    count: {_format_value(residual['unsaturated']['count'])}",
             f"    mean: {_format_value(residual['unsaturated']['mean'])}",
             f"    std: {_format_value(residual['unsaturated']['std'])}",
+        ]
+    )
+    override_accounting = summary["override_accounting"]
+    if override_accounting is not None:
+        lines.extend(
+            [
+                "",
+                "override_accounting_unsaturated:",
+                f"  mean_abs_p_expected: {_format_value(override_accounting['mean_abs_p_expected'])}",
+                f"  ratio_corr_expected: {_format_value(override_accounting['ratio_corr_expected'])}",
+                f"  residual_mean: {_format_value(override_accounting['residual_mean'])}",
+                f"  residual_std: {_format_value(override_accounting['residual_std'])}",
+                f"  max_relative_error: {_format_value(override_accounting['max_relative_error'])}",
+            ]
+        )
+    lines.extend(
+        [
             "",
             "lam_min:",
             f"  p5: {_format_value(lam_min['p5'])}",
@@ -300,7 +360,7 @@ def _write_summary(out_dir: Path, summary: dict[str, object]) -> None:
 
 
 def analyze(args: argparse.Namespace) -> dict[str, object]:
-    arrays, tau_limit, physics_dt = _load_rollout(
+    arrays, tau_limit, physics_dt, override_diag_c = _load_rollout(
         args.npz_path,
         tau_limit_fallback=args.tau_limit,
         physics_dt_fallback=args.physics_dt,
@@ -310,36 +370,37 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
     if args.trim_start_s < 0.0:
         raise ValueError(f"trim_start_s must be non-negative, got {args.trim_start_s}")
 
-    clamp_values, clamp_counts = np.unique(arrays["clamp_applied"], return_counts=True)
-    distribution = {
-        str(value.item()): int(count)
-        for value, count in zip(clamp_values, clamp_counts, strict=True)
-    }
+    distribution = _distribution(arrays["clamp_applied"])
     print(f"clamp_applied distribution: {distribution}")
     if np.all(arrays["clamp_applied"] == 0):
         print("clamp_applied classification: baseline rollout (all 0)")
+        mode = "baseline"
     elif np.all(arrays["clamp_applied"] == 1):
         print("clamp_applied classification: clamp rollout (all 1)")
+        mode = "override_diag" if override_diag_c > 0.0 else "clamp"
     else:
         print("warning: clamp_applied contains mixed values")
+        mode = "mixed"
 
-    T = arrays["steps"].shape[0]
-    tau_sub = arrays["tau_corr"].reshape(T * 4, 12)
-    joint_vel_sub = arrays["joint_vel_substep"].reshape(T * 4, 12)
-    p_neg = arrays["p_neg_substep"].reshape(T * 4)
-    t_sub = np.arange(T * 4, dtype=np.float64) * physics_dt
-    lam_time = np.arange(T, dtype=np.float64) * 4.0 * physics_dt
+    num_steps = arrays["steps"].shape[0]
+    tau_sub = arrays["tau_corr"].reshape(num_steps * 4, 12)
+    joint_vel_sub = arrays["joint_vel_substep"].reshape(num_steps * 4, 12)
+    p_neg = arrays["p_neg_substep"].reshape(num_steps * 4)
+    t_sub = np.arange(num_steps * 4, dtype=np.float64) * physics_dt
+    lam_time = np.arange(num_steps, dtype=np.float64) * 4.0 * physics_dt
     trim_mask = t_sub >= args.trim_start_s
     trim_control_mask = lam_time >= args.trim_start_s
     if not trim_mask.any() or not trim_control_mask.any():
         raise ValueError(
-            f"trim_start_s={args.trim_start_s} removes the entire {T * 4 * physics_dt:.6g}s rollout"
+            f"trim_start_s={args.trim_start_s} removes the entire "
+            f"{num_steps * 4 * physics_dt:.6g}s rollout"
         )
 
     sat_mask = np.abs(tau_sub) >= 0.98 * tau_limit
     saturated_substep = sat_mask.any(axis=-1)
     p_corr = np.sum(tau_sub * joint_vel_sub, axis=-1)
     p_kd = -args.kd * np.sum(joint_vel_sub**2, axis=-1)
+    p_override = -override_diag_c * np.sum(joint_vel_sub**2, axis=-1)
     lam_min = arrays["delta_d_eigvals"].min(axis=-1)
 
     tau_trimmed = tau_sub[trim_mask]
@@ -356,11 +417,30 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
     mean_abs_p_neg = float(np.abs(p_neg_trimmed).mean())
     mean_abs_p_kd = float(np.abs(p_kd_trimmed).mean())
     abs_tau = np.abs(tau_trimmed).reshape(-1)
+    override_accounting = None
+    if override_diag_c > 0.0:
+        unsaturated = ~saturated_trimmed
+        applied = p_corr_trimmed[unsaturated]
+        expected = p_override[trim_mask][unsaturated]
+        relative_error = np.abs(applied - expected) / np.maximum(np.abs(applied), 1.0e-6)
+        override_accounting = {
+            "mean_abs_p_expected": float(np.abs(expected).mean()),
+            "ratio_corr_expected": _ratio(
+                float(np.abs(applied).mean()),
+                float(np.abs(expected).mean()),
+            ),
+            "residual_mean": float((applied - expected).mean()),
+            "residual_std": float((applied - expected).std()),
+            "max_relative_error": float(relative_error.max()),
+        }
+
     summary: dict[str, object] = {
         "roll_name": args.npz_path.parent.parent.name,
         "npz_path": str(args.npz_path.resolve()),
-        "T": int(T),
-        "duration_s": float(T * 4 * physics_dt),
+        "mode": mode,
+        "override_diag_c": float(override_diag_c),
+        "T": int(num_steps),
+        "duration_s": float(num_steps * 4 * physics_dt),
         "tau_limit": float(tau_limit),
         "physics_dt": float(physics_dt),
         "kd": float(args.kd),
@@ -368,7 +448,8 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
         "clamp_applied_distribution": distribution,
         "saturation": {
             "per_joint_rate": {
-                name: float(rate) for name, rate in zip(JOINT_NAMES, per_joint_rate, strict=True)
+                name: float(rate)
+                for name, rate in zip(JOINT_NAMES, per_joint_rate, strict=True)
             },
             "global_rate": float(sat_trimmed.mean()),
             "abs_tau_p50": float(np.percentile(abs_tau, 50)),
@@ -389,6 +470,7 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
             "saturated": _group_stats(residual_trimmed[saturated_trimmed]),
             "unsaturated": _group_stats(residual_trimmed[~saturated_trimmed]),
         },
+        "override_accounting": override_accounting,
         "lam_min": {
             "p5": float(np.percentile(lam_trimmed, 5)),
             "p50": float(np.percentile(lam_trimmed, 50)),
@@ -406,6 +488,8 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
         per_joint_rate,
         physics_dt,
     )
+    reference_power = p_override if override_diag_c > 0.0 else p_neg
+    reference_name = r"$P_{diag}$" if override_diag_c > 0.0 else r"$P_{neg}$"
     _plot_energy_ledger(
         out_dir / "energy_ledger.png",
         t_sub,
@@ -418,29 +502,227 @@ def analyze(args: argparse.Namespace) -> dict[str, object]:
         saturated_substep,
         physics_dt,
         baseline_tau_zero=bool(np.all(tau_sub == 0.0)),
+        reference_power=reference_power,
+        reference_name=reference_name,
     )
     _write_summary(out_dir, summary)
 
     saturation_rate = summary["saturation"]["global_rate"]
-    ratio_corr_neg = summary["energy"]["ratio_corr_neg"]
     ratio_neg_pd = summary["energy"]["ratio_neg_pd"]
-    print(f"[hint] saturation rate={100.0 * saturation_rate:.4g}% (reference threshold: 5%)")
-    print(f"[hint] ratio_corr_neg={_format_value(ratio_corr_neg)} (reference range: 0.9-1.1)")
-    print(f"[hint] ratio_neg_pd={_format_value(ratio_neg_pd)} (reference threshold: 0.05)")
+    print(
+        f"[hint] saturation rate={100.0 * saturation_rate:.4g}% "
+        "(reference threshold: 5%)"
+    )
+    if override_accounting is not None:
+        print(
+            "[hint] ratio_corr_override="
+            f"{_format_value(override_accounting['ratio_corr_expected'])} "
+            "(reference range: 0.9-1.1)"
+        )
+    else:
+        ratio_corr_neg = summary["energy"]["ratio_corr_neg"]
+        print(
+            f"[hint] ratio_corr_neg={_format_value(ratio_corr_neg)} "
+            "(reference range: 0.9-1.1)"
+        )
+    print(
+        f"[hint] ratio_neg_pd={_format_value(ratio_neg_pd)} "
+        "(reference threshold: 0.05)"
+    )
     return summary
+
+
+def _dose_record(
+    npz_path: Path,
+    trim_start_s: float,
+    tau_limit_fallback: float,
+    physics_dt_fallback: float,
+) -> dict[str, object]:
+    arrays, tau_limit, physics_dt, override_diag_c = _load_rollout(
+        npz_path,
+        tau_limit_fallback=tau_limit_fallback,
+        physics_dt_fallback=physics_dt_fallback,
+    )
+    num_steps = arrays["steps"].shape[0]
+    joint_vel = arrays["joint_vel_substep"].reshape(num_steps * 4, 12)
+    tau_corr = arrays["tau_corr"].reshape(num_steps * 4, 12)
+    time = np.arange(num_steps * 4, dtype=np.float64) * physics_dt
+    trim_mask = time >= trim_start_s
+    if not trim_mask.any():
+        raise ValueError(
+            f"trim_start_s={trim_start_s} removes the entire "
+            f"{num_steps * 4 * physics_dt:.6g}s rollout {npz_path}"
+        )
+
+    joint_vel = joint_vel[trim_mask]
+    tau_corr = tau_corr[trim_mask]
+    per_joint_rms = np.sqrt(np.mean(joint_vel**2, axis=0))
+    combined_rms = float(np.sqrt(np.mean(joint_vel**2)))
+    frequencies, psd = welch(
+        joint_vel,
+        fs=1.0 / physics_dt,
+        window="hann",
+        nperseg=min(2048, joint_vel.shape[0]),
+        detrend="constant",
+        axis=0,
+    )
+    mean_psd = psd.mean(axis=1)
+    peak_band = (frequencies >= 0.5) & (frequencies <= 25.0)
+    peak_frequency = float(frequencies[peak_band][np.argmax(mean_psd[peak_band])])
+    p_corr = np.sum(tau_corr * joint_vel, axis=-1)
+    saturation_rate = float((np.abs(tau_corr) >= 0.98 * tau_limit).mean())
+
+    return {
+        "roll_name": npz_path.parent.parent.name,
+        "npz_path": str(npz_path.resolve()),
+        "override_diag_c": float(override_diag_c),
+        "tau_limit": float(tau_limit),
+        "physics_dt": float(physics_dt),
+        "T": int(num_steps),
+        "duration_s": float(num_steps * 4 * physics_dt),
+        "trim_start_s": float(trim_start_s),
+        "joint_vel_rms": combined_rms,
+        "joint_vel_rms_per_joint": {
+            name: float(value)
+            for name, value in zip(JOINT_NAMES, per_joint_rms, strict=True)
+        },
+        "joint_vel_peak_hz": peak_frequency,
+        "mean_abs_p_corr": float(np.abs(p_corr).mean()),
+        "saturation_rate": saturation_rate,
+    }
+
+
+def _plot_dose_response(
+    out_path: Path,
+    records: list[dict[str, object]],
+) -> None:
+    doses = np.asarray([record["override_diag_c"] for record in records], dtype=float)
+    rms = np.asarray([record["joint_vel_rms"] for record in records], dtype=float)
+    peak_hz = np.asarray([record["joint_vel_peak_hz"] for record in records], dtype=float)
+    saturation = np.asarray([record["saturation_rate"] for record in records], dtype=float)
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
+    axes[0].plot(doses, rms, marker="o", linewidth=1.5, color="tab:blue")
+    for dose, value, record in zip(doses, rms, records, strict=True):
+        axes[0].annotate(
+            str(record["roll_name"]),
+            (dose, value),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+        )
+    axes[0].set_ylabel(r"joint velocity RMS (rad/s)")
+    axes[0].set_title("Suspended diagonal-damping dose response")
+    axes[0].grid(alpha=0.25)
+    saturation_axis = axes[0].twinx()
+    bar_width = 0.02 * max(float(np.ptp(doses)), 1.0)
+    saturation_axis.bar(
+        doses,
+        100.0 * saturation,
+        width=bar_width,
+        alpha=0.25,
+        color="tab:red",
+        label="saturation rate",
+    )
+    saturation_axis.set_ylabel("saturation rate (%)")
+
+    axes[1].plot(doses, peak_hz, marker="o", linewidth=1.5, color="tab:orange")
+    for dose, value, record in zip(doses, peak_hz, records, strict=True):
+        axes[1].annotate(
+            str(record["roll_name"]),
+            (dose, value),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+        )
+    axes[1].set_xlabel(r"override diagonal damping $c$ (Nms/rad)")
+    axes[1].set_ylabel("dominant joint-velocity frequency (Hz)")
+    axes[1].set_title("Mean Welch-PSD peak in 0.5-25 Hz")
+    axes[1].grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def analyze_dose(args: argparse.Namespace) -> list[dict[str, object]]:
+    if args.trim_start_s < 0.0:
+        raise ValueError(f"trim_start_s must be non-negative, got {args.trim_start_s}")
+    tau_limit_fallback = 50.0 if args.tau_limit is None else args.tau_limit
+    records = [
+        _dose_record(
+            path,
+            trim_start_s=args.trim_start_s,
+            tau_limit_fallback=tau_limit_fallback,
+            physics_dt_fallback=args.physics_dt,
+        )
+        for path in args.dose
+    ]
+    records.sort(key=lambda record: record["override_diag_c"])
+
+    out_dir = args.out_dir or args.dose[0].parent / "dose"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _plot_dose_response(out_dir / "dose_response.png", records)
+    with (out_dir / "dose_summary.json").open("w", encoding="utf-8") as file:
+        json.dump(records, file, indent=2, allow_nan=False)
+        file.write("\n")
+    return records
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("npz_path", type=Path, help="Path to eff_impedance_timeseries.npz")
-    parser.add_argument("--tau-limit", type=float, required=True, help="Fallback clamp torque limit in Nm")
-    parser.add_argument("--physics-dt", type=float, default=0.005, help="Fallback physics timestep in seconds")
-    parser.add_argument("--kd", type=float, default=2.0, help="Nominal joint damping used for P_kd")
-    parser.add_argument("--trim-start-s", type=float, default=2.0, help="Seconds excluded from scalar summaries")
-    parser.add_argument("--out-dir", type=Path, help="Output directory (default: <npz directory>/analysis)")
+    parser.add_argument(
+        "npz_path",
+        nargs="?",
+        type=Path,
+        help="Path to one eff_impedance_timeseries.npz",
+    )
+    parser.add_argument(
+        "--dose",
+        nargs="+",
+        type=Path,
+        help="Aggregate diagonal-damping dose-response NPZ files",
+    )
+    parser.add_argument(
+        "--tau-limit",
+        type=float,
+        help="Fallback clamp torque limit in Nm (required for single-roll mode)",
+    )
+    parser.add_argument(
+        "--physics-dt",
+        type=float,
+        default=0.005,
+        help="Fallback physics timestep in seconds",
+    )
+    parser.add_argument(
+        "--kd",
+        type=float,
+        default=2.0,
+        help="Nominal joint damping used for P_kd",
+    )
+    parser.add_argument(
+        "--trim-start-s",
+        type=float,
+        default=2.0,
+        help="Seconds excluded from scalar summaries",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        help="Output directory (default: <NPZ directory>/analysis or dose)",
+    )
     args = parser.parse_args()
+    if args.dose is not None and args.npz_path is not None:
+        parser.error("provide either one positional NPZ or --dose NPZ files, not both")
+    if args.dose is None and args.npz_path is None:
+        parser.error("provide one positional NPZ or --dose NPZ files")
+    if args.dose is None and args.tau_limit is None:
+        parser.error("--tau-limit is required in single-roll mode")
+
     try:
-        analyze(args)
+        if args.dose is not None:
+            analyze_dose(args)
+        else:
+            analyze(args)
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

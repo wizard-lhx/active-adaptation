@@ -16,6 +16,7 @@ class EffClampConfig:
     baseline_mode: bool = False
     d_min: float = 0.0
     tau_limit: float = 50.0
+    override_diag_c: float = 0.0
 
     @classmethod
     def from_any(cls, value: Any) -> "EffClampConfig":
@@ -61,7 +62,7 @@ class ClampController:
         self._s_eigvals = state.new_zeros((1, num_joints))
         self._s_eigvecs = torch.eye(num_joints, device=state.device, dtype=state.dtype).unsqueeze(0)
         self._delta_d_eigvals = state.new_zeros((1, num_joints))
-        self._clamp_applied = not self.cfg.baseline_mode
+        self._clamp_applied = self.cfg.override_diag_c > 0.0 or not self.cfg.baseline_mode
         self._tau_corr: list[torch.Tensor] = []
         self._joint_vel_substep: list[torch.Tensor] = []
         self._p_neg_substep: list[torch.Tensor] = []
@@ -89,9 +90,17 @@ class ClampController:
             * delta_d_eigvals.unsqueeze(-2)
         ) @ eigvecs.transpose(-2, -1)
 
-        self._delta_d_applied = (
-            torch.zeros_like(delta_d) if self.cfg.baseline_mode else delta_d
-        )
+        if self.cfg.override_diag_c > 0.0:
+            eye = torch.eye(
+                delta_d.shape[-1],
+                device=delta_d.device,
+                dtype=delta_d.dtype,
+            ).unsqueeze(0)
+            self._delta_d_applied = float(self.cfg.override_diag_c) * eye
+        else:
+            self._delta_d_applied = (
+                torch.zeros_like(delta_d) if self.cfg.baseline_mode else delta_d
+            )
         self._s_eigvals = eigvals
         self._s_eigvecs = eigvecs
         self._delta_d_eigvals = delta_d_eigvals
