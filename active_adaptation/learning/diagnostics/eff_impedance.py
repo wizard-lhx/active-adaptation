@@ -485,7 +485,9 @@ def _step_to_int(step: int | str) -> int:
 class EffImpedanceMatrixRecorder:
     """In-memory time-series recorder for offline impedance visualization."""
 
-    def __init__(self) -> None:
+    def __init__(self, tau_limit: float, physics_dt: float) -> None:
+        self.tau_limit = float(tau_limit)
+        self.physics_dt = float(physics_dt)
         self.steps: list[int] = []
         self.num_points: list[int] = []
         self._last_saved_count = 0
@@ -541,6 +543,8 @@ class EffImpedanceMatrixRecorder:
         payload: dict[str, np.ndarray] = {
             "steps": np.asarray(self.steps, dtype=np.int64),
             "num_points": np.asarray(self.num_points, dtype=np.int64),
+            "tau_limit": np.asarray(self.tau_limit, dtype=np.float32),
+            "physics_dt": np.asarray(self.physics_dt, dtype=np.float32),
         }
         for key, values in self.matrices.items():
             if len(values) == len(self.steps):
@@ -586,7 +590,14 @@ class EffImpedancePlayReporter:
         )
         self.cfg = cfg or EffImpedancePlayConfig()
         self.viewer = EffImpedanceMatrixViewer() if self.cfg.show_viewer else None
-        self.recorder = EffImpedanceMatrixRecorder() if self.cfg.record_npz else None
+        clamp_cfg = self.policy.eff_impedance_probe.cfg.clamp
+        tau_limit = float(clamp_cfg.tau_limit) if clamp_cfg.enabled else float("nan")
+        physics_dt = float(self.policy._eff_impedance_action_managers[0].env.physics_dt)
+        self.recorder = (
+            EffImpedanceMatrixRecorder(tau_limit=tau_limit, physics_dt=physics_dt)
+            if self.cfg.record_npz
+            else None
+        )
         self._configure_policy()
 
     def _configure_policy(self) -> None:
