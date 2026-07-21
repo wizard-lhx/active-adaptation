@@ -1,10 +1,4 @@
-"""ppo_symaug variant with effective-impedance evaluation metrics.
-
-This file keeps the original ``ppo_symaug`` policy and ``scripts/train_ppo.py``
-unchanged. Select it explicitly with ``algo=ppo_symaug_eff`` to add the
-read-only effective impedance diagnostics implemented in
-``learning/diagnostics/eff_impedance.py``.
-"""
+"""ppo_symaug policy with play-time effective impedance support."""
 
 from __future__ import annotations
 
@@ -13,203 +7,124 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from hydra.core.config_store import ConfigStore
-from tensordict import TensorDict
 
+from active_adaptation.learning.diagnostics.eff_config import ImpedanceConfig
+from active_adaptation.learning.diagnostics.eff_impedance import compute_impedance
 from active_adaptation.learning.ppo.common import CMD_KEY, OBS_KEY
-from active_adaptation.learning.diagnostics.eff_impedance import EffImpedanceConfig, EffImpedanceProbe
-from active_adaptation.learning.ppo.ppo_symaug import PPOConfig as PPOBaseConfig
-from active_adaptation.learning.ppo.ppo_symaug import PPOPolicy as PPOBasePolicy
+from active_adaptation.learning.ppo.ppo_symaug import PPOConfig as BaseConfig
+from active_adaptation.learning.ppo.ppo_symaug import PPOPolicy as BasePolicy
 
 if TYPE_CHECKING:
     from active_adaptation.envs.env_base import _EnvBase
 
 
 @dataclass
-class PPOEFFConfig(PPOBaseConfig):
-    """Config for the ``ppo_symaug`` policy plus read-only impedance metrics."""
-
+class PPOConfig(BaseConfig):
     _target_: str = "active_adaptation.learning.ppo.ppo_symaug_eff.PPOPolicy"
     name: str = "ppo_symaug_eff"
-    eff_impedance: EffImpedanceConfig = field(default_factory=EffImpedanceConfig)
-    eff_impedance_interval: int = 10
+    eff_impedance: ImpedanceConfig = field(default_factory=ImpedanceConfig)
 
 
-cs = ConfigStore.instance()
-cs.store("ppo_symaug_eff", node=PPOEFFConfig, group="algo")
+ConfigStore.instance().store("ppo_symaug_eff", node=PPOConfig, group="algo")
 
 
-def _config_to_dict(cfg: Any) -> dict[str, Any]:
+def _config_dict(cfg: Any) -> dict[str, Any]:
     if is_dataclass(cfg) and not isinstance(cfg, type):
         return asdict(cfg)
     return dict(cfg)
 
 
-class PPOPolicy(PPOBasePolicy):
-    """``ppo_symaug`` policy that appends effective impedance metrics to logs."""
+class PPOPolicy(BasePolicy):
+    """ppo_symaug with environment-derived impedance parameters."""
 
-    def __init__(self, cfg: PPOEFFConfig, *args, **kwargs) -> None:
-        cfg_dict = _config_to_dict(cfg)
-        eff_cfg = EffImpedanceConfig.from_any(cfg_dict.pop("eff_impedance", None))
-        interval = int(cfg_dict.pop("eff_impedance_interval", 10))
-        super().__init__(cfg_dict, *args, **kwargs)
-        self.cfg = PPOEFFConfig(**cfg_dict, eff_impedance=eff_cfg, eff_impedance_interval=interval)
-        self.eff_impedance_probe = EffImpedanceProbe(eff_cfg)
-        self._eff_impedance_interval = max(interval, 1)
-        self._eff_impedance_iter = 0
-        self._eff_impedance_action_managers = []
+    def __init__(self, cfg: PPOConfig, *args, **kwargs) -> None:
+        data = _config_dict(cfg)
+        impedance_cfg = ImpedanceConfig.from_any(data.pop("eff_impedance", None))
+        super().__init__(data, *args, **kwargs)
+        self.cfg = PPOConfig(**data, eff_impedance=impedance_cfg)
+        self.impedance_cfg = impedance_cfg
+        self._impedance_managers = []
 
     @classmethod
-    def from_env(cls, cfg: PPOEFFConfig, env: "_EnvBase", device: str):
+    def from_env(cls, cfg: PPOConfig, env: "_EnvBase", device: str):
         policy = super().from_env(cfg, env, device)
-        policy._eff_impedance_action_managers = list(policy._iter_action_managers(env.action_manager))
-        policy._configure_eff_impedance_from_env(env)
+        policy._impedance_managers = list(policy._iter_managers(env.action_manager))
+        policy._configure_impedance(env)
         return policy
 
-    def train_op(self, tensordict: TensorDict):
-        diagnostic_logs = (
-            self._compute_eff_impedance_logs(tensordict)
-            if self.eff_impedance_probe.enabled
-            else {}
-        )
-        infos = super().train_op(tensordict)
-        infos.update(diagnostic_logs)
-        return dict(sorted(infos.items()))
+    def compute_impedance(self, obs: Any) -> dict[str, torch.Tensor]:
+        kp, kd = self.impedance_gains()
+        return compute_impedance(self, obs, kp, kd, self.impedance_cfg)
 
-    def _compute_eff_impedance_logs(self, tensordict: TensorDict) -> dict[str, float]:
-        iter_idx = self._eff_impedance_iter
-        self._eff_impedance_iter += 1
-        if iter_idx % self._eff_impedance_interval != 0:
-            return {}
-        self.sample_eff_impedance_points(tensordict)
-        return self.eff_impedance_probe.compute_and_log({}, iter_idx)
+    def impedance_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
+        kp = []
+        kd = []
+        for manager in self._impedance_managers:
+            kp.append(manager.asset.data.joint_stiffness[:, manager.joint_ids])
+            kd.append(manager.asset.data.joint_damping[:, manager.joint_ids])
+        return torch.cat(kp, dim=-1), torch.cat(kd, dim=-1)
 
-    def sample_eff_impedance_points(self, tensordict: TensorDict) -> None:
-        """Cache operating points for later effective impedance computation."""
-
-        if not self.eff_impedance_probe.enabled:
-            return
-        kp, kd = self._eff_impedance_gains()
-        self.eff_impedance_probe.sample_operating_points(self, tensordict, kp, kd)
-
-    def compute_eff_impedance_matrices(self, reset: bool = True) -> dict[str, Any]:
-        """Return full effective impedance matrices from cached play/rollout points."""
-
-        return self.eff_impedance_probe.compute_matrices(reset=reset)
-
-    def _eff_impedance_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
-        kp_chunks = []
-        kd_chunks = []
-        for manager in self._eff_impedance_action_managers:
-            joint_ids = manager.joint_ids
-            if manager.action_dim != len(joint_ids):
-                raise ValueError(
-                    "effective impedance diagnostics require one action per controlled joint; "
-                    f"got {manager!r}"
-                )
-            asset_data = manager.asset.data
-            kp_chunks.append(asset_data.joint_stiffness[:, joint_ids].detach().mean(dim=0))
-            kd_chunks.append(asset_data.joint_damping[:, joint_ids].detach().mean(dim=0))
-
-        if not kp_chunks:
-            raise ValueError("could not read joint_stiffness/joint_damping for impedance diagnostics")
-        kp = torch.cat(kp_chunks, dim=-1)
-        kd = torch.cat(kd_chunks, dim=-1)
-        if kp.numel() != self.action_dim:
-            raise ValueError(
-                f"diagnostic gain dimension {kp.numel()} does not match action dim {self.action_dim}"
-            )
-        return kp, kd
-
-    def _configure_eff_impedance_from_env(self, env: "_EnvBase") -> None:
-        cfg = self.eff_impedance_probe.cfg
-        controlled_joint_ids = self._eff_impedance_joint_ids()
-        cfg.alpha = tuple(float(v) for v in self._eff_impedance_action_scaling().detach().cpu().tolist())
-        cfg.q_slice = self._infer_joint_obs_slice(env, "pos", controlled_joint_ids)
-        cfg.qd_slice = self._infer_joint_obs_slice(env, "vel", controlled_joint_ids)
-
-        cfg_dict = _config_to_dict(self.cfg)
-        cfg_dict.pop("eff_impedance", None)
-        cfg_dict.pop("eff_impedance_interval", None)
-        self.cfg = PPOEFFConfig(
-            **cfg_dict,
-            eff_impedance=cfg,
-            eff_impedance_interval=self._eff_impedance_interval,
-        )
-
-    def _eff_impedance_joint_ids(self) -> torch.Tensor:
+    def impedance_joint_ids(self) -> torch.Tensor:
         return torch.cat(
-            [
-                torch.as_tensor(manager.joint_ids, device=self.device)
-                for manager in self._eff_impedance_action_managers
-            ],
-            dim=0,
+            [torch.as_tensor(manager.joint_ids, device=self.device) for manager in self._impedance_managers]
         )
 
-    def _eff_impedance_action_scaling(self) -> torch.Tensor:
-        alpha_chunks = []
-        for manager in self._eff_impedance_action_managers:
-            alpha = torch.as_tensor(manager.action_scaling, device=self.device, dtype=torch.float32)
-            if alpha.ndim == 0:
-                alpha = alpha.expand(manager.action_dim)
-            alpha_chunks.append(alpha.reshape(-1))
-        alpha = torch.cat(alpha_chunks, dim=0)
-        if alpha.numel() != self.action_dim:
-            raise ValueError(
-                f"diagnostic action scaling dimension {alpha.numel()} does not match action dim {self.action_dim}"
-            )
-        return alpha
+    def impedance_joint_names(self) -> list[str]:
+        return [name for manager in self._impedance_managers for name in manager.joint_names]
 
-    def _infer_joint_obs_slice(
+    def _configure_impedance(self, env: "_EnvBase") -> None:
+        joint_ids = self.impedance_joint_ids()
+        self.impedance_cfg.alpha = tuple(self._action_scaling().detach().cpu().tolist())
+        self.impedance_cfg.q_slice = self._joint_obs_slice(env, "pos", joint_ids)
+        self.impedance_cfg.qd_slice = self._joint_obs_slice(env, "vel", joint_ids)
+        self.cfg.eff_impedance = self.impedance_cfg
+
+    def _action_scaling(self) -> torch.Tensor:
+        scaling = []
+        for manager in self._impedance_managers:
+            value = torch.as_tensor(manager.action_scaling, device=self.device, dtype=torch.float32)
+            scaling.append(value.expand(manager.action_dim).reshape(-1))
+        return torch.cat(scaling)
+
+    def _joint_obs_slice(
         self,
         env: "_EnvBase",
         kind: str,
-        controlled_joint_ids: torch.Tensor,
+        controlled_ids: torch.Tensor,
     ) -> tuple[int, int]:
         group = env.observation_groups[OBS_KEY]
-        actor_offset = 0
-        if CMD_KEY in env.observation_spec.keys(True, True):
-            actor_offset = env.observation_spec[CMD_KEY].shape[-1]
-
+        actor_offset = (
+            env.observation_spec[CMD_KEY].shape[-1]
+            if CMD_KEY in env.observation_spec.keys(True, True)
+            else 0
+        )
         local_offset = 0
+        names = {"pos": {"joint_pos", "joint_pos_multistep"}, "vel": {"joint_vel", "joint_vel_multistep"}}
         for obs in group.funcs.values():
             width = int(obs.compute().shape[-1])
-            class_name = type(obs).__name__
-            if self._matches_joint_obs_kind(class_name, kind):
-                joint_ids = torch.as_tensor(obs.joint_ids, device=controlled_joint_ids.device)
-                window = self._contiguous_joint_window(joint_ids, controlled_joint_ids)
+            if type(obs).__name__ in names[kind]:
+                term_ids = torch.as_tensor(obs.joint_ids, device=controlled_ids.device)
+                window = self._joint_window(term_ids, controlled_ids)
                 if window is not None:
                     start = actor_offset + local_offset + window
-                    return (start, start + controlled_joint_ids.numel())
+                    return start, start + controlled_ids.numel()
             local_offset += width
-
-        raise ValueError(f"could not infer {kind} q slice from observation group {OBS_KEY!r}")
-
-    @staticmethod
-    def _matches_joint_obs_kind(class_name: str, kind: str) -> bool:
-        if kind == "pos":
-            return class_name in {"joint_pos", "joint_pos_multistep"}
-        if kind == "vel":
-            return class_name in {"joint_vel", "joint_vel_multistep"}
-        raise ValueError(f"unknown joint observation kind {kind!r}")
+        raise ValueError(f"could not infer {kind} slice from observation group {OBS_KEY!r}")
 
     @staticmethod
-    def _contiguous_joint_window(
-        term_joint_ids: torch.Tensor,
-        controlled_joint_ids: torch.Tensor,
-    ) -> int | None:
-        term_ids = [int(v) for v in term_joint_ids.detach().cpu().tolist()]
-        controlled_ids = [int(v) for v in controlled_joint_ids.detach().cpu().tolist()]
-        width = len(controlled_ids)
-        for start in range(len(term_ids) - width + 1):
-            if term_ids[start : start + width] == controlled_ids:
+    def _joint_window(term_ids: torch.Tensor, controlled_ids: torch.Tensor) -> int | None:
+        term = term_ids.tolist()
+        controlled = controlled_ids.tolist()
+        for start in range(len(term) - len(controlled) + 1):
+            if term[start : start + len(controlled)] == controlled:
                 return start
         return None
 
     @staticmethod
-    def _iter_action_managers(action_manager):
-        managers = getattr(action_manager, "action_managers", None)
-        if managers is None:
-            yield action_manager
-            return
-        for manager in managers:
-            yield from PPOPolicy._iter_action_managers(manager)
+    def _iter_managers(manager):
+        children = getattr(manager, "action_managers", None)
+        if children is None:
+            yield manager
+        else:
+            for child in children:
+                yield from PPOPolicy._iter_managers(child)

@@ -16,7 +16,6 @@ from typing import Any, List, Optional
 from omegaconf import OmegaConf
 from hydra.conf import HydraConf, RunDir
 from hydra.core.config_store import ConfigStore
-from hydra.core.hydra_config import HydraConfig
 
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 
@@ -24,7 +23,6 @@ import active_adaptation as aa
 from active_adaptation.utils.export import export_onnx
 from active_adaptation.utils.timerfd import Timer
 from active_adaptation.utils.helpers import EpisodeStats
-from active_adaptation.learning.diagnostics.eff_impedance import EffImpedancePlayReporter
 from active_adaptation.learning.modules.vecnorm import VecNorm
 
 
@@ -51,7 +49,7 @@ class PlayTaskOverride:
 
     num_envs: int = 4
     """Number of parallel environments (kept small for interactive playback)."""
-
+    record_video: bool = "${..record_video}"
 
 @dataclass
 class PlayConfig:
@@ -65,7 +63,7 @@ class PlayConfig:
     """Run with a visible GUI window (``false``) or headless (``true``)."""
     backend: str = "isaac"
     """Simulation backend: ``isaac``, ``mujoco``, ``mjlab``, or ``motrix``."""
-    device: str = "cuda"
+    device: str = "cpu"
     """Torch device for policy inference (e.g. ``cuda``, ``cpu``)."""
     record_video: bool = False
     """Record an MP4 of the rollout (Isaac backend only)."""
@@ -82,8 +80,6 @@ class PlayConfig:
     task: PlayTaskOverride = field(default_factory=PlayTaskOverride)
     """Task overrides applied on top of the selected task config."""
     exploration_type: ExplorationType = ExplorationType.MODE
-    eff_impedance_play: bool = False
-    """Record play-time effective impedance matrices for offline visualization."""
 
 
 cs = ConfigStore.instance()
@@ -145,10 +141,6 @@ def main(cfg: PlayConfig):
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
     rollout_policy = policy.get_rollout_policy("eval").to(env.device)
-    run_dir = Path(HydraConfig.get().runtime.output_dir)
-    eff_impedance_reporter = None
-    if cfg.eff_impedance_play:
-        eff_impedance_reporter = EffImpedancePlayReporter(policy, run_dir / "eff_impedance")
     
     env.base_env.eval()
     carry = env.reset()
@@ -161,40 +153,30 @@ def main(cfg: PlayConfig):
     # KeyboardInterrupt because the recorder is a context manager that flushes
     # buffered frames on exit.
     record_enabled = bool(cfg.get("record_video", False))
-    # video_dir = FILE_PATH / "videos"
-    video_dir = run_dir / "videos"
-    if record_enabled:
-        video_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = FILE_PATH / "videos"
     time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
     video_path = video_dir / f"{cfg.task.name}-{time_str}.mp4"
     exploration_type = ExplorationType(cfg.get("exploration_type", "MODE"))
-    last_step = -1
 
     print_interval_s = 2.0
     last_print_time = time.perf_counter()
     last_print_step = -1
 
-    with env.get_recorder(video_path, enabled=record_enabled) as rec, set_exploration_type(exploration_type):
+    with env.get_recorder(video_path, enabled=record_enabled) as rec, \
+        torch.inference_mode(), set_exploration_type(exploration_type):
         try:
             for i in itertools.count():
-                last_step = i
-                with torch.inference_mode():
-                    carry = rollout_policy(carry)
-                    td, carry = env.step_and_maybe_reset(carry)
-                    if eff_impedance_reporter is not None:
-                        eff_impedance_reporter.sample(carry)
-                    episode_stats.add(td)
+                carry = rollout_policy(carry)
+                td, carry = env.step_and_maybe_reset(carry)
+                episode_stats.add(td)
 
-                    if record_enabled:
-                        rec.add_frame()
+                if record_enabled:
+                    rec.add_frame()
 
-                    if len(episode_stats) >= env.num_envs:
-                        print("Step", i)
-                        for k, v in sorted(episode_stats.pop().items(True, True)):
-                            print(k, torch.mean(v).item())
-
-                if eff_impedance_reporter is not None:
-                    eff_impedance_reporter.maybe_report(i + 1)
+                if len(episode_stats) >= env.num_envs:
+                    print("Step", i)
+                    for k, v in sorted(episode_stats.pop().items(True, True)):
+                        print(k, torch.mean(v).item())
 
                 now = time.perf_counter()
                 elapsed = now - last_print_time
@@ -208,17 +190,10 @@ def main(cfg: PlayConfig):
                 timer.sleep()
         except KeyboardInterrupt:
             print(f"Interrupted by user, video saved to: {video_path}" if record_enabled else "Interrupted by user.")
-        finally:
-            if eff_impedance_reporter is not None:
-                try:
-                    eff_impedance_reporter.report(f"final_step_{last_step + 1:06d}")
-                finally:
-                    eff_path = eff_impedance_reporter.close()
-                    if eff_path is not None:
-                        print(f"[eff_impedance] saved time-series to: {eff_path}")
-
+    
     env.close()
 
 
 if __name__ == "__main__":
     main()
+

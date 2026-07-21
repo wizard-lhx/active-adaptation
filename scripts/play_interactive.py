@@ -1,4 +1,4 @@
-"""Run clamp-capable policy play with interactive push and sling controls."""
+"""Record effective impedance with interactive push and sling controls."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def main() -> None:
         "algo.eff_impedance.clamp.baseline_mode=false"
     )
 
-    from play_clamp import main as play_main
+    from play_eff import main as play_main
 
     play_main()
 

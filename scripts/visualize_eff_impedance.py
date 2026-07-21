@@ -12,38 +12,32 @@ import numpy as np
 from matplotlib.widgets import Slider
 
 
-def _matrix_index_for_video_step(steps: np.ndarray, video_step: int) -> int | None:
-    idx = int(np.searchsorted(steps, video_step, side="right") - 1)
-    if idx < 0:
-        return None
-    return min(idx, len(steps) - 1)
-
-
-class EffImpedanceReplayViewer:
+class Viewer:
     """Matplotlib viewer with slider and held left/right navigation."""
 
     def __init__(self, video_path: Path, npz_path: Path) -> None:
         with np.load(npz_path) as data:
             self.steps = data["steps"]
-            self.num_points = data["num_points"]
             self.Keff = data["Keff"]
             self.Deff = data["Deff"]
-            self.Keff_sym_eigvals = data["Keff_sym_eigvals"]
-            self.Deff_sym_eigvals = data["Deff_sym_eigvals"]
-            self.Keff_sym_min_eig = data["Keff_sym_min_eig"]
-            self.Deff_sym_min_eig = data["Deff_sym_min_eig"]
-            self.Keff_sym_cond = data["Keff_sym_cond"]
-            self.Deff_sym_cond = data["Deff_sym_cond"]
-            self.Keff_sym_neg_count = data["Keff_sym_neg_count"]
-            self.Deff_sym_neg_count = data["Deff_sym_neg_count"]
-            self.Keff_sym_neg_frac = data["Keff_sym_neg_frac"]
-            self.Deff_sym_neg_frac = data["Deff_sym_neg_frac"]
+            self.Keff_eigvals = data["Keff_eigvals"]
+            self.Deff_eigvals = data["Deff_eigvals"]
+            self.Keff_cond = data["Keff_cond"]
+            self.Deff_cond = data["Deff_cond"]
+            self.joint_names = data["joint_names"].astype(str)
+            self.control_dt = float(data["control_dt"])
+
+        self.times = self.steps * self.control_dt
+        self.Keff_min = self.Keff_eigvals[:, 0]
+        self.Deff_min = self.Deff_eigvals[:, 0]
+        self.Keff_neg_count = (self.Keff_eigvals < 0.0).sum(axis=-1)
+        self.Deff_neg_count = (self.Deff_eigvals < 0.0).sum(axis=-1)
 
         video_meta = iio.immeta(video_path)
         self.video_fps = float(video_meta["fps"])
         self.frame_count = int(round(float(video_meta["duration"]) * float(video_meta["fps"])))
         self.video_reader = iio.imopen(video_path, "r")
-        self.current_video_step = 1
+        self.current_video_step = 0
         self.pressed_keys: set[str] = set()
         self.is_playing = False
         self.show_values = False
@@ -56,7 +50,7 @@ class EffImpedanceReplayViewer:
         self.play_timer.add_callback(self._advance_playback)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
         self.fig.canvas.mpl_connect("key_release_event", self._on_key_release)
-        self._update_video_step(1)
+        self._update_video_step(0)
 
     @lru_cache(maxsize=16)
     def _read_frame(self, frame_idx: int) -> np.ndarray:
@@ -108,6 +102,9 @@ class EffImpedanceReplayViewer:
         for axis in (keff_ax, deff_ax):
             axis.set_xlabel("state joint")
             axis.set_ylabel("action joint")
+            joint_ids = np.arange(len(self.joint_names))
+            axis.set_xticks(joint_ids, self.joint_names, rotation=90, fontsize=6)
+            axis.set_yticks(joint_ids, self.joint_names, fontsize=6)
         self.keff_ax = keff_ax
         self.deff_ax = deff_ax
         self.matrix_value_texts = {
@@ -124,7 +121,7 @@ class EffImpedanceReplayViewer:
         }
         self.matrix_value_limits = {"Keff": keff_limit, "Deff": deff_limit}
 
-        eig_ids = np.arange(self.Keff_sym_eigvals.shape[-1])
+        eig_ids = np.arange(self.Keff_eigvals.shape[-1])
         (self.keff_eig_line,) = eig_ax.plot(
             eig_ids,
             np.full_like(eig_ids, np.nan, dtype=float),
@@ -137,8 +134,8 @@ class EffImpedanceReplayViewer:
             "o-",
             label="Deff",
         )
-        eig_min = min(float(np.nanmin(self.Keff_sym_eigvals)), float(np.nanmin(self.Deff_sym_eigvals)), 0.0)
-        eig_max = max(float(np.nanmax(self.Keff_sym_eigvals)), float(np.nanmax(self.Deff_sym_eigvals)), 0.0)
+        eig_min = min(float(np.nanmin(self.Keff_eigvals)), float(np.nanmin(self.Deff_eigvals)), 0.0)
+        eig_max = max(float(np.nanmax(self.Keff_eigvals)), float(np.nanmax(self.Deff_eigvals)), 0.0)
         eig_pad = 0.05 * (eig_max - eig_min)
         eig_ax.set_xlim(eig_ids[0] - 0.5, eig_ids[-1] + 0.5)
         eig_ax.set_ylim(eig_min - eig_pad, eig_max + eig_pad)
@@ -157,22 +154,22 @@ class EffImpedanceReplayViewer:
             for idx in eig_ids
         ]
 
-        min_eig_ax.plot(self.steps, self.Keff_sym_min_eig, label="Keff")
-        min_eig_ax.plot(self.steps, self.Deff_sym_min_eig, label="Deff")
+        min_eig_ax.plot(self.times, self.Keff_min, label="Keff")
+        min_eig_ax.plot(self.times, self.Deff_min, label="Deff")
         min_eig_ax.axhline(0.0, color="black", linewidth=1.0)
-        self.min_eig_cursor = min_eig_ax.axvline(1, color="black", linestyle="--")
+        self.min_eig_cursor = min_eig_ax.axvline(0, color="black", linestyle="--")
         (self.keff_min_marker,) = min_eig_ax.plot([], [], "o")
         (self.deff_min_marker,) = min_eig_ax.plot([], [], "o")
         min_eig_ax.set_ylabel("min eigenvalue")
         min_eig_ax.legend(loc="best")
 
-        cond_ax.plot(self.steps, self.Keff_sym_cond, label="Keff")
-        cond_ax.plot(self.steps, self.Deff_sym_cond, label="Deff")
-        self.cond_cursor = cond_ax.axvline(1, color="black", linestyle="--")
+        cond_ax.plot(self.times, self.Keff_cond, label="Keff")
+        cond_ax.plot(self.times, self.Deff_cond, label="Deff")
+        self.cond_cursor = cond_ax.axvline(0, color="black", linestyle="--")
         (self.keff_cond_marker,) = cond_ax.plot([], [], "o")
         (self.deff_cond_marker,) = cond_ax.plot([], [], "o")
         cond_ax.set_yscale("log")
-        cond_ax.set_xlabel("play step")
+        cond_ax.set_xlabel("time (s)")
         cond_ax.set_ylabel("condition number")
         cond_ax.legend(loc="best")
 
@@ -180,9 +177,9 @@ class EffImpedanceReplayViewer:
         self.slider = Slider(
             slider_ax,
             "video step",
-            1,
-            self.frame_count,
-            valinit=1,
+            0,
+            self.frame_count - 1,
+            valinit=0,
             valstep=1,
         )
         self.slider.on_changed(self._on_slider)
@@ -194,51 +191,33 @@ class EffImpedanceReplayViewer:
         )
 
     def _update_video_step(self, video_step: int) -> None:
-        video_step = int(np.clip(video_step, 1, self.frame_count))
+        video_step = int(np.clip(video_step, 0, self.frame_count - 1))
         self.current_video_step = video_step
-        self.video_image.set_data(self._read_frame(video_step - 1))
-        self.min_eig_cursor.set_xdata([video_step, video_step])
-        self.cond_cursor.set_xdata([video_step, video_step])
+        self.video_image.set_data(self._read_frame(video_step))
 
-        matrix_idx = _matrix_index_for_video_step(self.steps, video_step)
-        if matrix_idx is None:
-            self.keff_image.set_data(np.zeros_like(self.Keff[0]))
-            self.deff_image.set_data(np.zeros_like(self.Deff[0]))
-            self.keff_eig_line.set_ydata(np.full(self.Keff.shape[-1], np.nan))
-            self.deff_eig_line.set_ydata(np.full(self.Deff.shape[-1], np.nan))
-            for marker in (
-                self.keff_min_marker,
-                self.deff_min_marker,
-                self.keff_cond_marker,
-                self.deff_cond_marker,
-            ):
-                marker.set_data([], [])
-            self.keff_ax.set_title("Keff | blue < 0 < red")
-            self.deff_ax.set_title("Deff | blue < 0 < red")
-            self.fig.suptitle(f"video step={video_step}")
-        else:
-            matrix_step = int(self.steps[matrix_idx])
-            self.keff_image.set_data(self.Keff[matrix_idx])
-            self.deff_image.set_data(self.Deff[matrix_idx])
-            self.keff_eig_line.set_ydata(self.Keff_sym_eigvals[matrix_idx])
-            self.deff_eig_line.set_ydata(self.Deff_sym_eigvals[matrix_idx])
-            self.keff_min_marker.set_data([matrix_step], [self.Keff_sym_min_eig[matrix_idx]])
-            self.deff_min_marker.set_data([matrix_step], [self.Deff_sym_min_eig[matrix_idx]])
-            self.keff_cond_marker.set_data([matrix_step], [self.Keff_sym_cond[matrix_idx]])
-            self.deff_cond_marker.set_data([matrix_step], [self.Deff_sym_cond[matrix_idx]])
-            self.keff_ax.set_title(f"Keff | step={matrix_step} | blue < 0 < red")
-            self.deff_ax.set_title(f"Deff | step={matrix_step} | blue < 0 < red")
-            self.fig.suptitle(
-                f"video step={video_step} | matrix step={matrix_step} | n={int(self.num_points[matrix_idx])}\n"
-                f"K: min eig={self.Keff_sym_min_eig[matrix_idx]:.5g}, "
-                f"cond={self.Keff_sym_cond[matrix_idx]:.5g}, "
-                f"negative={int(self.Keff_sym_neg_count[matrix_idx])} "
-                f"({self.Keff_sym_neg_frac[matrix_idx]:.1%}) | "
-                f"D: min eig={self.Deff_sym_min_eig[matrix_idx]:.5g}, "
-                f"cond={self.Deff_sym_cond[matrix_idx]:.5g}, "
-                f"negative={int(self.Deff_sym_neg_count[matrix_idx])} "
-                f"({self.Deff_sym_neg_frac[matrix_idx]:.1%})"
-            )
+        matrix_idx = min(video_step, len(self.steps) - 1)
+        matrix_step = int(self.steps[matrix_idx])
+        matrix_time = float(self.times[matrix_idx])
+        self.min_eig_cursor.set_xdata([matrix_time, matrix_time])
+        self.cond_cursor.set_xdata([matrix_time, matrix_time])
+        self.keff_image.set_data(self.Keff[matrix_idx])
+        self.deff_image.set_data(self.Deff[matrix_idx])
+        self.keff_eig_line.set_ydata(self.Keff_eigvals[matrix_idx])
+        self.deff_eig_line.set_ydata(self.Deff_eigvals[matrix_idx])
+        self.keff_min_marker.set_data([matrix_time], [self.Keff_min[matrix_idx]])
+        self.deff_min_marker.set_data([matrix_time], [self.Deff_min[matrix_idx]])
+        self.keff_cond_marker.set_data([matrix_time], [self.Keff_cond[matrix_idx]])
+        self.deff_cond_marker.set_data([matrix_time], [self.Deff_cond[matrix_idx]])
+        self.keff_ax.set_title(f"Keff | step={matrix_step} | blue < 0 < red")
+        self.deff_ax.set_title(f"Deff | step={matrix_step} | blue < 0 < red")
+        joints = len(self.joint_names)
+        self.fig.suptitle(
+            f"video step={video_step} | matrix step={matrix_step} | t={matrix_time:.3f} s\n"
+            f"K: min eig={self.Keff_min[matrix_idx]:.5g}, cond={self.Keff_cond[matrix_idx]:.5g}, "
+            f"negative={int(self.Keff_neg_count[matrix_idx])} ({self.Keff_neg_count[matrix_idx] / joints:.1%}) | "
+            f"D: min eig={self.Deff_min[matrix_idx]:.5g}, cond={self.Deff_cond[matrix_idx]:.5g}, "
+            f"negative={int(self.Deff_neg_count[matrix_idx])} ({self.Deff_neg_count[matrix_idx] / joints:.1%})"
+        )
         self._update_value_annotations(matrix_idx)
 
         if int(self.slider.val) != video_step:
@@ -261,7 +240,7 @@ class EffImpedanceReplayViewer:
             return
         if key == "v":
             self.show_values = not self.show_values
-            matrix_idx = _matrix_index_for_video_step(self.steps, self.current_video_step)
+            matrix_idx = min(self.current_video_step, len(self.steps) - 1)
             self._update_value_annotations(matrix_idx)
             self._update_controls_text()
             self.fig.canvas.draw_idle()
@@ -285,11 +264,11 @@ class EffImpedanceReplayViewer:
             self._update_video_step(self.current_video_step - 1)
 
     def _advance_playback(self) -> None:
-        if self.current_video_step >= self.frame_count:
+        if self.current_video_step >= self.frame_count - 1:
             self._set_playing(False)
             return
         self._update_video_step(self.current_video_step + 1)
-        if self.current_video_step >= self.frame_count:
+        if self.current_video_step >= self.frame_count - 1:
             self._set_playing(False)
 
     def _set_playing(self, playing: bool) -> None:
@@ -310,8 +289,8 @@ class EffImpedanceReplayViewer:
             f"{playback} | SPACE: play/pause | hold LEFT/RIGHT: play steps | V: values {values}"
         )
 
-    def _update_value_annotations(self, matrix_idx: int | None) -> None:
-        visible = self.show_values and matrix_idx is not None
+    def _update_value_annotations(self, matrix_idx: int) -> None:
+        visible = self.show_values
         matrices = {"Keff": self.Keff, "Deff": self.Deff}
         for key, texts in self.matrix_value_texts.items():
             values = matrices[key][matrix_idx].reshape(-1) if visible else ()
@@ -324,8 +303,8 @@ class EffImpedanceReplayViewer:
                     text.set_color("white" if abs(value) > 0.55 * limit else "black")
 
         eig_groups = (
-            (self.keff_eig_texts, self.Keff_sym_eigvals),
-            (self.deff_eig_texts, self.Deff_sym_eigvals),
+            (self.keff_eig_texts, self.Keff_eigvals),
+            (self.deff_eig_texts, self.Deff_eigvals),
         )
         for texts, eigvals in eig_groups:
             values = eigvals[matrix_idx] if visible else ()
@@ -352,7 +331,7 @@ def main() -> None:
     parser.add_argument("--npz", type=Path, required=True, help="Recorded eff_impedance_timeseries.npz path.")
     args = parser.parse_args()
 
-    EffImpedanceReplayViewer(video_path=args.video, npz_path=args.npz).show()
+    Viewer(video_path=args.video, npz_path=args.npz).show()
 
 
 if __name__ == "__main__":
