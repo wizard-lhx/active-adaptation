@@ -83,7 +83,7 @@ def make_isaaclab_cfg(self_collisions: bool = False):
     )
     asset_cfg = ArticulationCfg(
         spawn=sim_utils.UsdFileCfg(
-            usd_path=ROBOT_MODEL_DIR / "b2" / "b2_flattened.usda",
+            usd_path=str(ROBOT_MODEL_DIR / "b2" / "b2_flattened.usda"),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
                 retain_accelerations=False,
@@ -102,6 +102,7 @@ def make_isaaclab_cfg(self_collisions: bool = False):
                 contact_offset=0.02,
                 rest_offset=0.0,
             ),
+            activate_contact_sensors=True,
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=INIT_POS,
