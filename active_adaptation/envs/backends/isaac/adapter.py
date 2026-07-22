@@ -197,17 +197,7 @@ class IsaacSceneAdapter(SceneAdapter):
 
     @override
     def get_spawn_origins(self, env_ids: torch.Tensor) -> torch.Tensor:
-        if self._scene.terrain.terrain_origins is None:
-            return self.env_origins[env_ids]
-
-        terrain_origins = self._scene.terrain.terrain_origins.reshape(-1, 3)
-        idx = torch.randint(
-            0,
-            terrain_origins.shape[0],
-            (len(env_ids),),
-            device=env_ids.device,
-        )
-        return terrain_origins[idx]
+        return self.env_origins[env_ids]
 
 
 __all__ = [

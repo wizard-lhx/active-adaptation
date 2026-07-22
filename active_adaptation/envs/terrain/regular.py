@@ -128,6 +128,17 @@ ROUGH_MEDIUM = TerrainGeneratorCfg(
     },
 )
 
+ROUGH_MEDIUM_PLAY = ROUGH_MEDIUM.replace(
+    border_width=10.0,
+    num_rows=3,
+    num_cols=5,
+    curriculum=True,
+    sub_terrains={
+        name: terrain.replace(proportion=0.2)
+        for name, terrain in ROUGH_MEDIUM.sub_terrains.items()
+    },
+)
+
 ROUGH_EASY = TerrainGeneratorCfg(
     seed=0,
     size=(8.0, 8.0),
@@ -182,6 +193,7 @@ STAIRS = TerrainGeneratorCfg(
     vertical_scale=0.005,
     slope_threshold=0.75,
     use_cache=False,
+    curriculum=True,
     sub_terrains={
         "flat": MeshPlaneTerrainCfg(
             proportion=0.10,
@@ -402,14 +414,23 @@ ROUGH_TERRAIN_BASE_CFG = TerrainImporterCfg(
     debug_vis=False,
 )
 
+ROUGH_CURRICULUM_TERRAIN_CFG = ROUGH_TERRAIN_BASE_CFG.replace(
+    max_init_terrain_level=0,
+    visual_material=sim_utils.PreviewSurfaceCfg(
+        diffuse_color=(0.35, 0.35, 0.35),
+        roughness=0.8,
+    ),
+)
+
 from active_adaptation.registry import Registry
 
 registry = Registry.instance()
 registry.register("terrain", "medium", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=ROUGH_MEDIUM))
-registry.register("terrain", "medium_curriculum", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=ROUGH_MEDIUM.replace(curriculum=True)))
+registry.register("terrain", "medium_curriculum", ROUGH_CURRICULUM_TERRAIN_CFG.replace(terrain_generator=ROUGH_MEDIUM.replace(curriculum=True)))
+registry.register("terrain", "medium_play", ROUGH_CURRICULUM_TERRAIN_CFG.replace(terrain_generator=ROUGH_MEDIUM_PLAY))
 registry.register("terrain", "easy", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=ROUGH_EASY))
 registry.register("terrain", "hard_curriculum", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=ROUGH_HARD))
 registry.register("terrain", "plane", PLANE_TERRAIN_CFG)
-registry.register("terrain", "stairs", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=STAIRS))
+registry.register("terrain", "stairs", ROUGH_CURRICULUM_TERRAIN_CFG.replace(terrain_generator=STAIRS))
 registry.register("terrain", "stairs_test", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=STAIRS_TEST))
 registry.register("terrain", "stairs_easy", ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=STAIRS_EASY))

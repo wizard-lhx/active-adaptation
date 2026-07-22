@@ -1,0 +1,11 @@
+# @package task
+name: B2LocoRoughPlay
+
+defaults:
+  - /task/B2/B2LocoRough@_here_
+  - _self_
+
+terrain: medium_play
+
+command:
+  curriculum: false

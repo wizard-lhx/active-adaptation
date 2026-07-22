@@ -7,6 +7,9 @@ defaults:
 
 terrain: stairs
 
+command:
+  curriculum: true
+
 observation:
   extero:
     height_scan:
