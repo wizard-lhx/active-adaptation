@@ -370,7 +370,7 @@ class Twist(CommandV2):
             if km.get(key, False):
                 self._teleop_base_height.copy_(height)
 
-        linvel = (self._teleop_linvel * scale).unsqueeze(0).expand(self.num_envs, -1)
+        linvel = (self._teleop_linvel * scale).unsqueeze(0).expand(self.num_envs, -1).clone()
         linvel[:, 2] = 0.0
         max_speed = max(0.0, 2.5 - self._teleop_yaw.abs().item())
         self.cmd_linvel_b = clamp_norm(linvel, max=max_speed)
