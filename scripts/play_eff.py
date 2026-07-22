@@ -158,7 +158,7 @@ def main(cfg: PlayConfig):
                     video.add_frame()
                 with torch.inference_mode():
                     td, carry = env.step_and_maybe_reset(carry)
-                    episode_stats.add(td)
+                episode_stats.add(td)
 
                 clamp_record = controller.step_record() if controller else None
                 recorder.record(step, impedance, clamp_record)
