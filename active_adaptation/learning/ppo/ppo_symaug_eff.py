@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -20,28 +20,24 @@ if TYPE_CHECKING:
 
 @dataclass
 class PPOConfig(BaseConfig):
-    _target_: str = "active_adaptation.learning.ppo.ppo_symaug_eff.PPOPolicy"
+    _target_: str = "active_adaptation.learning.ppo.ppo_symaug_eff.PPOConfig"
     name: str = "ppo_symaug_eff"
     eff_impedance: ImpedanceConfig = field(default_factory=ImpedanceConfig)
 
+    def get_class(self):
+        return PPOPolicy
+
 
 ConfigStore.instance().store("ppo_symaug_eff", node=PPOConfig, group="algo")
-
-
-def _config_dict(cfg: Any) -> dict[str, Any]:
-    if is_dataclass(cfg) and not isinstance(cfg, type):
-        return asdict(cfg)
-    return dict(cfg)
 
 
 class PPOPolicy(BasePolicy):
     """ppo_symaug with environment-derived impedance parameters."""
 
     def __init__(self, cfg: PPOConfig, *args, **kwargs) -> None:
-        data = _config_dict(cfg)
-        impedance_cfg = ImpedanceConfig.from_any(data.pop("eff_impedance", None))
-        super().__init__(data, *args, **kwargs)
-        self.cfg = PPOConfig(**data, eff_impedance=impedance_cfg)
+        impedance_cfg = ImpedanceConfig.from_any(cfg.eff_impedance)
+        cfg.eff_impedance = impedance_cfg
+        super().__init__(cfg, *args, **kwargs)
         self.impedance_cfg = impedance_cfg
         self._impedance_managers = []
 

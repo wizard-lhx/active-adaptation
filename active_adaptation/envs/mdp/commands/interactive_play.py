@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tensordict import TensorDictBase
 from typing_extensions import override
 
 from active_adaptation.utils.math import quat_rotate
@@ -95,8 +96,8 @@ class InteractiveTwist(Twist):
         settings.set_float(physx_bindings.SETTING_MOUSE_PUSH, self.mouse_push_acceleration)
 
     @override
-    def reset(self, env_ids: torch.Tensor) -> None:
-        super().reset(env_ids)
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> None:
+        super().reset(env_ids, tensordict)
         self.sling_enabled = False
         self._h_pressed = self.keyboard_manager.key_pressed["H"]
         self._sling_corner_forces_w.zero_()

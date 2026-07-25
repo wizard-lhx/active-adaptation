@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn.functional as F
 from typing_extensions import override
-from tensordict import TensorDict
+from tensordict import TensorDict, TensorDictBase
 
 from active_adaptation.utils.math import (
     clamp_norm,
@@ -682,7 +682,7 @@ class SingleEEFLocoManip(CommandV2):
         )        
 
     @override
-    def reset(self, env_ids: torch.Tensor) -> None:
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> None:
         self.sample_commands(env_ids)
         # self._sync_world_frames()
         self.base_pos_error[env_ids] = 0.0
@@ -844,13 +844,32 @@ class eef_pos_orient_tracking(RewardV2[SingleEEFLocoManip]):
         orient_error = _eef_orient_error(self.command_manager)
         self.rew_orient = torch.exp(-orient_error.square() / self.orient_sigma)
 
-        self._base_height_rew.modifier.mul_(self.rew_pos_exp)
+        # self._base_height_rew.modifier.mul_(self.rew_pos_exp)
 
     @override
     def _compute(self) -> torch.Tensor:
         active = self.command_manager.base_pos_error < self.base_pos_error_threshold
         rew = self.rew_pos_exp * self.rew_orient + self.rew_pos_l1
         return rew.reshape(self.num_envs, 1), active.reshape(self.num_envs, 1)
+    
+    @override
+    def relabel(self, tensordict: TensorDict) -> torch.Tensor:
+        T, N = tensordict.shape[:2]
+        base_pos_error = tensordict["command_state", "base_pos_error"]
+        pos_error_norm2 = tensordict["command_state", "pos_error_norm2"]
+        pos_error_norm = tensordict["command_state", "pos_error_norm"]
+        rew_pos = torch.exp(-pos_error_norm2 / self.pos_sigma)
+        rew_pos_l1 = -0.2 * pos_error_norm
+
+        cmd_eef_rot_w = tensordict["command_state", "cmd_eef_rot_w"]
+        eef_quat_w = tensordict["command_state", "eef_quat_w"]
+        quat_error = quat_mul(cmd_eef_rot_w, quat_conjugate(eef_quat_w))
+        orient_error = quat_angle_magnitude(quat_error).reshape(T, N, 1)
+        rew_orient = torch.exp(-orient_error.square() / self.orient_sigma)
+
+        rew = rew_pos * rew_orient + rew_pos_l1
+        rew = rew * (base_pos_error < self.base_pos_error_threshold)
+        return rew.reshape(T, N, 1)
 
 
 class eef_pos_forward_tracking(RewardV2[SingleEEFLocoManip]):
@@ -889,7 +908,7 @@ class eef_pos_forward_tracking(RewardV2[SingleEEFLocoManip]):
         upward_error_norm2 = upward_diff.square().sum(dim=-1, keepdim=True)
         self.rew_upward = torch.exp(-upward_error_norm2 / self.rot_sigma)
 
-        self._base_height_rew.modifier.mul_(self.rew_pos_exp)
+        # self._base_height_rew.modifier.mul_(self.rew_pos_exp)
 
     @override
     def _compute(self) -> torch.Tensor:
@@ -924,7 +943,7 @@ class eef_pos_progress(RewardV2[SingleEEFLocoManip]):
         self.rew = torch.zeros(self.num_envs, 1, device=self.device)
 
     @override
-    def reset(self, env_ids: torch.Tensor) -> None:
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase) -> None:
         self.prev_pos_error_norm[env_ids] = self.command_manager.pos_error_norm[
             env_ids
         ]

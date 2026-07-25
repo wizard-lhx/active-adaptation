@@ -39,7 +39,7 @@ from tensordict.nn import (
 
 from hydra.core.config_store import ConfigStore
 from dataclasses import dataclass
-from typing import Union, Tuple, Optional, TYPE_CHECKING
+from typing import Union, Tuple, Optional, Any, TYPE_CHECKING
 from collections import OrderedDict
 
 if TYPE_CHECKING:
@@ -54,6 +54,7 @@ from active_adaptation.learning.modules import (
 from active_adaptation.learning.ppo.common import (
     ppo_clipped_loss,
     spo_loss,
+    resolve_clip_param,
     CMD_KEY,
     OBS_KEY,
     ACTION_KEY,
@@ -77,18 +78,24 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 @dataclass
 class PPOConfig:
-    _target_: str = "active_adaptation.learning.ppo.ppo_symaug.PPOPolicy"
+    _target_: str = "active_adaptation.learning.ppo.ppo_symaug.PPOConfig"
     name: str = "ppo_symaug"
     train_every: int = 32
     ppo_epochs: int = 4
     num_minibatches: int = 4
     lr: float = 5e-4
     desired_kl: Union[float, None] = None
-    clip_param: float = 0.2
+    # Scalar ε → [1-ε, 1+ε]. Length-2 list/tuple [eps_neg, eps_pos] →
+    # [1-eps_neg, 1+eps_pos]. Typed as Any: Hydra/OmegaConf cannot express
+    # Union[float, Sequence[float]], and YAML lists become ListConfig.
+    clip_param: Any = (0.2, 0.2)
     entropy_coef: float = 0.002
+    pred_std: bool = False
 
     clamp_reward: bool = False
-
+    
+    actor_num_units: Tuple[int, ...] = (256, 256, 256)
+    critic_num_units: Tuple[int, ...] = (512, 256, 256)
     activation: str = "Mish"
     spo: bool = False # use Simple Policy Optimization Loss
     muon: bool = False # use Muon optimizer
@@ -100,8 +107,13 @@ class PPOConfig:
 
     in_keys: Tuple[str, ...] = (CMD_KEY, OBS_KEY,) # CMD_KEY is optional. One can embed the command into the observation.
 
+    def get_class(self):
+        return PPOPolicy
+
+
 cs = ConfigStore.instance()
 cs.store("ppo_symaug", node=PPOConfig, group="algo")
+cs.store("ppo_symaug_large", node=PPOConfig(actor_num_units=(512, 512, 512), critic_num_units=(512, 512, 512)), group="algo")
 
 
 def vecnorm_sync_(module: nn.Module):
@@ -124,7 +136,7 @@ class PPOPolicy(TensorDictModuleBase):
         act_transform: Optional[SymmetryTransform] = None,
     ):
         super().__init__()
-        self.cfg = PPOConfig(**cfg)
+        self.cfg = cfg
         if self.cfg.debug and self.cfg.compile:
             raise ValueError("Debug mode and compile mode cannot be enabled together")
         self.device = device
@@ -132,7 +144,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.entropy_coef = self.cfg.entropy_coef
         self.max_grad_norm = 1.0
         self.desired_kl = self.cfg.desired_kl
-        self.clip_param = self.cfg.clip_param
+        self.clip_param = resolve_clip_param(self.cfg.clip_param)
         self.actor_loss_fn = spo_loss if self.cfg.spo else ppo_clipped_loss
         self.critic_loss_fn = nn.MSELoss(reduction="none")
         self.gae = GAE(0.99, 0.95)  
@@ -159,13 +171,13 @@ class PPOPolicy(TensorDictModuleBase):
 
         Activation = getattr(nn, self.cfg.activation)
         actor_mlp = MLP(
-            num_units=[inp_dim, 256, 256, 256],
+            num_units=[inp_dim, *self.cfg.actor_num_units],
             activation=Activation,
             first_non_muon=True,
         )
         actor_modules = [
             Mod(actor_mlp, ["_obs_normed"], ["_actor_feature"]),
-            Mod(Actor(self.action_dim), ["_actor_feature"], ["loc", "scale"])
+            Mod(Actor(self.action_dim, predict_std=self.cfg.pred_std), ["_actor_feature"], ["loc", "scale"])
         ]
         if self.cfg.aux_coef > 0.0:
             actor_modules.append(Mod(nn.LazyLinear(1), ["_actor_feature"], ["aux_pred"]))
@@ -179,7 +191,7 @@ class PPOPolicy(TensorDictModuleBase):
         ).to(self.device)
         
         critic_mlp = MLP(
-            num_units=[inp_dim, 512, 256, 256],
+            num_units=[inp_dim, *self.cfg.critic_num_units],
             activation=Activation,
             first_non_muon=True,
         )
@@ -440,8 +452,12 @@ class PPOPolicy(TensorDictModuleBase):
         ret = tensordict["ret"] # [bsize, 1]
         log_ratio = (log_probs - log_probs_data).reshape_as(adv) # [bsize, 1]
         ratio = torch.exp(log_ratio)
-        clamped = ((ratio.detach() - 1.0).abs() > self.clip_param).reshape_as(ret)
-        
+        eps_neg, eps_pos = self.clip_param
+        ratio_det = ratio.detach()
+        clamped_pos = (ratio_det > 1.0 + eps_pos)
+        clamped_neg = (ratio_det < 1.0 - eps_neg)
+        clamped = (clamped_pos | clamped_neg).reshape_as(ret)
+
         policy_loss = self.actor_loss_fn(ratio, adv, self.clip_param)
         entropy_loss = - self.entropy_coef * entropy
 
@@ -474,7 +490,6 @@ class PPOPolicy(TensorDictModuleBase):
         
         with torch.no_grad():
             explained_var = 1 - F.mse_loss(values, ret) / ret.var()
-            clipfrac = clamped.float().mean()
             approx_kl = ((ratio - 1.0) - log_ratio).mean()
             symmetry_loss = F.mse_loss(dist.mean[bsize:], self.act_transform(dist.mean[:bsize]))
             actor_feature_norm = torch.norm(tensordict["_actor_feature"], dim=-1).mean()
@@ -483,7 +498,8 @@ class PPOPolicy(TensorDictModuleBase):
             "actor/policy_loss": policy_loss.detach(),
             "actor/entropy": entropy.detach(),
             "actor/grad_norm": actor_grad_norm,
-            "actor/clamp_ratio": clipfrac,
+            "actor/clamp_pos": clamped_pos.float().mean(),
+            "actor/clamp_neg": clamped_neg.float().mean(),
             "actor/approx_kl": approx_kl,
             "actor/aux_loss": aux_loss,
             "actor/symmetry_loss": symmetry_loss.detach(),

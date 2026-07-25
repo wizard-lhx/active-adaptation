@@ -23,6 +23,11 @@ from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModuleBase
 
 import active_adaptation as aa
+from active_adaptation.pipeline_io import (
+    RUN_STATE_FILENAME,
+    get_run_state_dir,
+    write_run_state,
+)
 from active_adaptation.utils.profiling import ScopedTimer
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -93,7 +98,7 @@ class TrainConfig:
     """Log statistics every N training iterations."""
     checkpoint_interval: int = 400
     """Save a local checkpoint every N training iterations."""
-    upload_interval: int = 1600
+    upload_interval: int = 3200
     """Upload a checkpoint to WandB every N training iterations."""
 
     seed: int = 42
@@ -124,8 +129,8 @@ FILE_PATH = Path(__file__).resolve().parent
 CONFIG_PATH = FILE_PATH.parent / "cfg"
 
 
-@hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
-def main(cfg: TrainConfig):
+def run(cfg: TrainConfig) -> dict[str, str]:
+    """Train an off-policy policy and return checkpoint paths for downstream stages."""
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
@@ -135,29 +140,30 @@ def main(cfg: TrainConfig):
         f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"
     )
 
+    wandb_run = None
     if aa.is_main_process():
-        run = wandb.init(
+        wandb_run = wandb.init(
             job_type=cfg.wandb.job_type,
             project=cfg.wandb.project,
             mode=cfg.wandb.mode,
             tags=cfg.wandb.tags,
         )
-        run.config.update(OmegaConf.to_container(cfg))
-        run.config["world_size"] = aa.get_world_size()
+        wandb_run.config.update(OmegaConf.to_container(cfg))
+        wandb_run.config["world_size"] = aa.get_world_size()
 
         default_run_name = (
             f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         )
-        run_idx = run.name.split("-")[-1]
-        run.name = f"{run_idx}-{default_run_name}"
-        setproctitle(run.name)
+        run_idx = wandb_run.name.split("-")[-1]
+        wandb_run.name = f"{run_idx}-{default_run_name}"
+        setproctitle(wandb_run.name)
 
-        run_dir = Path(run.dir)
+        run_dir = Path(wandb_run.dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         cfg_save_path = run_dir / "cfg.yaml"
         OmegaConf.save(cfg, cfg_save_path)
-        run.save(str(cfg_save_path), policy="now")
-        run.save(str(run_dir / "config.yaml"), policy="now")
+        wandb_run.save(str(cfg_save_path), policy="now")
+        wandb_run.save(str(run_dir / "config.yaml"), policy="now")
 
     from active_adaptation.helpers import make_env_policy, evaluate
     from active_adaptation.utils.helpers import EpisodeStats
@@ -189,15 +195,15 @@ def main(cfg: TrainConfig):
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
     def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
-        run_dir = Path(run.dir)
+        run_dir = Path(wandb_run.dir)
         ckpt_path = run_dir / f"{checkpoint_name}.pt"
         state_dict = OrderedDict()
-        state_dict["wandb"] = {"name": run.name, "id": run.id}
+        state_dict["wandb"] = {"name": wandb_run.name, "id": wandb_run.id}
         state_dict["policy"] = policy.state_dict()
         
         torch.save(state_dict, ckpt_path)
         if upload_to_wandb:
-            run.save(str(ckpt_path), policy="now", base_path=run.dir)
+            wandb_run.save(str(ckpt_path), policy="now", base_path=wandb_run.dir)
         
         latest_link = run_dir / "checkpoint_latest.pt"
         if latest_link.exists() or latest_link.is_symlink():
@@ -218,6 +224,17 @@ def main(cfg: TrainConfig):
         stages = policy.cfg.stages
     else:
         stages = ("",)
+    
+    from tensordict import TensorDict
+    def step_and_maybe_reset(tensordict: TensorDict) -> TensorDict:
+        if tensordict.device != env.device:
+            tensordict = tensordict.to(env.device)
+        tensordict = env.step(tensordict)
+        tensordict_ = env._step_mdp(tensordict)
+        if hasattr(policy, "maybe_reset"):
+            tensordict_ = policy.maybe_reset(tensordict_)
+        tensordict_ = env.maybe_reset(tensordict_)
+        return tensordict, tensordict_
 
     for stage in stages:
         policy.on_stage_start(stage, env)
@@ -243,7 +260,8 @@ def main(cfg: TrainConfig):
                     carry = rollout_policy(carry)
 
                 with ScopedTimer("env_step") as timer:
-                    td, carry = env.step_and_maybe_reset(carry)
+                    # td, carry = env.step_and_maybe_reset(carry)
+                    td, carry = step_and_maybe_reset(carry)
                     if not private_keys:
                         private_keys = [
                             key
@@ -282,9 +300,10 @@ def main(cfg: TrainConfig):
                 )
                 info.update(env.extra)
                 info.update(env.stats_ema)  # step-wise exponential moving average of stats
-                run.log(info)
+                wandb_run.log(info)
                 print(f"Latest checkpoint: {ckpt_path}")
 
+    run_state: dict[str, str] = {}
     if aa.is_main_process():
         ckpt_path = save(policy, "checkpoint_final")
         policy_eval = policy.get_rollout_policy("eval")
@@ -292,10 +311,28 @@ def main(cfg: TrainConfig):
             env, policy_eval, render=cfg.eval_render, seed=cfg.seed
         )
         info["env_frames"] = env_frames
-        run.log(info)
+        wandb_run.log(info)
         wandb.finish()
         print(f"Final checkpoint: {ckpt_path}")
-    exit(0)
+        run_state = {
+            "checkpoint_path": ckpt_path,
+            "run_dir": str(run_dir),
+            "task": str(cfg.task.name),
+            "algo": str(cfg.algo.name),
+        }
+        if cfg.algo.get("prior_data") is not None:
+            run_state["prior_data"] = str(cfg.algo.prior_data)
+        run_state_path = write_run_state(run_state, run_dir / RUN_STATE_FILENAME)
+        print(f"Wrote run state to {run_state_path}")
+        pipeline_dir = get_run_state_dir()
+        if pipeline_dir is not None and pipeline_dir.resolve() != run_dir.resolve():
+            write_run_state(run_state, pipeline_dir / RUN_STATE_FILENAME)
+    return run_state
+
+
+@hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
+def main(cfg: TrainConfig) -> None:
+    run(cfg)
 
 
 if __name__ == "__main__":

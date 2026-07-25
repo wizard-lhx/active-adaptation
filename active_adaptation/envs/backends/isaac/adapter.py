@@ -199,6 +199,12 @@ class IsaacSceneAdapter(SceneAdapter):
     def get_spawn_origins(self, env_ids: torch.Tensor) -> torch.Tensor:
         return self.env_origins[env_ids]
 
+    def reset_to(self, state: dict, env_ids: torch.Tensor):
+        self._scene.reset_to(state, env_ids=env_ids)
+
+    def get_state(self, env_ids: torch.Tensor) -> dict:
+        return self._scene.get_state(env_ids=env_ids)
+
 
 __all__ = [
     "IsaacSimAdapter",

@@ -1,6 +1,7 @@
 import torch
 from typing import TYPE_CHECKING
 from typing_extensions import override
+from tensordict import TensorDictBase
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
@@ -36,7 +37,7 @@ class max_swing_height(RewardV2):
         )
 
     @override
-    def reset(self, env_ids):
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase):
         self.max_height[env_ids] = 0.0
 
     @override

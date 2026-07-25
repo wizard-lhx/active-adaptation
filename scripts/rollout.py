@@ -22,6 +22,11 @@ from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict import TensorDict, NonTensorData
 
 import active_adaptation as aa
+from active_adaptation.pipeline_io import (
+    RUN_STATE_FILENAME,
+    get_run_state_dir,
+    write_run_state,
+)
 from active_adaptation.utils.helpers import EpisodeStats
 from active_adaptation.rollout_io import (
     DEFAULT_ROLLOUT_ROOT,
@@ -74,6 +79,8 @@ class RolloutConfig:
     """Run the critic during rollout (adds value estimates to the policy path)."""
     checkpoint_path: Optional[str] = None
     """Path or WandB URI to a policy checkpoint; ``null`` starts from scratch."""
+    output_dir: Optional[str] = None
+    """Optional rollout output directory; defaults to ``scripts/rollout/<task>-<algo>/<timestamp>``."""
     discard_unused_obs: bool = False
     """Drop observation groups not listed in ``algo.in_keys``."""
     app: IsaacAppConfig = field(default_factory=IsaacAppConfig)
@@ -121,9 +128,9 @@ class RolloutWriter:
         *,
         episode_count: int = 0,
         episode_stats: dict[str, float] | None = None,
-    ) -> None:
+    ) -> Path | None:
         if not self._rows:
-            return
+            return None
         stacked: TensorDict = torch.stack(self._rows, dim=0)
         stacked["env_meta"] = NonTensorData(env_meta)
         print(stacked)
@@ -151,10 +158,11 @@ class RolloutWriter:
         )
         print(f"Episodes completed: {episode_count}")
         print(f"Wrote rollout metadata to {out_path.with_suffix('.json')}")
+        return out_path
 
 
-@hydra.main(config_path=str(CONFIG_PATH), config_name="rollout", version_base=None)
-def main(cfg: RolloutConfig):
+def run(cfg: RolloutConfig) -> dict[str, str]:
+    """Collect policy rollouts and return archive paths for downstream stages."""
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
@@ -190,7 +198,10 @@ def main(cfg: RolloutConfig):
     carry = env.reset()
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    writer_path = DEFAULT_ROLLOUT_ROOT / f"{cfg.task.name}-{cfg.algo.name}" / timestamp
+    if cfg.output_dir is not None:
+        writer_path = Path(cfg.output_dir).expanduser().resolve()
+    else:
+        writer_path = DEFAULT_ROLLOUT_ROOT / f"{cfg.task.name}-{cfg.algo.name}" / timestamp
     writer = RolloutWriter(
         writer_path,
         max_size=cfg.num_steps,
@@ -218,12 +229,35 @@ def main(cfg: RolloutConfig):
         if episode_count > 0:
             episode_stats_meta = episode_stats_to_metadata(episode_stats.pop())
 
-    writer.close(
-        env_meta = {"step_dt": env.step_dt, "physics_dt": env.physics_dt},
+    out_path = writer.close(
+        env_meta={"step_dt": env.step_dt, "physics_dt": env.physics_dt},
         episode_count=episode_count,
-        episode_stats=episode_stats_meta
+        episode_stats=episode_stats_meta,
     )
     env.close()
+
+    run_state: dict[str, str] = {}
+    if out_path is not None:
+        run_state = {
+            "rollout_path": str(out_path.resolve()),
+            "metadata_path": str(out_path.with_suffix(".json").resolve()),
+            "writer_dir": str(writer_path.resolve()),
+            "task": str(cfg.task.name),
+            "algo": str(cfg.algo.name),
+        }
+        if cfg.checkpoint_path is not None:
+            run_state["checkpoint_path"] = str(cfg.checkpoint_path)
+        run_state_path = write_run_state(run_state, writer_path / RUN_STATE_FILENAME)
+        print(f"Wrote run state to {run_state_path}")
+        pipeline_dir = get_run_state_dir()
+        if pipeline_dir is not None and pipeline_dir.resolve() != writer_path.resolve():
+            write_run_state(run_state, pipeline_dir / RUN_STATE_FILENAME)
+    return run_state
+
+
+@hydra.main(config_path=str(CONFIG_PATH), config_name="rollout", version_base=None)
+def main(cfg: RolloutConfig) -> None:
+    run(cfg)
 
 
 if __name__ == "__main__":

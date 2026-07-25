@@ -1,9 +1,9 @@
 from . import ppo
-from . import td3
 from . import offpolicy
+from . import imitation
 
 __all__ = [
     "ppo",
-    "td3",
     "offpolicy",
+    "imitation",
 ]

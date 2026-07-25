@@ -78,6 +78,7 @@ LEGS_DAMPING = 1.0
 def make_isaaclab_cfg(self_collisions: bool = False):
     from isaaclab.sensors import ContactSensorCfg
     from active_adaptation.assets.asset_cfg import (
+        AssetSpec,
         ArticulationCfg,
         ImplicitActuatorCfg,
         sim_utils
@@ -133,15 +134,15 @@ def make_isaaclab_cfg(self_collisions: bool = False):
             history_length=3,
         )
     }
-    return asset_cfg, sensors
+    return AssetSpec(config=asset_cfg, sensors=sensors)
 
 
 def make_mjlab_cfg(motrix: bool = False):
     import mujoco
-    from active_adaptation.assets.asset_cfg import EntityCfg
+    from active_adaptation.assets.asset_cfg import AssetSpec, EntityCfg
     from mjlab.entity import EntityArticulationInfoCfg
     from mjlab.utils.spec_config import CollisionCfg
-    from mjlab.actuator import BuiltinPositionActuatorCfg
+    from mjlab.actuator import BuiltinPdActuatorCfg
     from mjlab.sensor import ContactSensorCfg, ContactMatch
 
     mjcf_path = ROBOT_MODEL_DIR / "a2" / "a2.xml"
@@ -158,7 +159,7 @@ def make_mjlab_cfg(motrix: bool = False):
         spec_fn=spec_fn,
         articulation=EntityArticulationInfoCfg(
             actuators=(
-                BuiltinPositionActuatorCfg(
+                BuiltinPdActuatorCfg(
                     target_names_expr=(".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"),
                     effort_limit=EFFORT_LIMIT,
                     stiffness=50.0,
@@ -210,7 +211,7 @@ def make_mjlab_cfg(motrix: bool = False):
         from active_adaptation.envs.backends.motrix.mjcf import export_entity_mjcf
 
         cfg.motrix_mjcf_path_fn = lambda c: export_entity_mjcf(c, mjcf_path)
-    return cfg, sensors
+    return AssetSpec(config=cfg, sensors=sensors)
 
 
 def make_cfg(backend: Literal["isaaclab", "mjlab", "motrix"]):

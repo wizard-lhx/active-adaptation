@@ -38,6 +38,7 @@ class IsaacAppConfig:
 class PlayTaskOverride:
     num_envs: int = 1
     max_episode_length: int = 5000
+    record_video: bool = "${..record_video}"
 
 
 @dataclass

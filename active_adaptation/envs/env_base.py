@@ -5,6 +5,7 @@ from typing import Callable, Dict, Mapping, cast
 
 import numpy as np
 import torch
+import time
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import Binary, Composite, Unbounded
 from torchrl.envs import EnvBase
@@ -215,6 +216,8 @@ class _EnvBase(EnvBase, RegistryMixin):
 
         self._create_mdp_terms()
         self._setup_simulation()
+
+        self._render_enabled = False # TODO: better naming
         self._initialize_mdp_terms()
         self._build_tensor_specs()
 
@@ -238,6 +241,14 @@ class _EnvBase(EnvBase, RegistryMixin):
         else:
             raise ValueError(f"Invalid type for max episode length: {type(value)}")
         self._max_episode_length = value.to(self.device)
+    
+    @property
+    def render_enabled(self) -> bool:
+        return self._render_enabled
+    
+    @render_enabled.setter
+    def render_enabled(self, value: bool):
+        self._render_enabled = value
 
     # ---------------------------------------------------------------------
     # Initialization helpers
@@ -471,6 +482,9 @@ class _EnvBase(EnvBase, RegistryMixin):
             env_ids = env_mask.nonzero().squeeze(-1)
         else:
             env_ids = torch.arange(self.num_envs, device=self.device)
+            tensordict = TensorDict(
+                {}, batch_size=[self.num_envs], device=self.device
+            )
 
         if len(env_ids):
             num_envs = env_ids.numel()
@@ -482,11 +496,13 @@ class _EnvBase(EnvBase, RegistryMixin):
 
             self._reset_idx(env_ids)
             self.scene.reset(env_ids)
-            [callback(env_ids) for callback in self._reset_callbacks]
+            # MDP terms: reset(env_ids, tensordict) — may read/write tensordict
+            [callback(env_ids, tensordict) for callback in self._reset_callbacks]
 
         tensordict = TensorDict({}, self.num_envs, device=self.device)
         tensordict.update(self.observation_spec.zero())
         tensordict.set("episode_id", self.episode_id.clone())
+        self._last_render_time = time.perf_counter()
         return tensordict
 
     def _reset_idx(self, env_ids: torch.Tensor):
@@ -497,6 +513,16 @@ class _EnvBase(EnvBase, RegistryMixin):
             entity = self.scene[key]
             entity.write_root_state_to_sim(value, env_ids=env_ids)
         self.stats[env_ids] = 0.0
+    
+    def _should_render(self) -> bool:
+        if self.render_enabled:
+            # isaacsim requires calling `render` to render the camera images
+            return True
+        if self.sim.has_gui():
+            if time.perf_counter() - self._last_render_time > 1.0 / 30.0:
+                self._last_render_time = time.perf_counter()
+                return True
+        return False
 
     @ScopedTimer("env._step", sync=PROFILE_SYNC_TIMERS)
     def _step(self, tensordict: TensorDictBase) -> TensorDictBase:
@@ -512,16 +538,11 @@ class _EnvBase(EnvBase, RegistryMixin):
                     [callback(substep) for callback in self._pre_step_callbacks]
                     self.scene.write_data_to_sim()
                 with ScopedTimer("sim.step", sync=PROFILE_SYNC_TIMERS):
-                    self.sim.step(render=False)
+                    self.sim.step((substep == self.decimation - 1) and self._should_render())
                 with ScopedTimer("scene.update", sync=PROFILE_SYNC_TIMERS):
                     self.scene.update(self.physics_dt)
                 with ScopedTimer("post_step_callbacks", sync=False):
                     [callback(substep) for callback in self._post_step_callbacks]
-            # TODO: test if this is needed
-            # if self.backend == "mjlab":
-            #     with ScopedTimer("simulation_forward", sync=PROFILE_SYNC_TIMERS):
-            #         self.sim._sim.forward()
-
 
         self.episode_length_buf.add_(1)
         self.timestamp += 1
@@ -538,11 +559,8 @@ class _EnvBase(EnvBase, RegistryMixin):
         with ScopedTimer("command.update", sync=False):
             self.command_manager.update()
 
-        # TODO: make this backend agnostic
-        if self.sim.has_gui() and self.backend != "mjlab":
-            self.sim.render()
-        if self.backend == "mjlab":
-            self.sim.sense()
+        # if self._should_render():
+        #     self.sim.render()
     
         tensordict = self._compute_observation(tensordict)
 

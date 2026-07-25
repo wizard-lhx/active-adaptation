@@ -23,6 +23,11 @@ from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModuleBase
 
 import active_adaptation as aa
+from active_adaptation.pipeline_io import (
+    RUN_STATE_FILENAME,
+    get_run_state_dir,
+    write_run_state,
+)
 from active_adaptation.utils.profiling import ScopedTimer
 from active_adaptation.learning.ppo.ppo_base import PPOBase
 
@@ -88,6 +93,8 @@ class TrainConfig:
     total_frames: int = 150_000_000
     """Total environment frames to collect across all ranks before stopping."""
 
+    eval: bool = True
+    """Evaluate the policy after training."""
     eval_render: bool = False
     """Render the environment during the final post-training evaluation."""
     checkpoint_interval: int = 4
@@ -215,8 +222,8 @@ class BufferCollector:
         return self._buffer.copy(), carry
 
 
-@hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
-def main(cfg: TrainConfig):
+def run(cfg: TrainConfig) -> dict[str, str]:
+    """Train a PPO policy and return checkpoint paths for downstream stages."""
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
@@ -226,29 +233,44 @@ def main(cfg: TrainConfig):
         f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"
     )
 
+    wandb_run = None
+    run_name = None
     if aa.is_main_process():
-        run = wandb.init(
+        wandb_run = wandb.init(
             job_type=cfg.wandb.job_type,
             project=cfg.wandb.project,
             mode=cfg.wandb.mode,
             tags=cfg.wandb.tags,
         )
-        run.config.update(OmegaConf.to_container(cfg))
-        run.config["world_size"] = aa.get_world_size()
+        wandb_run.config.update(OmegaConf.to_container(cfg))
+        wandb_run.config["world_size"] = aa.get_world_size()
 
         default_run_name = (
             f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
         )
-        run_idx = run.name.split("-")[-1]
-        run.name = f"{run_idx}-{default_run_name}"
-        setproctitle(run.name)
+        run_idx = wandb_run.name.split("-")[-1]
+        wandb_run.name = f"{run_idx}-{default_run_name}"
+        run_name = wandb_run.name
 
-        run_dir = Path(run.dir)
+        run_dir = Path(wandb_run.dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         cfg_save_path = run_dir / "cfg.yaml"
         OmegaConf.save(cfg, cfg_save_path)
-        run.save(str(cfg_save_path), policy="now")
-        run.save(str(run_dir / "config.yaml"), policy="now")
+        wandb_run.save(str(cfg_save_path), policy="now")
+        wandb_run.save(str(run_dir / "config.yaml"), policy="now")
+
+    if aa.is_distributed():
+        import torch.distributed as dist
+
+        name_list = [run_name]
+        dist.broadcast_object_list(name_list, src=0)
+        run_name = name_list[0]
+
+    if run_name is not None:
+        if aa.is_main_process():
+            setproctitle(run_name)
+        else:
+            setproctitle(f"{run_name}-rank{aa.get_local_rank()}")
 
     from active_adaptation.helpers import make_env_policy, evaluate
     from active_adaptation.utils.helpers import EpisodeStats
@@ -284,15 +306,15 @@ def main(cfg: TrainConfig):
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
     def save(policy, checkpoint_name: str, *, upload_to_wandb: bool = True):
-        run_dir = Path(run.dir)
+        run_dir = Path(wandb_run.dir)
         ckpt_path = run_dir / f"{checkpoint_name}.pt"
         state_dict = OrderedDict()
-        state_dict["wandb"] = {"name": run.name, "id": run.id}
+        state_dict["wandb"] = {"name": wandb_run.name, "id": wandb_run.id}
         state_dict["policy"] = policy.state_dict()
         
         torch.save(state_dict, ckpt_path)
         if upload_to_wandb:
-            run.save(str(ckpt_path), policy="now", base_path=run.dir)
+            wandb_run.save(str(ckpt_path), policy="now", base_path=wandb_run.dir)
         
         latest_link = run_dir / "checkpoint_latest.pt"
         if latest_link.exists() or latest_link.is_symlink():
@@ -395,19 +417,37 @@ def main(cfg: TrainConfig):
                 print(f"Latest checkpoint: {ckpt_path}")
                 info.update(env.extra)
                 info.update(env.stats_ema)  # step-wise exponential moving average of stats
-                run.log(info)
+                wandb_run.log(info)
 
+    run_state: dict[str, str] = {}
     if aa.is_main_process():
         ckpt_path = save(policy, "checkpoint_final")
-        policy_eval = policy.get_rollout_policy("eval")
-        info, trajs, stats = evaluate(
-            env, policy_eval, render=cfg.eval_render, seed=cfg.seed
-        )
-        info["env_frames"] = env_frames
-        run.log(info)
+        if cfg.eval:
+            policy_eval = policy.get_rollout_policy("eval")
+            eval_info, trajs, stats = evaluate(
+                env, policy_eval, render=cfg.eval_render, seed=cfg.seed
+            )
+            eval_info["env_frames"] = env_frames
+            wandb_run.log(eval_info)
         wandb.finish()
         print(f"Final checkpoint: {ckpt_path}")
-    exit(0)
+        run_state = {
+            "checkpoint_path": ckpt_path,
+            "run_dir": str(run_dir),
+            "task": str(cfg.task.name),
+            "algo": str(cfg.algo.name),
+        }
+        run_state_path = write_run_state(run_state, run_dir / RUN_STATE_FILENAME)
+        print(f"Wrote run state to {run_state_path}")
+        pipeline_dir = get_run_state_dir()
+        if pipeline_dir is not None and pipeline_dir.resolve() != run_dir.resolve():
+            write_run_state(run_state, pipeline_dir / RUN_STATE_FILENAME)
+    return run_state
+
+
+@hydra.main(config_path=str(CONFIG_PATH), config_name="train", version_base=None)
+def main(cfg: TrainConfig) -> None:
+    run(cfg)
 
 
 if __name__ == "__main__":

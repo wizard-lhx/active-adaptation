@@ -1,16 +1,22 @@
 # active-adaptation
 
-<!-- ## Note (2025.8.26)
+`active-adaptation` is a fast-moving, research-oriented RL codebase for various robotic tasks and algorithms. It emphasizes environment flexibility and ease of use for research.
 
-Thanks for taking a look! The code base was shared for multiple projects so it contains some old code that are no-longer usable. We are actively working on **cleaning up and refactoring to make it camera-ready** (e.g, compatible with Isaac Sim 5.0). It will be ready by the date of CoRL 2025. The core implementation of our CoRL paper [FACET](https://arxiv.org/abs/2505.06883) can be found at `active_adaptation/envs/mdp/commands/facet_commands`.
+Projects using this codebase:
 
-Meanwhile, the code for the live demo (runinng Mujoco in browsers) is here [https://github.com/Facet-Team/facet]. -->
+* [FACET: Force-Adaptive Control via Impedance Reference Tracking for Legged Robots](https://arxiv.org/abs/2505.06883)
 
-## Features
-* Automatic shape handling for observation.
-* Clean and efficient single-file RL implementation.
-* Easy symmetry augmentation.
-* Seamless Mujoco sim2sim.
+* [HDMI: Learning Interactive Humanoid Whole-Body Control from Human Videos](https://arxiv.org/abs/2509.16757)
+
+* [GentleHumanoid: Learning Upper-body Compliance for Contact-rich Human and Object Interaction](https://arxiv.org/abs/2511.04679)
+
+* [Gallant: Voxel Grid-based Humanoid Locomotion and Local-navigation across 3D Constrained Terrains](https://arxiv.org/abs/2511.14625)
+
+* [MimicLite](https://github.com/EGalahad/mimic-lite) at branch `dev/hdmi`.
+
+and more to come...
+
+Note: The main branch is fast-moving and therefore **almost constantly broken somewhere**. We intentionally practice human design and limit AI-generated code. The best usage of this codebase is to read it instead of directly using it for your own projects.
 
 ## Installation
 
@@ -43,11 +49,12 @@ git clone git@github.com:btx0424/active-adaptation.git
 cd active-adaptation
 
 # shared tooling / backend-agnostic environment
+# you may `uv python pin 3.11` to share uv's cache across backends
 uv sync
 
 # backend-specific environments
 uv sync --project venv/isaac51
-uv sync --project venv/isaac60
+# uv sync --project venv/isaac60 # not supported yet
 uv sync --project venv/mjlab
 ```
 
@@ -82,9 +89,9 @@ uv run aa-list-tasks
 uv run pyright active_adaptation
 
 # backend-specific runs
-uv run --project venv/isaac51 python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo
-uv run --project venv/isaac60 python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo
-uv run --project venv/mjlab python scripts/train_ppo.py task=Go2/Go2Flat algo=ppo backend=mjlab
+uv run --project venv/isaac51 scripts/train_ppo.py task=Go2/Go2Flat algo=ppo
+# uv run --project venv/isaac60 scripts/train_ppo.py task=Go2/Go2Flat algo=ppo # not supported yet
+uv run --project venv/mjlab scripts/train_ppo.py task=Go2/Go2Flat algo=ppo backend=mjlab
 
 # multi-GPU helper (DDP via torchrun)
 uv run --project venv/isaac51 ./scripts/launch_ddp.sh 0,1 scripts/train_ppo.py task=Go2/Go2Flat algo=ppo

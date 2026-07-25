@@ -7,6 +7,7 @@ from typing_extensions import override
 import active_adaptation
 from active_adaptation.envs.mdp.randomizations.base import RandomizationV2
 from active_adaptation.envs.mdp.randomizations.common import NestedRangeType
+from tensordict import TensorDictBase
 
 if TYPE_CHECKING:
     from active_adaptation.envs.env_base import _EnvBase
@@ -16,7 +17,7 @@ if active_adaptation.get_backend() == "isaac":
 if active_adaptation.get_backend() == "mjlab":
     from mjlab.utils.lab_api.string import resolve_matching_names_values
     from mjlab.sim import Simulation
-    from mjlab.actuator import BuiltinPositionActuator
+    from mjlab.actuator import BuiltinPositionActuator, BuiltinPdActuator
 
 
 class actuator_pd_gains(RandomizationV2):
@@ -82,8 +83,8 @@ class actuator_pd_gains(RandomizationV2):
         self.model = sim.model
 
         for actuator in self.asset.actuators:
-            if not isinstance(actuator, BuiltinPositionActuator):
-                raise ValueError(f"Actuator {actuator} is not a BuiltinPositionActuator")
+            if not isinstance(actuator, (BuiltinPositionActuator, BuiltinPdActuator)):
+                raise ValueError(f"Actuator {actuator} is not a BuiltinPositionActuator or BuiltinPdActuator")
 
         if self.stiffness_range is not None:
             kp_ids, _, kp_ranges = resolve_matching_names_values(
@@ -116,7 +117,7 @@ class actuator_pd_gains(RandomizationV2):
             self.kd_ctrl_ids = None
 
     @override
-    def reset(self, env_ids):
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase):
         if self.env.backend == "mjlab":
             if self.kp_ctrl_ids is not None:
                 rand = torch.rand(len(env_ids), len(self.kp_ctrl_ids), device=self.device)
