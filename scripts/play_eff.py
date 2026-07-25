@@ -37,6 +37,7 @@ class IsaacAppConfig:
 @dataclass
 class PlayTaskOverride:
     num_envs: int = 1
+    max_episode_length: int = 5000
 
 
 @dataclass
@@ -110,6 +111,21 @@ def main(cfg: PlayConfig):
     rollout_policy = policy.get_rollout_policy("eval").to(env.device)
     base_env = env.base_env
     asset = base_env.scene.articulations["robot"]
+    viewer_eye = torch.tensor(cfg.task.viewer.eye, device=env.device)
+    viewer_target = torch.tensor(cfg.task.viewer.lookat, device=env.device)
+    camera_distance = torch.linalg.vector_norm(viewer_eye[:2] - viewer_target[:2])
+    camera_height = viewer_eye[2] - viewer_target[2]
+
+    def reset_camera():
+        root_position = asset.data.root_pos_w[0]
+        heading = asset.data.heading_w[0]
+        forward = torch.stack((heading.cos(), heading.sin(), torch.zeros_like(heading)))
+        target = root_position.clone()
+        target[2] += viewer_target[2]
+        eye = target - camera_distance * forward
+        eye[2] += camera_height
+        base_env.sim.set_camera_view(eye=eye.cpu().tolist(), target=target.cpu().tolist())
+
     clamp_cfg = policy.impedance_cfg.clamp
     controller = None
     if clamp_cfg.enabled:
@@ -135,6 +151,7 @@ def main(cfg: PlayConfig):
 
     base_env.eval()
     carry = env.reset()
+    reset_camera()
     timer = Timer(env.step_dt)
     video_enabled = bool(cfg.record_video)
     video_dir = run_dir / "videos"
@@ -162,8 +179,10 @@ def main(cfg: PlayConfig):
 
                 clamp_record = controller.step_record() if controller else None
                 recorder.record(step, impedance, clamp_record)
-                if controller and td["next", "done"].any():
-                    controller.zero_effort()
+                if td["next", "done"].any():
+                    if controller:
+                        controller.zero_effort()
+                    reset_camera()
 
                 if len(episode_stats) >= env.num_envs:
                     print("Step", step)
