@@ -80,4 +80,13 @@ class RgbArrayVideoRecorder(VideoRecorder):
 
 
 class IsaacVideoRecorder(RgbArrayVideoRecorder):
-    """Backward-compatible alias for older imports."""
+    """Record Isaac frames while keeping the render product current."""
+
+    def __enter__(self) -> "IsaacVideoRecorder":
+        self._previous_render_enabled = self._env.render_enabled
+        self._env.render_enabled = True
+        return self
+
+    def close(self):
+        super().close()
+        self._env.render_enabled = self._previous_render_enabled

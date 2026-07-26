@@ -11,8 +11,9 @@ if TYPE_CHECKING:
 
 
 class IsaacSimAdapter(SimAdapter):
-    def __init__(self, sim: "SimulationContext"):
+    def __init__(self, sim: "SimulationContext", camera_prim_path: str):
         self._sim = sim
+        self.camera_prim_path = camera_prim_path
 
     def get_physics_dt(self) -> float:
         return self._sim.get_physics_dt()
@@ -28,7 +29,8 @@ class IsaacSimAdapter(SimAdapter):
 
     def set_camera_view(self, eye=None, target=None, **kwargs) -> None:
         if eye is not None and target is not None:
-            self._sim.set_camera_view(eye=eye, target=target)
+            kwargs.setdefault("camera_prim_path", self.camera_prim_path)
+            self._sim.set_camera_view(eye=eye, target=target, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._sim, name)

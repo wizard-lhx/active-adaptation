@@ -114,26 +114,22 @@ class IsaacBackendEnv(_EnvBase):
         with use_stage(sim.get_initial_stage()):
             sim.reset()
         
-        # Try to fix headless record
-        # --------------------------
-        from pxr import UsdGeom, Gf
+        if sim.has_gui():
+            camera_path = "/OmniverseKit_Persp"
+        else:
+            from pxr import Gf, UsdGeom
 
-        stage = sim.get_initial_stage()
-
-        camera_path = "/World/RecordCamera"
-
-        camera = UsdGeom.Camera.Define(stage, camera_path)
-
-        xform = UsdGeom.Xformable(camera)
-        xform.AddTranslateOp().Set(
-            Gf.Vec3d(
-                self.cfg.viewer.eye[0],
-                self.cfg.viewer.eye[1],
-                self.cfg.viewer.eye[2],
+            camera_path = "/World/RecordCamera"
+            camera = UsdGeom.Camera.Define(sim.get_initial_stage(), camera_path)
+            xform = UsdGeom.Xformable(camera)
+            xform.AddTranslateOp().Set(
+                Gf.Vec3d(
+                    self.cfg.viewer.eye[0],
+                    self.cfg.viewer.eye[1],
+                    self.cfg.viewer.eye[2],
+                )
             )
-        )
-        # --------------------------
-        
+
         # warm up the simulation
         for _ in tqdm(range(10), desc="Warming up the simulation"):
             sim.step(render=False)
@@ -154,7 +150,7 @@ class IsaacBackendEnv(_EnvBase):
         except ModuleNotFoundError:
             print("Set enable_cameras=true to use cameras.")
 
-        self.sim = IsaacSimAdapter(sim)
+        self.sim = IsaacSimAdapter(sim, camera_path)
         self.scene = IsaacSceneAdapter(self.scene)
         self.terrain_type = self.scene.terrain.cfg.terrain_type
         self.robot = self.scene.articulations["robot"]
