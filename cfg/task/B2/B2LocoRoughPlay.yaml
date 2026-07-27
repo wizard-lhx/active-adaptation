@@ -9,3 +9,7 @@ terrain: medium_play
 
 command:
   curriculum: false
+
+randomization:
+  push_body:
+    _enabled_: false

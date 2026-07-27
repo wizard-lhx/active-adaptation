@@ -317,7 +317,12 @@ class _EnvBase(EnvBase, RegistryMixin):
 
         # MDP: randomizations
         for rand_name, rand_cfg in self.cfg.get("randomization", {}).items():
-            rand_name, cls_name, rand_kwargs = parse_component_spec(rand_name, rand_cfg)
+            rand_cfg = dict(rand_cfg)
+            if not rand_cfg.pop("_enabled_", True):
+                continue
+            rand_name, cls_name, rand_kwargs = parse_component_spec(
+                rand_name, rand_cfg
+            )
             rand = mdp.RandomizationV2.make(cls_name, **rand_kwargs)
             if not rand:
                 continue

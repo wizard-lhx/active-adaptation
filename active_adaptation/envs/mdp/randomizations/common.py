@@ -948,11 +948,13 @@ class push_body(RandomizationV2):
         self,
         body_names,
         force_range = (20, 50),
+        vertical_force_range=(0, 0),
         min_interval=100,
-        decay: float=0.9
+        decay: float = 0.9,
     ):
         self.body_names = body_names
         self.force_range = force_range
+        self.vertical_force_range = vertical_force_range
         self.min_interval = min_interval
         self.decay = decay
 
@@ -988,6 +990,7 @@ class push_body(RandomizationV2):
         push_forces = torch.zeros_like(self.forces)
         push_forces[:, :, 0].uniform_(*self.force_range)
         push_forces[:, :, 1].uniform_(*self.force_range)
+        push_forces[:, :, 2].uniform_(*self.vertical_force_range)
         self.forces = torch.where(i, push_forces, self.forces * self.decay)
         
     def debug_draw(self):

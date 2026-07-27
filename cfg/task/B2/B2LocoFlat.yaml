@@ -109,3 +109,9 @@ randomization:
       .*_hip_joint: [0.8, 1.2]
       .*_thigh_joint: [0.8, 1.2]
       .*_calf_joint: [0.8, 1.2]
+  push_body:
+    body_names: base_link
+    force_range: [-250, 250]
+    vertical_force_range: [-250, 250]
+    min_interval: 100
+    decay: 0.9

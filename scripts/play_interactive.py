@@ -23,6 +23,7 @@ def main() -> None:
         "  UP / DOWN         raise / lower the sling while enabled\n"
         "  W / A / S / D     locomotion command\n"
         "  LEFT / RIGHT      yaw command\n"
+        "  X / Y / Z         hold to apply +body-axis force\n"
         "  SHIFT + left drag spring-grab any rigid body (CPU PhysX)\n"
         "  SHIFT + double click push the pointed rigid body\n"
         "Effective-damping clamp (CLI):\n"

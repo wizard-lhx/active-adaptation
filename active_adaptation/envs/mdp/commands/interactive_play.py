@@ -8,7 +8,7 @@ import torch
 from tensordict import TensorDictBase
 from typing_extensions import override
 
-from active_adaptation.utils.math import quat_rotate
+from active_adaptation.utils.math import quat_rotate, quat_rotate_inverse
 
 from .locomotion import Twist
 
@@ -28,6 +28,7 @@ class InteractiveTwist(Twist):
         sling_damping_ratio: float = 0.7,
         sling_max_force_weight_ratio: float = 3.0,
         sling_half_extents: tuple[float, float, float] = (0.25, 0.14, 0.075),
+        push_force_xyz: tuple[float, float, float] = (200.0, 200.0, -200.0),
         mouse_grab_force: float = 1.0,
         mouse_push_acceleration: float = 100.0,
         **kwargs,
@@ -40,6 +41,7 @@ class InteractiveTwist(Twist):
         self.sling_damping_ratio = sling_damping_ratio
         self.sling_max_force_weight_ratio = sling_max_force_weight_ratio
         self.sling_half_extents = sling_half_extents
+        self.push_force_xyz = push_force_xyz
         self.mouse_grab_force = mouse_grab_force
         self.mouse_push_acceleration = mouse_push_acceleration
 
@@ -84,6 +86,12 @@ class InteractiveTwist(Twist):
         self._sling_corner_forces_w = torch.zeros(1, 4, 3, device=self.device)
         self._sling_force_w = torch.zeros(1, 1, 3, device=self.device)
         self._sling_torque_w = torch.zeros_like(self._sling_force_w)
+        self._push_force_scale_b = torch.tensor(
+            self.push_force_xyz, device=self.device
+        ).view(1, 1, 3)
+        self._push_force_b = torch.zeros_like(self._sling_force_w)
+        self._external_force_b = torch.zeros_like(self._sling_force_w)
+        self._external_torque_b = torch.zeros_like(self._sling_torque_w)
 
         import carb.settings
         import omni.physx.bindings._physx as physx_bindings
@@ -103,6 +111,9 @@ class InteractiveTwist(Twist):
         self._sling_corner_forces_w.zero_()
         self._sling_force_w.zero_()
         self._sling_torque_w.zero_()
+        self._push_force_b.zero_()
+        self._external_force_b.zero_()
+        self._external_torque_b.zero_()
 
         self._total_mass.copy_(self.asset.root_physx_view.get_masses()[0].sum())
         omega = 2.0 * math.pi * self.sling_frequency_hz
@@ -130,6 +141,7 @@ class InteractiveTwist(Twist):
             self._sling_corner_forces_w.zero_()
             self._sling_force_w.zero_()
             self._sling_torque_w.zero_()
+            self._apply_external_wrench(keys)
             return
 
         height_direction = float(keys["UP"]) - float(keys["DOWN"])
@@ -186,36 +198,59 @@ class InteractiveTwist(Twist):
                 dim=-1,
             ).sum(dim=1, keepdim=True)
         )
+        self._apply_external_wrench(keys)
+
+    def _apply_external_wrench(self, keys) -> None:
+        self._push_force_b[..., 0].fill_(float(keys["X"]))
+        self._push_force_b[..., 1].fill_(float(keys["Y"]))
+        self._push_force_b[..., 2].fill_(float(keys["Z"]))
+        self._push_force_b.mul_(self._push_force_scale_b)
+
+        body_quat_w = self.asset.data.body_link_quat_w[:, self.sling_body_id, None]
+        self._external_force_b.copy_(
+            quat_rotate_inverse(body_quat_w, self._sling_force_w)
+        )
+        self._external_force_b.add_(self._push_force_b)
+        self._external_torque_b.copy_(
+            quat_rotate_inverse(body_quat_w, self._sling_torque_w)
+        )
         self.asset.instantaneous_wrench_composer.set_forces_and_torques(
-            forces=self._sling_force_w,
-            torques=self._sling_torque_w,
+            forces=self._external_force_b,
+            torques=self._external_torque_b,
             body_ids=[self.sling_body_id],
-            is_global=True,
         )
 
     @override
     def debug_draw(self) -> None:
         super().debug_draw()
-        if not self.sling_enabled:
-            return
+        if self.sling_enabled:
+            corner_pos = self._sling_corner_pos_w.reshape(-1, 3)
+            target_pos = self._sling_target_pos_w.reshape(-1, 3)
+            self.env.debug_draw.vector(
+                corner_pos,
+                target_pos - corner_pos,
+                color=(0.2, 1.0, 0.2, 1.0),
+            )
+            self.env.debug_draw.point(
+                target_pos, color=(0.2, 1.0, 0.2, 1.0), size=12.0
+            )
+            self.env.debug_draw.vector(
+                corner_pos,
+                0.2
+                * self._sling_corner_forces_w.reshape(-1, 3)
+                / (0.25 * self._total_mass * 9.81),
+                color=(1.0, 0.5, 0.1, 1.0),
+            )
 
-        corner_pos = self._sling_corner_pos_w.reshape(-1, 3)
-        target_pos = self._sling_target_pos_w.reshape(-1, 3)
-        self.env.debug_draw.vector(
-            corner_pos,
-            target_pos - corner_pos,
-            color=(0.2, 1.0, 0.2, 1.0),
-        )
-        self.env.debug_draw.point(
-            target_pos, color=(0.2, 1.0, 0.2, 1.0), size=12.0
-        )
-        self.env.debug_draw.vector(
-            corner_pos,
-            0.2
-            * self._sling_corner_forces_w.reshape(-1, 3)
-            / (0.25 * self._total_mass * 9.81),
-            color=(1.0, 0.5, 0.1, 1.0),
-        )
+        if self._push_force_b.any():
+            body_pos = self.asset.data.body_link_pos_w[:, self.sling_body_id]
+            body_quat = self.asset.data.body_link_quat_w[:, self.sling_body_id]
+            push_force_w = quat_rotate(body_quat, self._push_force_b[:, 0])
+            self.env.debug_draw.vector(
+                body_pos,
+                push_force_w / 50.0,
+                color=(0.2, 0.8, 1.0, 1.0),
+            )
 
 
 __all__ = ["InteractiveTwist"]
