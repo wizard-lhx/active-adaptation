@@ -85,6 +85,32 @@ class body_pos_b(body_link_pos_b):
     """Alias kept for existing task configs that reference ``body_pos_b``."""
 
 
+class feet_linvel_b(body_observation):
+    """Body linear velocities relative to the root link, expressed in root frame."""
+
+    @override
+    def compute(self):
+        root_pos_w = self.asset.data.root_link_pos_w.unsqueeze(1)
+        root_quat_w = self.asset.data.root_link_quat_w.unsqueeze(1)
+        root_lin_vel_w = self.asset.data.root_link_lin_vel_w.unsqueeze(1)
+        root_ang_vel_w = self.asset.data.root_link_ang_vel_w.unsqueeze(1)
+        body_pos_w = self.asset.data.body_link_pos_w[:, self.body_ids]
+        body_lin_vel_w = self.asset.data.body_link_lin_vel_w[:, self.body_ids]
+
+        offset_w = body_pos_w - root_pos_w
+        relative_lin_vel_w = (
+            body_lin_vel_w
+            - root_lin_vel_w
+            - torch.linalg.cross(root_ang_vel_w.expand_as(offset_w), offset_w)
+        )
+        relative_lin_vel_b = quat_rotate_inverse(root_quat_w, relative_lin_vel_w)
+        return relative_lin_vel_b.reshape(self.num_envs, -1)
+
+    @override
+    def symmetry_transform(self):
+        return cartesian_space_symmetry(self.asset, self.body_names)
+
+
 class body_vel_b(body_observation):
     def __init__(self, body_names: str, yaw_only: bool = False):
         super().__init__(body_names)

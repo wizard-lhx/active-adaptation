@@ -1,0 +1,12 @@
+# @package task
+name: B2LocoFlatEE
+
+defaults:
+  - /task/B2/B2LocoFlat@_here_
+  - _self_
+
+observation:
+  policy:
+    root_linvel_b: {}
+    feet_linvel_b:
+      body_names: [FL_foot, FR_foot, RL_foot, RR_foot]
