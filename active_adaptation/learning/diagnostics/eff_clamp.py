@@ -36,10 +36,15 @@ class ClampController:
         self._qd: list[torch.Tensor] = []
         self._p_neg: list[torch.Tensor] = []
 
-    def update(self, obs: Any) -> dict[str, torch.Tensor]:
+    def update(
+        self,
+        obs: Any,
+        j_leg: torch.Tensor | None = None,
+        jdot_leg: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Compute the impedance and correction for one control step."""
 
-        result = self.policy.compute_impedance(obs)
+        result = self.policy.compute_impedance(obs, j_leg, jdot_leg)
         eigvals = result["Deff_eigvals"]
         eigvecs = result["Deff_eigvecs"]
         delta_eigvals = torch.relu(float(self.cfg.d_min) - eigvals)

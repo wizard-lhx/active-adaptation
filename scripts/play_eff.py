@@ -22,6 +22,7 @@ from active_adaptation.learning.diagnostics.eff_record import Recorder
 from active_adaptation.learning.modules.vecnorm import VecNorm
 from active_adaptation.utils.export import export_onnx
 from active_adaptation.utils.helpers import EpisodeStats
+from active_adaptation.utils.math import matrix_from_quat
 from active_adaptation.utils.timerfd import Timer
 
 
@@ -88,6 +89,7 @@ def main(cfg: PlayConfig):
     OmegaConf.set_struct(cfg, False)
     aa.init(cfg, auto_rank=True)
 
+    from active_adaptation.envs.utils import find_bodies
     from active_adaptation.helpers import make_env_policy
 
     env, policy = make_env_policy(
@@ -141,6 +143,7 @@ def main(cfg: PlayConfig):
 
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     output_path = run_dir / "eff_impedance" / "eff_impedance_timeseries.npz"
+    augmented = policy.impedance_cfg.augmented
     recorder = Recorder(
         output_path,
         policy.impedance_joint_names(),
@@ -148,7 +151,33 @@ def main(cfg: PlayConfig):
         base_env.step_dt,
         base_env.decimation,
         clamp_cfg,
+        augmented,
     )
+
+    if augmented:
+        foot_body_ids, _ = find_bodies(
+            asset,
+            ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+        )
+        foot_body_ids = torch.as_tensor(
+            foot_body_ids,
+            device=env.device,
+            dtype=torch.long,
+        )
+        joint_jacobian_ids = policy.impedance_joint_ids() + 6
+    previous_j_leg = None
+
+    def compute_leg_jacobian():
+        raw = asset.root_physx_view.get_jacobians()
+        jacobian_w = (
+            raw.index_select(1, foot_body_ids)
+            .index_select(3, joint_jacobian_ids)[:, :, :3]
+            .clone()
+        )
+        rotation_bw = matrix_from_quat(
+            asset.data.root_link_quat_w
+        ).transpose(-2, -1)
+        return torch.matmul(rotation_bw.unsqueeze(1), jacobian_w)
 
     base_env.eval()
     carry = env.reset()
@@ -170,7 +199,36 @@ def main(cfg: PlayConfig):
                 with torch.inference_mode():
                     carry = rollout_policy(carry)
                 diagnostic_obs = carry.clone().detach()
-                impedance = controller.update(diagnostic_obs) if controller else policy.compute_impedance(diagnostic_obs)
+                if augmented:
+                    j_leg = compute_leg_jacobian()
+                    jdot_valid = previous_j_leg is not None
+                    jdot_leg = (
+                        (j_leg - previous_j_leg) / base_env.step_dt
+                        if jdot_valid
+                        else torch.zeros_like(j_leg)
+                    )
+                else:
+                    j_leg = None
+                    jdot_leg = None
+                    jdot_valid = False
+                impedance = (
+                    controller.update(diagnostic_obs, j_leg, jdot_leg)
+                    if controller
+                    else policy.compute_impedance(diagnostic_obs, j_leg, jdot_leg)
+                )
+                if augmented:
+                    impedance["J_leg"] = j_leg
+                    impedance["Jdot_valid"] = torch.full(
+                        (env.num_envs,),
+                        jdot_valid,
+                        device=env.device,
+                        dtype=torch.bool,
+                    )
+                    if step == 0:
+                        print(
+                            "[eff-aug] "
+                            f"J_xe_norm={torch.linalg.vector_norm(impedance['J_xe']).item():.6g}"
+                        )
 
                 if video_enabled:
                     video.add_frame()
@@ -180,7 +238,10 @@ def main(cfg: PlayConfig):
 
                 clamp_record = controller.step_record() if controller else None
                 recorder.record(step, impedance, clamp_record)
-                if td["next", "done"].any():
+                done = td["next", "done"].any()
+                if augmented:
+                    previous_j_leg = None if done else j_leg.detach().clone()
+                if done:
                     if controller:
                         controller.zero_effort()
                     reset_camera()
@@ -201,7 +262,6 @@ def main(cfg: PlayConfig):
                 timer.sleep()
         except KeyboardInterrupt:
             print(f"Interrupted by user. Latest impedance data: {output_path}")
-
     env.close()
 
 

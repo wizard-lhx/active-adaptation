@@ -48,9 +48,22 @@ class PPOPolicy(BasePolicy):
         policy._configure_impedance(env)
         return policy
 
-    def compute_impedance(self, obs: Any) -> dict[str, torch.Tensor]:
+    def compute_impedance(
+        self,
+        obs: Any,
+        j_leg: torch.Tensor | None = None,
+        jdot_leg: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         kp, kd = self.impedance_gains()
-        return compute_impedance(self, obs, kp, kd, self.impedance_cfg)
+        return compute_impedance(
+            self,
+            obs,
+            kp,
+            kd,
+            self.impedance_cfg,
+            j_leg,
+            jdot_leg,
+        )
 
     def impedance_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
         kp = []
@@ -70,9 +83,23 @@ class PPOPolicy(BasePolicy):
 
     def _configure_impedance(self, env: "_EnvBase") -> None:
         joint_ids = self.impedance_joint_ids()
+        obs_slices = self._actor_obs_slices(env)
         self.impedance_cfg.alpha = tuple(self._action_scaling().detach().cpu().tolist())
-        self.impedance_cfg.q_slice = self._joint_obs_slice(env, "pos", joint_ids)
-        self.impedance_cfg.qd_slice = self._joint_obs_slice(env, "vel", joint_ids)
+        self.impedance_cfg.q_slice = self._joint_obs_slice(
+            env,
+            obs_slices,
+            ("joint_pos", "joint_pos_multistep"),
+            joint_ids,
+        )
+        self.impedance_cfg.qd_slice = self._joint_obs_slice(
+            env,
+            obs_slices,
+            ("joint_vel", "joint_vel_multistep"),
+            joint_ids,
+        )
+        self.impedance_cfg.base_linvel_slice = obs_slices.get("root_linvel_b")
+        self.impedance_cfg.base_angvel_slice = obs_slices.get("root_angvel_b")
+        self.impedance_cfg.foot_vel_slice = obs_slices.get("feet_linvel_b")
         self.cfg.eff_impedance = self.impedance_cfg
 
     def _action_scaling(self) -> torch.Tensor:
@@ -82,30 +109,44 @@ class PPOPolicy(BasePolicy):
             scaling.append(value.expand(manager.action_dim).reshape(-1))
         return torch.cat(scaling)
 
+    @staticmethod
+    def _actor_obs_slices(env: "_EnvBase") -> dict[str, tuple[int, int]]:
+        group = env.observation_groups[OBS_KEY]
+        actor_offset = 0
+        if CMD_KEY in env.observation_groups:
+            actor_offset = sum(
+                int(shape[-1])
+                for shape in env.observation_groups[CMD_KEY].shapes.values()
+            )
+
+        slices = {}
+        start = actor_offset
+        for name, shape in group.shapes.items():
+            end = start + int(shape[-1])
+            slices[name] = (start, end)
+            start = end
+        return slices
+
     def _joint_obs_slice(
         self,
         env: "_EnvBase",
-        kind: str,
+        obs_slices: dict[str, tuple[int, int]],
+        names: tuple[str, ...],
         controlled_ids: torch.Tensor,
     ) -> tuple[int, int]:
         group = env.observation_groups[OBS_KEY]
-        actor_offset = (
-            env.observation_spec[CMD_KEY].shape[-1]
-            if CMD_KEY in env.observation_spec.keys(True, True)
-            else 0
+        for name in names:
+            if name not in obs_slices:
+                continue
+            obs = group[name]
+            term_ids = torch.as_tensor(obs.joint_ids, device=controlled_ids.device)
+            window = self._joint_window(term_ids, controlled_ids)
+            if window is not None:
+                start = obs_slices[name][0] + window
+                return start, start + controlled_ids.numel()
+        raise ValueError(
+            f"could not infer any of {names!r} from observation group {OBS_KEY!r}"
         )
-        local_offset = 0
-        names = {"pos": {"joint_pos", "joint_pos_multistep"}, "vel": {"joint_vel", "joint_vel_multistep"}}
-        for obs in group.funcs.values():
-            width = int(obs.compute().shape[-1])
-            if type(obs).__name__ in names[kind]:
-                term_ids = torch.as_tensor(obs.joint_ids, device=controlled_ids.device)
-                window = self._joint_window(term_ids, controlled_ids)
-                if window is not None:
-                    start = actor_offset + local_offset + window
-                    return start, start + controlled_ids.numel()
-            local_offset += width
-        raise ValueError(f"could not infer {kind} slice from observation group {OBS_KEY!r}")
 
     @staticmethod
     def _joint_window(term_ids: torch.Tensor, controlled_ids: torch.Tensor) -> int | None:

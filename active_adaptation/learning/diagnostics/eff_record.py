@@ -26,6 +26,7 @@ class Recorder:
         control_dt: float,
         decimation: int,
         clamp: ClampConfig,
+        augmented: bool,
     ) -> None:
         self.path = path
         self.joint_names = joint_names
@@ -33,6 +34,7 @@ class Recorder:
         self.control_dt = float(control_dt)
         self.decimation = int(decimation)
         self.clamp = clamp
+        self.augmented = augmented
         self.data: dict[str, list[np.ndarray]] = {
             "steps": [],
             "Keff": [],
@@ -44,6 +46,17 @@ class Recorder:
             "kp": [],
             "kd": [],
         }
+        if augmented:
+            self.data.update(
+                {
+                    "Keff_aug": [],
+                    "Deff_aug": [],
+                    "D_base": [],
+                    "J_leg": [],
+                    "Jdot_valid": [],
+                    "foot_vel_obs": [],
+                }
+            )
         if clamp.enabled:
             self.data.update(
                 {
@@ -75,6 +88,18 @@ class Recorder:
         )
         for key in keys:
             self.data[key].append(_numpy(impedance[key][0]))
+        if self.augmented:
+            for key in (
+                "Keff_aug",
+                "Deff_aug",
+                "D_base",
+                "J_leg",
+                "foot_vel_obs",
+            ):
+                self.data[key].append(_numpy(impedance[key][0]))
+            self.data["Jdot_valid"].append(
+                np.asarray(impedance["Jdot_valid"][0].item(), dtype=np.bool_)
+            )
         if clamp_record is not None:
             clamp_keys = (
                 "tau_corr",
@@ -87,9 +112,9 @@ class Recorder:
                 self.data[key].append(_numpy(clamp_record[key]))
             self.data["clamp_applied"].append(np.asarray(clamp_record["clamp_applied"], dtype=np.bool_))
         if len(self.data["steps"]) == 1 or (len(self.data["steps"]) - 1) % 10 == 0:
-            self._save()
+            self.save()
 
-    def _save(self) -> None:
+    def save(self) -> None:
         payload = {key: np.stack(values) for key, values in self.data.items()}
         payload.update(
             {
