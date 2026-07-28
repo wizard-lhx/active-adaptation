@@ -1,0 +1,26 @@
+# @package task
+name: B2LocoFlatJRM
+
+defaults:
+  - /task/B2/B2LocoFlat@_here_
+  - _self_
+
+input:
+  action:
+    _target_: JointReferenceModel
+    action_scaling:
+      .*_hip_joint: 0.5
+      .*_thigh_joint: 0.5
+      .*_calf_joint: 0.5
+    omega: 20.0
+    zeta: 1.0
+    max_delay: 1
+    alpha_range: [1.0, 1.0]
+
+observation:
+  policy:
+    joint_pos_targets:
+      joint_names: ".*_(hip|thigh|calf)_joint"
+      subtract_offset: true
+    joint_vel_targets:
+      joint_names: ".*_(hip|thigh|calf)_joint"
