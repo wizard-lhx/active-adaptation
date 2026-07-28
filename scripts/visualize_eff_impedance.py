@@ -12,26 +12,45 @@ import numpy as np
 from matplotlib.widgets import Slider
 
 
+LEG_NAMES = ("FL", "FR", "RL", "RR")
+LEG_JOINT_NAMES = tuple(
+    f"{leg}_{joint}_joint"
+    for leg in LEG_NAMES
+    for joint in ("hip", "thigh", "calf")
+)
+
+
+def leg_joint_permutation(joint_names: np.ndarray) -> np.ndarray:
+    """Return a leg-major permutation when the B2 leg joint set is present."""
+    names = [str(name) for name in joint_names]
+    if len(names) == len(LEG_JOINT_NAMES) and set(names) == set(LEG_JOINT_NAMES):
+        lookup = {name: idx for idx, name in enumerate(names)}
+        return np.asarray([lookup[name] for name in LEG_JOINT_NAMES], dtype=np.int64)
+    return np.arange(len(names), dtype=np.int64)
+
+
+def reorder_joint_matrix(matrix: np.ndarray, permutation: np.ndarray) -> np.ndarray:
+    """Apply the same joint permutation to action rows and state columns."""
+    return np.take(np.take(matrix, permutation, axis=-2), permutation, axis=-1)
+
+
+def configure_joint_matrix_axis(axis, joint_names: np.ndarray) -> None:
+    joint_ids = np.arange(len(joint_names))
+    axis.set_xlabel("state joint")
+    axis.set_ylabel("action joint")
+    axis.set_xticks(joint_ids, joint_names, rotation=90, fontsize=6)
+    axis.set_yticks(joint_ids, joint_names, fontsize=6)
+    if tuple(joint_names) == LEG_JOINT_NAMES:
+        for boundary in (2.5, 5.5, 8.5):
+            axis.axhline(boundary, color="black", linewidth=0.8)
+            axis.axvline(boundary, color="black", linewidth=0.8)
+
+
 class Viewer:
     """Matplotlib viewer with slider and held left/right navigation."""
 
     def __init__(self, video_path: Path, npz_path: Path) -> None:
-        with np.load(npz_path) as data:
-            self.steps = data["steps"]
-            self.Keff = data["Keff"]
-            self.Deff = data["Deff"]
-            self.Keff_eigvals = data["Keff_eigvals"]
-            self.Deff_eigvals = data["Deff_eigvals"]
-            self.Keff_cond = data["Keff_cond"]
-            self.Deff_cond = data["Deff_cond"]
-            self.joint_names = data["joint_names"].astype(str)
-            self.control_dt = float(data["control_dt"])
-
-        self.times = self.steps * self.control_dt
-        self.Keff_min = self.Keff_eigvals[:, 0]
-        self.Deff_min = self.Deff_eigvals[:, 0]
-        self.Keff_neg_count = (self.Keff_eigvals < 0.0).sum(axis=-1)
-        self.Deff_neg_count = (self.Deff_eigvals < 0.0).sum(axis=-1)
+        self._load_data(npz_path)
 
         video_meta = iio.immeta(video_path)
         self.video_fps = float(video_meta["fps"])
@@ -51,6 +70,26 @@ class Viewer:
         self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
         self.fig.canvas.mpl_connect("key_release_event", self._on_key_release)
         self._update_video_step(0)
+
+    def _load_data(self, npz_path: Path) -> None:
+        with np.load(npz_path) as data:
+            self.steps = data["steps"]
+            joint_names = data["joint_names"].astype(str)
+            permutation = leg_joint_permutation(joint_names)
+            self.Keff = reorder_joint_matrix(data["Keff"], permutation)
+            self.Deff = reorder_joint_matrix(data["Deff"], permutation)
+            self.Keff_eigvals = data["Keff_eigvals"]
+            self.Deff_eigvals = data["Deff_eigvals"]
+            self.Keff_cond = data["Keff_cond"]
+            self.Deff_cond = data["Deff_cond"]
+            self.joint_names = joint_names[permutation]
+            self.control_dt = float(data["control_dt"])
+
+        self.times = self.steps * self.control_dt
+        self.Keff_min = self.Keff_eigvals[:, 0]
+        self.Deff_min = self.Deff_eigvals[:, 0]
+        self.Keff_neg_count = (self.Keff_eigvals < 0.0).sum(axis=-1)
+        self.Deff_neg_count = (self.Deff_eigvals < 0.0).sum(axis=-1)
 
     @lru_cache(maxsize=16)
     def _read_frame(self, frame_idx: int) -> np.ndarray:
@@ -100,11 +139,7 @@ class Viewer:
         self.fig.colorbar(self.keff_image, ax=keff_ax)
         self.fig.colorbar(self.deff_image, ax=deff_ax)
         for axis in (keff_ax, deff_ax):
-            axis.set_xlabel("state joint")
-            axis.set_ylabel("action joint")
-            joint_ids = np.arange(len(self.joint_names))
-            axis.set_xticks(joint_ids, self.joint_names, rotation=90, fontsize=6)
-            axis.set_yticks(joint_ids, self.joint_names, fontsize=6)
+            configure_joint_matrix_axis(axis, self.joint_names)
         self.keff_ax = keff_ax
         self.deff_ax = deff_ax
         self.matrix_value_texts = {
@@ -173,6 +208,9 @@ class Viewer:
         cond_ax.set_ylabel("condition number")
         cond_ax.legend(loc="best")
 
+        self._add_playback_controls()
+
+    def _add_playback_controls(self) -> None:
         slider_ax = self.fig.add_axes((0.10, 0.045, 0.80, 0.03))
         self.slider = Slider(
             slider_ax,

@@ -89,7 +89,7 @@ def main(cfg: PlayConfig):
     OmegaConf.set_struct(cfg, False)
     aa.init(cfg, auto_rank=True)
 
-    from active_adaptation.envs.utils import find_bodies
+    from active_adaptation.envs.utils import find_bodies, find_sensor_bodies
     from active_adaptation.helpers import make_env_policy
 
     env, policy = make_env_policy(
@@ -144,18 +144,9 @@ def main(cfg: PlayConfig):
     run_dir = Path(HydraConfig.get().runtime.output_dir)
     output_path = run_dir / "eff_impedance" / "eff_impedance_timeseries.npz"
     augmented = policy.impedance_cfg.augmented
-    recorder = Recorder(
-        output_path,
-        policy.impedance_joint_names(),
-        base_env.physics_dt,
-        base_env.step_dt,
-        base_env.decimation,
-        clamp_cfg,
-        augmented,
-    )
 
     if augmented:
-        foot_body_ids, _ = find_bodies(
+        foot_body_ids, foot_names = find_bodies(
             asset,
             ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
         )
@@ -164,7 +155,23 @@ def main(cfg: PlayConfig):
             device=env.device,
             dtype=torch.long,
         )
+        contact_sensor = base_env.scene.sensors["contact_forces"]
+        foot_contact_ids = torch.as_tensor(
+            find_sensor_bodies(asset, contact_sensor, foot_names)[0],
+            device=env.device,
+            dtype=torch.long,
+        )
         joint_jacobian_ids = policy.impedance_joint_ids() + 6
+    recorder = Recorder(
+        output_path,
+        policy.impedance_joint_names(),
+        base_env.physics_dt,
+        base_env.step_dt,
+        base_env.decimation,
+        clamp_cfg,
+        augmented,
+        foot_names if augmented else None,
+    )
     previous_j_leg = None
 
     def compute_leg_jacobian():
@@ -201,6 +208,9 @@ def main(cfg: PlayConfig):
                 diagnostic_obs = carry.clone().detach()
                 if augmented:
                     j_leg = compute_leg_jacobian()
+                    foot_contact = (
+                        contact_sensor.data.current_contact_time[:, foot_contact_ids] > 0.0
+                    )
                     jdot_valid = previous_j_leg is not None
                     jdot_leg = (
                         (j_leg - previous_j_leg) / base_env.step_dt
@@ -218,6 +228,7 @@ def main(cfg: PlayConfig):
                 )
                 if augmented:
                     impedance["J_leg"] = j_leg
+                    impedance["foot_contact"] = foot_contact
                     impedance["Jdot_valid"] = torch.full(
                         (env.num_envs,),
                         jdot_valid,

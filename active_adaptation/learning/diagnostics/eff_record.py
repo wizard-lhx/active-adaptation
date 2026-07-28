@@ -27,6 +27,7 @@ class Recorder:
         decimation: int,
         clamp: ClampConfig,
         augmented: bool,
+        foot_names: list[str] | None = None,
     ) -> None:
         self.path = path
         self.joint_names = joint_names
@@ -35,6 +36,9 @@ class Recorder:
         self.decimation = int(decimation)
         self.clamp = clamp
         self.augmented = augmented
+        self.foot_names = foot_names
+        if augmented:
+            assert foot_names is not None
         self.data: dict[str, list[np.ndarray]] = {
             "steps": [],
             "Keff": [],
@@ -55,6 +59,7 @@ class Recorder:
                     "J_leg": [],
                     "Jdot_valid": [],
                     "foot_vel_obs": [],
+                    "foot_contact": [],
                 }
             )
         if clamp.enabled:
@@ -100,6 +105,9 @@ class Recorder:
             self.data["Jdot_valid"].append(
                 np.asarray(impedance["Jdot_valid"][0].item(), dtype=np.bool_)
             )
+            self.data["foot_contact"].append(
+                impedance["foot_contact"][0].detach().cpu().numpy().astype(np.bool_, copy=False)
+            )
         if clamp_record is not None:
             clamp_keys = (
                 "tau_corr",
@@ -124,6 +132,8 @@ class Recorder:
                 "decimation": np.asarray(self.decimation, dtype=np.int64),
             }
         )
+        if self.augmented:
+            payload["foot_names"] = np.asarray(self.foot_names)
         if self.clamp.enabled:
             payload.update(
                 {
