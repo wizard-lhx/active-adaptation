@@ -290,6 +290,21 @@ class body_upright(RewardV2):
         return rew.mean(1, True)
 
 
+class base_orientation_l2(RewardV2):
+    def __init__(self, weight: float, track_var: bool = False):
+        super().__init__(weight, track_var=track_var)
+
+    @override
+    def _initialize(self, env: "EnvBase"):
+        super()._initialize(env)
+        self.asset: Articulation = self.env.scene.articulations["robot"]
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        projected_gravity = self.asset.data.projected_gravity_b
+        return -projected_gravity[:, :2].square().sum(1, keepdim=True)
+
+
 class base_height_l1(RewardV2[Twist]):
     def __init__(
         self,
@@ -315,6 +330,29 @@ class base_height_l1(RewardV2[Twist]):
         height = root_link_pos_w[:, 2] - self.env.get_ground_height_at(root_link_pos_w)
         error_l1 = (height.unsqueeze(1) - target_height).abs()
         return -error_l1.reshape(self.num_envs, 1)
+
+
+class base_height_l2(RewardV2):
+    def __init__(
+        self,
+        weight: float,
+        target_height: float,
+        track_var: bool = False,
+    ):
+        super().__init__(weight, track_var=track_var)
+        self.target_height = target_height
+
+    @override
+    def _initialize(self, env: "EnvBase"):
+        super()._initialize(env)
+        self.asset: Articulation = self.env.scene.articulations["robot"]
+
+    @override
+    def _compute(self) -> torch.Tensor:
+        root_link_pos_w = self.asset.data.root_link_pos_w
+        ground_height = self.env.get_ground_height_at(root_link_pos_w)
+        height = root_link_pos_w[:, 2] - ground_height
+        return -(height.unsqueeze(1) - self.target_height).square()
 
 
 class base_height_exp(RewardV2[Twist]):

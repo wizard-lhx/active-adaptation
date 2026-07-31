@@ -143,7 +143,7 @@ class contact_forces(ObservationV2):
                 self.root_link_quat_w.reshape(self.num_envs, 1, 4),
                 contact_forces,
             )
-        return contact_forces.reshape(self.num_envs, -1)
+        return contact_forces.reshape(self.num_envs, -1) / 50.0
 
     def symmetry_transform(self):
         return cartesian_space_symmetry(self.asset, self.body_names)

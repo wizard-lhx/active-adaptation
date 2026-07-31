@@ -54,6 +54,32 @@ class energy_l1(RewardV2):
         return -(power).sum(1, keepdim=True)
 
 
+class power_distribution(RewardV2):
+    supported_backends = ("isaac", "mujoco", "mjlab")
+
+    def __init__(self, weight: float, joint_names: str = ".*", track_var: bool = False):
+        super().__init__(weight, track_var=track_var)
+        self.joint_names = joint_names
+
+    def _initialize(self, env: "EnvBase"):
+        super()._initialize(env)
+        self.asset: Articulation = self.env.scene.articulations["robot"]
+        self.joint_ids = self.asset.find_joints(self.joint_names)[0]
+        self.joint_ids = torch.tensor(self.joint_ids, device=self.device)
+        if self.env.backend in ("isaac", "mujoco"):
+            self.get_torques = lambda: self.asset.data.applied_torque[:, self.joint_ids]
+        elif self.env.backend == "mjlab":
+            self.get_torques = lambda: self.asset.data.actuator_force[:, self.joint_ids]
+
+    def update(self):
+        self.torques = self.get_torques()
+        self.joint_vel = self.asset.data.joint_vel[:, self.joint_ids]
+
+    def _compute(self) -> torch.Tensor:
+        power = (self.torques * self.joint_vel).abs()
+        return -power.var(dim=1, keepdim=True)
+
+
 class energy_l2(RewardV2):
     """Penalize joint energy (L2); stronger regularization than :class:`energy_l1`."""
 

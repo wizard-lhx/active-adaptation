@@ -75,20 +75,25 @@ class root_linacc_substep(ObservationV2):
 
 
 class command(ObservationV2):
-    def __init__(self, key: str | None = None):
+    def __init__(self, key: str | None = None, steps: int = 1):
         self.key = key
+        self.steps = steps
 
     @override
     def compute(self):
         if self.key is not None:
-            return self.command_manager.command(self.key)
-        return self.command_manager.command
+            command = self.command_manager.command(self.key)
+        else:
+            command = self.command_manager.command
+        return command.repeat(1, self.steps)
 
     @override
     def symmetry_transform(self):
         if self.key is not None:
-            return self.command_manager.symmetry_transform(self.key)
-        return self.command_manager.symmetry_transform()
+            transform = self.command_manager.symmetry_transform(self.key)
+        else:
+            transform = self.command_manager.symmetry_transform()
+        return transform.repeat(self.steps)
 
 
 class root_angvel_b(ObservationV2):

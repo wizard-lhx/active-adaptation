@@ -112,7 +112,7 @@ class _DelayedJointAction(ActionV2):
         self.decimation = int(self.env.step_dt / self.env.physics_dt)
 
         with torch.device(self.device):
-            self.action_buf = torch.zeros(self.num_envs, 4, self.action_dim)
+            self.action_buf = torch.zeros(self.num_envs, 5, self.action_dim)
             self.action_queue = torch.zeros(
                 self.num_envs,
                 self.max_delay + self.decimation,

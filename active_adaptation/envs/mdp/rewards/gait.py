@@ -191,7 +191,7 @@ class feet_air_time(RewardV2):
             :, self.body_ids
         ]
         last_air_time = self.contact_sensor.data.last_air_time[:, self.body_ids]
-        reward = ((last_air_time - self.thres).clamp_max(0.0) * first_contact).sum(1)
+        reward = ((last_air_time - self.thres) * first_contact).sum(1)
         active = ~self.command_manager.is_standing_env
         return reward.reshape(self.num_envs, 1), active
 

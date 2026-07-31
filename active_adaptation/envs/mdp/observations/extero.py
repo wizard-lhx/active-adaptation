@@ -31,9 +31,6 @@ if active_adaptation.get_backend() == "isaac":
     from isaaclab.utils.warp import raycast_mesh
 
 
-# from simple_raycaster import MultiMeshRaycaster
-
-
 def raymap(width: int, height: int, fov: float) -> Float[torch.Tensor, "height width 3"]:
     """
     Generate a raymap for a given width, height, and field of view.
@@ -191,13 +188,17 @@ class height_scan(ObservationV2):
             self.ground_mesh_quat_w = torch.tensor([1.0, 0.0, 0.0, 0.0]).expand(self.num_envs, 1, 4)
             self.ray_dirs_w = torch.tensor([0.0, 0.0, -1.0]).expand(self.num_envs, self.n_rays, 3)
 
-        self.raycaster = MultiMeshRaycaster([self.env.ground_mesh], device=self.device)
         self.target_assets = []
 
         if self.targets is not None:
             if self.env.backend == "isaac":
+                from simple_raycaster import MultiMeshRaycaster
                 from isaacsim.core.utils.stage import get_current_stage
 
+                self.raycaster = MultiMeshRaycaster(
+                    [self.env.ground_mesh],
+                    device=self.device,
+                )
                 stage = get_current_stage()
                 for target in self.targets:
                     target_asset = self.env.scene[target]
@@ -240,12 +241,19 @@ class height_scan(ObservationV2):
             mesh_pos_w = self.ground_mesh_pos_w
             mesh_quat_w = self.ground_mesh_quat_w
 
-        hit_pos_w, _ = self.raycaster.raycast_fused(
-            mesh_pos_w=mesh_pos_w,
-            mesh_quat_w=mesh_quat_w,
-            ray_starts_w=self.scan_pos_w.reshape(self.num_envs, self.n_rays, 3),
-            ray_dirs_w=self.ray_dirs_w,
-        )
+        if self.targets is None:
+            hit_pos_w = raycast_mesh(
+                ray_starts=self.scan_pos_w.reshape(-1, 3),
+                ray_directions=self.ray_dirs_w.reshape(-1, 3),
+                mesh=self.env.ground_mesh,
+            )[0].reshape(self.num_envs, self.n_rays, 3)
+        else:
+            hit_pos_w, _ = self.raycaster.raycast_fused(
+                mesh_pos_w=mesh_pos_w,
+                mesh_quat_w=mesh_quat_w,
+                ray_starts_w=self.scan_pos_w.reshape(self.num_envs, self.n_rays, 3),
+                ray_dirs_w=self.ray_dirs_w,
+            )
         self.hit_pos_w = hit_pos_w.reshape(self.num_envs, *self.shape, 3)
 
         height_map = root_pos_w[:, :, :, 2] - self.hit_pos_w[:, :, :, 2]

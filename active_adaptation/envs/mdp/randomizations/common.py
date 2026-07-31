@@ -754,7 +754,6 @@ class perturb_body_com(RandomizationV2):
                 self.pos_ranges[:, 0].unsqueeze(0).unsqueeze(-1).expand_as(coms[:, self.body_ids, :3]),
                 self.pos_ranges[:, 1].unsqueeze(0).unsqueeze(-1).expand_as(coms[:, self.body_ids, :3])
             )
-            rand_sample[:, :, 0] *= 0.5
             coms[:, self.body_ids, :3] += rand_sample.to('cpu')
             indices = torch.arange(self.asset.num_instances)
             self.asset.root_physx_view.set_coms(coms, indices)
