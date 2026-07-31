@@ -7,6 +7,7 @@ dependencies = [
     # Keep this pinned to the Isaac 5.1-compatible version.
     "isaacsim[all,extscache]==5.1.0",
     "viser>=1.0.30",
+    "simple-raycaster @ git+https://github.com/btx0424/simple-raycaster.git",
     "warp-lang < 1.13",
 ]
 
@@ -19,17 +20,12 @@ torchaudio = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]
 name = "aliyun"
-url = "http://mirrors.aliyun.com/pypi/simple/"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
 [[tool.uv.index]]
 name = "nvidia"
 url = "https://pypi.nvidia.com/"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv]
@@ -49,3 +45,8 @@ override-dependencies = [
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'"
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
