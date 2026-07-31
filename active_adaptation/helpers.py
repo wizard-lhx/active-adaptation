@@ -20,6 +20,8 @@ from active_adaptation.utils.wandb import parse_checkpoint
 from active_adaptation.utils.profiling import ScopedTimer
 from active_adaptation.envs import _EnvBase
 
+if active_adaptation.get_backend() is None:
+    raise ValueError("Backend is not set")
 
 class Every:
     def __init__(self, func, steps):
@@ -55,15 +57,51 @@ def make_env_policy(
     discard_unused_obs: bool = True,
     checkpoint_path: str | None = None
 ) -> tuple[Union[TransformedEnv, _EnvBase], torch.nn.Module]:
-    """Build env and policy, optionally restoring from `checkpoint_path`."""
+    """Build env and policy, optionally restoring from `checkpoint_path`.
+
+    If ``algo_cfg`` is ``algo=from_checkpoint``, replace it with the ``algo``
+    block from the run sidecar ``cfg.yaml`` next to the resolved checkpoint.
+    """
 
     seed = seed + active_adaptation.get_local_rank()
     # Select the appropriate backend-specific environment class
     backend = active_adaptation.get_backend()
 
+    from active_adaptation.utils.checkpoint_cfg import (
+        FromCheckpointAlgoConfig,
+        is_from_checkpoint_algo,
+        load_algo_cfg_from_local_pt,
+    )
+
     # Parse checkpoint in parallel with environment creation.
     with ThreadPoolExecutor(max_workers=1) as executor:
         checkpoint_future = executor.submit(parse_checkpoint, checkpoint_path)
+
+        # setup policy
+        # New pattern: ``_target_`` is the *config* dataclass (so ``__post_init__`` runs
+        # via ``hydra.utils.instantiate``); ``cfg.get_class()`` returns the policy class.
+        # Legacy: ``_target_`` was the policy class — keep a fallback during migration.
+        if is_from_checkpoint_algo(algo_cfg):
+            if not checkpoint_path:
+                raise ValueError(
+                    "algo=from_checkpoint requires checkpoint_path=... "
+                    "(or pass an explicit algo=..., e.g. algo=ppo_symaug)."
+                )
+            checkpoint = checkpoint_future.result()
+            if checkpoint is None:
+                raise ValueError(
+                    "algo=from_checkpoint requires a resolvable checkpoint_path."
+                )
+            checkpoint.update()
+            local_pt = checkpoint.get_path()
+            if not local_pt:
+                raise FileNotFoundError(
+                    f"Could not resolve checkpoint path for {checkpoint_path!r}"
+                )
+            algo_cfg = load_algo_cfg_from_local_pt(local_pt)
+
+        algo_cfg = hydra.utils.instantiate(algo_cfg)
+        policy_cls = algo_cfg.get_class()
         
         _ensure_backend_env_imported(backend)
         if backend == "isaac":
@@ -83,8 +121,9 @@ def make_env_policy(
         else:
             raise ValueError(f"Unknown backend: {backend}")
         
-        policy_in_keys = algo_cfg.get("in_keys", None)
-        if policy_in_keys is None:
+        try:
+            policy_in_keys = algo_cfg.in_keys
+        except AttributeError:
             raise ValueError("Specify `in_keys` (e.g., `policy`, `priv`) in `cfg.algo`.")
 
         if discard_unused_obs:
@@ -115,21 +154,9 @@ def make_env_policy(
 
     env = TransformedEnv(base_env, transform)
     env.set_seed(seed)
-    
-    # setup policy
-    # New pattern: ``_target_`` is the *config* dataclass (so ``__post_init__`` runs
-    # via ``hydra.utils.instantiate``); ``cfg.get_class()`` returns the policy class.
-    # Legacy: ``_target_`` was the policy class — keep a fallback during migration.
-    try:
-        cfg = hydra.utils.instantiate(algo_cfg)
-        policy_cls = cfg.get_class()
-    except Exception:
-        # raise a warning
-        cfg = algo_cfg
-        policy_cls = hydra.utils.get_class(algo_cfg._target_)
 
     print(f"Creating policy {policy_cls} on device {device}")
-    policy = policy_cls.from_env(cfg, env, device=device)
+    policy = policy_cls.from_env(algo_cfg, env, device=device)
     
     if "policy" in state_dict.keys():
         print(colored("[Info]: Load policy from checkpoint.", "green"))

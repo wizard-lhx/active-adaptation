@@ -5,6 +5,16 @@
 ```
 active_adaptation/envs/
 ├── env_base.py              # _EnvBase: create / init / step / reset wiring
+├── adapters.py              # SimAdapter, SceneAdapter, CameraFrustumHandle
+├── backends/
+│   ├── isaac/
+│   │   ├── adapter.py       # Omni DebugDraw + Viser draw_*/frustum
+│   │   ├── viewer.py        # IsaacViserViewer (meshes, lines, frustums)
+│   │   └── env.py           # viewer.viser, clear_debug callback
+│   └── mjlab/
+│       ├── adapter.py       # Viser draw_*/frustum
+│       ├── viewer.py        # MjLabViewer
+│       └── env.py
 └── mdp/
     ├── base.py              # MDPComponent, is_method_implemented
     ├── __init__.py          # re-exports V1+V2 bases + subpackages
@@ -16,7 +26,7 @@ active_adaptation/envs/
     │   └── *.py             # e.g. Twist
     ├── observations/
     │   ├── base.py          # Observation, ObservationV2
-    │   ├── common.py, joint.py, …
+    │   ├── common.py, joint.py, underwater.py, …
     │   └── __init__.py      # explicit submodule imports
     ├── rewards/
     │   ├── base.py          # Reward (deprecated), RewardV2
@@ -59,14 +69,17 @@ _step(tensordict)
   │     write_data_to_sim → sim.step → scene.update
   │     post_step(substep)
   ├─ episode_length_buf += 1
-  ├─ command.sync_state()
+  ├─ command.sync_state()   # intermediates for rewards; do not change next-step targets
   ├─ update callbacks
   ├─ _compute_reward
   ├─ _compute_termination
-  ├─ command.update()
+  ├─ command.update()       # may resample; write next-step targets for obs
   ├─ _compute_observation
-  └─ debug_draw callbacks (if GUI)
+  └─ if sim.has_gui(): debug_draw callbacks
+       (backends insert scene.clear_debug as first callback)
 ```
+
+`sim.has_gui()` is true for: Isaac Omni Kit **or** `viewer.viser`; mjlab when a `MjLabViewer` exists (non-headless).
 
 ---
 
@@ -149,6 +162,9 @@ Optional: `namespace = "foo"` on the class → registry key `foo.ClassName`; YAM
 - Abstract `sync_state` and `update` (must override both, even if `pass`).
 - `sample_init(env_ids)` provides root (and optionally joint) state for `_reset_idx`.
 - No teleop on V2 (legacy `Command` had `teleop`).
+- **`sync_state`:** refresh intermediates for rewards from the *current* command; do not change commands / next-step targets.
+- **`update`:** may change commands; write next-step targets for observations (rewards on the *next* step read these).
+- **First obs discarded:** post-reset observation is invalid (`is_init`); do not recompute next-step targets in `reset` solely to validate it. See SKILL.md “Command timing”.
 
 ---
 
@@ -169,3 +185,109 @@ Terms may read/write `tensordict`. Most leave it unused.
 **Order:** `_reset_idx` (`sample_init`) → `scene.reset` → `reset` callbacks.
 
 **Future:** drop `sample_init`; `reset` decides initial state.
+
+---
+
+## Raycasting / USD meshes
+
+External package: [`simple-raycaster`](https://github.com/btx0424/simple-raycaster) (installed into the uv env with active-adaptation; not a workspace-local path). Public exports: `MultiMeshRaycaster`, `MultiMeshRaycasterV2`. Authoritative notes: upstream `AGENTS.md`.
+
+### Package modules (import paths)
+
+```
+simple_raycaster.raycaster       # MultiMeshRaycaster — caller supplies mesh_pos_w / mesh_quat_w
+simple_raycaster.raycaster_v2    # MultiMeshRaycasterV2 — Isaac entity poses auto-gathered
+simple_raycaster.proximity       # MeshProximitySensor — closest-point / signed-distance queries
+simple_raycaster.kernels         # Warp raycast + fused transform + proximity kernels
+simple_raycaster.helpers         # trimesh2wp, quat_rotate_inverse, voxelize_*
+simple_raycaster.utils_usd       # find_matching_prims, get_trimesh_from_prim, usd2trimesh, usd2wp
+simple_raycaster.utils_mjc       # get_trimesh_from_body (MuJoCo)
+```
+
+### USD extraction pipeline (`utils_usd`)
+
+```
+stage / prim_path regex
+  → find_matching_prims
+  → get_mesh_prims_subtree (Mesh + Cube; resolve Usd instances → prototypes)
+  → usd2trimesh per mesh prim
+  → transform = mesh_world * parent_world⁻¹  (skip for prototype meshes)
+  → concatenate + merge_vertices
+  → body-local trimesh.Trimesh
+```
+
+- **Dynamic bodies:** mesh vertices stay in the body/parent frame; runtime pose is `body_link_pose_w` (`[pos(3), quat_wxyz(4)]`).
+- **Static world geometry** (`add_isaac_static`): combine matching visuals once; bake world transform into the trimesh; raycast pose is identity.
+- Prim path for Isaac articulations: template `entity.root_physx_view.prim_paths[0]`, then `{template with body_name}/visuals` per `entity.body_names`. Count must equal `entity.num_bodies`.
+
+### Raycast call shape
+
+- Inputs: `ray_starts_w`, `ray_dirs_w` as `[N, n_rays, 3]` (dirs normalized); optional `enabled [N]`, `mesh_indices [N, n_subset]`.
+- Outputs: `hit_positions_w [N, n_rays, 3]`, `hit_distances [N, n_rays]` (closest hit across meshes; misses → `max_dist`).
+- Prefer `raycast_fused` (single Warp kernel). Non-fused `raycast` is for parity/debug.
+- Conventions: quats **WXYZ** in Python (fused kernel reorders to XYZW for Warp); `wp.init()` once; CUDA device for production.
+
+### active-adaptation touchpoints
+
+| Location | Role |
+|----------|------|
+| `IsaacSceneAdapter.ground_mesh` | Warp mesh for `/World/ground` (plane or USD) |
+| `env.ground_mesh` | Proxy onto scene adapter |
+| `observations/extero.raycast_camera` | **Canonical V2** usage: static ground + `add_isaac_entity` targets |
+| `observations/extero.height_scan` | V1 + `ground_mesh` (+ optional `add_from_path` targets with manual root poses) |
+| `observations/underwater` DVL | IsaacLab `raycast_mesh` on `ground_mesh` only (not multi-mesh V2 yet) |
+
+---
+
+## Debug visualization
+
+Cross-backend API in `envs/adapters.py`. MDP terms call **`env.scene`**, never `env.debug_draw`.
+
+### SceneAdapter surface
+
+```python
+scene.clear_debug()
+scene.draw_vector(x, v, size=2.0, color=(…,))   # x,v: (..., 3)
+scene.draw_point(x, color=(…,), size=10.0)
+scene.draw_plot(x, size=2.0, color=(…,))         # polyline
+handle = scene.create_camera_frustum(name, fov_y=…, aspect=…, scale=0.15)
+handle.position = pos_w      # torch or numpy
+handle.wxyz = quat_wxyz
+handle.image = hwc_uint8
+```
+
+Env backends register `scene.clear_debug` as the **first** `debug_draw` callback so each frame starts empty, then term callbacks append primitives; viewers sync on `sim.step(render=True)` / `viewer.update()`.
+
+### Backend behavior
+
+| Backend | Primitives | Camera frustum | Enable |
+|---------|------------|----------------|--------|
+| Isaac Omni | `IsaacDebugDraw` (Kit) | — | Native GUI |
+| Isaac Viser | `IsaacViserViewer` lines/points | `register_camera` → `CameraFrustumHandle` | `viewer.viser: true` |
+| mjlab | `MjLabViewer` MDP buffers | same | non-headless |
+
+Isaac adapter may fan out `draw_*` to **both** Omni and Viser when both exist. `IsaacSimAdapter.has_gui()` is true if either is present; Omniverse window setup must check the **native** sim (`sim._sim.has_gui()`), not the adapter.
+
+### Viser mesh path (viewer internals)
+
+Same extraction as raycasting (`utils_usd.get_trimesh_from_prim` / `{body}/visuals`):
+
+1. Upload body meshes once at viewer `setup()`.
+2. Each update: write `body_link_pose_w` into batched mesh handles (park non-selected envs far away rather than rebuilding handles).
+3. Camera obs: frustum pose = body × mount offset (WXYZ); push RGB as HWC uint8.
+4. Example term: `observations/underwater.uw_camera` with `debug_vis: true`.
+
+### Example task knobs
+
+```yaml
+viewer:
+  eye: [4.0, 4.0, 4.0]
+  lookat: [0., 0., 0.]
+  viser: true   # Isaac only; mjlab uses headless=false
+
+observation:
+  policy:
+    underwater.uw_camera:
+      body_name: base_link
+      debug_vis: true
+```

@@ -95,6 +95,7 @@ from active_adaptation.learning.ppo.common import (
     make_mlp,
     Actor,
     Critic,
+    soft_copy_,
 )
 from active_adaptation.learning.utils.opt import MuonAdamWWrapper
 from active_adaptation.utils.profiling import ScopedTimer
@@ -149,7 +150,8 @@ class PPOTSCfg:
     def __post_init__(self):
         self.teacher_keys = tuple(self.teacher_keys)
         self.student_keys = tuple(self.student_keys)
-        self.in_keys = tuple(set(self.teacher_keys + self.student_keys))
+        # set is unordered, so we need to sort the keys to ensure the order is consistent.
+        self.in_keys = tuple(sorted(set(self.teacher_keys + self.student_keys)))
 
     def get_class(self):
         return PPOTeacherStudentPolicy
@@ -158,8 +160,13 @@ class PPOTSCfg:
 cs = ConfigStore.instance()
 cs.store(name="ppo_teacher", node=PPOTSCfg(stage="teacher"), group="algo")
 cs.store(
-    name="ppo_student",
-    node=PPOTSCfg(stage="student", symaug=False),
+    name="ppo_student1",
+    node=PPOTSCfg(stage="student1", symaug=False),
+    group="algo",
+)
+cs.store(
+    name="ppo_student2",
+    node=PPOTSCfg(stage="student2", symaug=False),
     group="algo",
 )
 
@@ -230,7 +237,7 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
     ):
         super().__init__()
         self.cfg = cfg
-        if self.cfg.stage not in ("teacher", "student"):
+        if self.cfg.stage not in ("teacher", "student1", "student2"):
             raise ValueError(f"Invalid stage: {self.cfg.stage!r}")
         self.device = device
         self.observation_spec = observation_spec
@@ -374,15 +381,6 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
             Mod(Critic(1), ["_critic_feature"], ["state_value"]),
         ).to(self.device)
 
-        self.training_keys = [
-            "action_log_prob",
-            "adv",
-            "ret",
-            "is_init",
-            ACTION_KEY,
-            *self.in_keys,
-        ]
-
         # Lazy init / shape check (GRU needs is_init + adapt_hx).
         with torch.device(self.device):
             fake_input["is_init"] = torch.ones(fake_input.shape[0], 1, dtype=torch.bool)
@@ -405,6 +403,9 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         self.encoder_student.apply(init_)
         self.actor_teacher.apply(init_)
         self.critic.apply(init_)
+
+        self.encoder_student_ema = copy.deepcopy(self.encoder_student)
+        self.encoder_student_ema.requires_grad_(False)
 
         self.opt_ppo: Optional[torch.optim.Optimizer] = None
         self.opt_distill: Optional[torch.optim.Optimizer] = None
@@ -437,6 +438,14 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
 
     def on_stage_start(self, _stage: str, _env: _EnvBase):
         # One stage per run for now; ``cfg.stage`` selects teacher vs student.
+        self.training_keys = [
+            "action_log_prob",
+            "adv",
+            "ret",
+            "is_init",
+            ACTION_KEY,
+            *self.in_keys,
+        ]
         if self.cfg.stage == "teacher":
             if self.cfg.muon:
                 self.opt_ppo = MuonAdamWWrapper(
@@ -460,7 +469,7 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
                 lr=self.cfg.lr,
                 weight_decay=0.01,
             )
-        elif self.cfg.stage == "student":
+        elif self.cfg.stage == "student1":
             # Shared actor / critic / teacher encoder already carry teacher weights
             # from the checkpoint. Only the student GRU is updated (DAgger).
             self.opt_ppo = None
@@ -471,6 +480,25 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
             )
             self.critic.requires_grad_(False)
             # copy to initialize student actor
+            hard_copy_(self.encoder_student, self.encoder_student_ema)
+            hard_copy_(self.actor_teacher, self.actor_student)
+        elif self.cfg.stage == "student2":
+            self.training_keys.append("adapt_hx")
+            self.opt_ppo = torch.optim.AdamW(
+                [
+                    {"params": self.actor_student.parameters()},
+                    {"params": self.critic.parameters()},
+                ],
+                lr=self.cfg.lr,
+                weight_decay=0.01,
+            )
+            self.opt_distill = torch.optim.AdamW(
+                [{"params": self.encoder_student.parameters()}],
+                lr=self.cfg.lr,
+                weight_decay=0.01,
+            )
+            # copy to initialize student actor
+            hard_copy_(self.encoder_student, self.encoder_student_ema)
             hard_copy_(self.actor_teacher, self.actor_student)
         else:
             raise ValueError(f"Invalid stage: {self.cfg.stage}")
@@ -480,12 +508,14 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
             self.update = torch.compile(self.update)
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
-        modules = [self.vecnorm if self.cfg.stage == "teacher" else VecNorm.freeze()(self.vecnorm)]
+        # VecNorm is frozen in eval mode to avoid unexpected updates
+        vecnorm = self.vecnorm if mode == "train" else VecNorm.freeze()(self.vecnorm)
+        modules = [vecnorm]
         if self.cfg.stage == "teacher":
             modules += [self.encoder_teacher, self.from_teacher, self.actor_teacher]
-        elif self.cfg.stage == "student":
+        elif self.cfg.stage in ("student1", "student2"):
             # Collect with student GRU (DAgger); carries adapt_hx via primer.
-            modules += [self.encoder_student, self.from_student, self.actor_student]
+            modules += [self.encoder_student_ema, self.from_student, self.actor_student]
         else:
             raise ValueError(f"Invalid stage: {self.cfg.stage}")
         if critic:
@@ -504,15 +534,16 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         if self.cfg.stage == "teacher":
             info.update(self.train_policy(tensordict.copy()))
             info.update(self.train_distillation(tensordict.copy()))
-        elif self.cfg.stage == "student":
+        elif self.cfg.stage == "student1":
             info.update(self.train_distillation(tensordict.copy()))
+        elif self.cfg.stage == "student2":
+            info.update(self.train_distillation(tensordict.copy()))
+            info.update(self.train_policy(tensordict.copy()))
         else:
             raise ValueError(f"Invalid stage: {self.cfg.stage}")
         return dict(sorted(info.items()))
 
     def train_policy(self, tensordict: TensorDict):
-        self.encoder_teacher.requires_grad_(True)
-        self.actor_teacher.requires_grad_(True)
         self.critic.requires_grad_(True)
 
         infos = []
@@ -524,13 +555,26 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
             adv_mean = adv.mean()
             adv_std = adv.std()
             tensordict["adv"] = (adv - adv_mean) / adv_std.clamp_min(1e-7)
-
+        
         td = tensordict.select(*self.training_keys)
+        if self.cfg.stage == "teacher":
+            self.encoder_teacher.requires_grad_(True)
+            self.actor_teacher.requires_grad_(True)
+            encoder = Seq(self.encoder_teacher, self.from_teacher)
+            actor = self.actor_teacher.requires_grad_(True)
+        elif self.cfg.stage == "student2":
+            self.encoder_student.requires_grad_(False) # trained by distillation
+            encoder = Seq(self.encoder_student_ema, self.from_student)
+            actor = self.actor_student.requires_grad_(True)
+        else:
+            raise ValueError(f"Invalid stage: {self.cfg.stage}")
+
         for _epoch in range(self.cfg.ppo_epochs):
-            for minibatch in make_batch(td, self.cfg.num_minibatches):
+            for minibatch in make_batch(td, self.cfg.num_minibatches, self.cfg.train_every):
                 if self.cfg.symaug:
                     minibatch = self._augment_symmetry(minibatch)
-                infos.append(self.update(minibatch))
+                info = self.update(minibatch, encoder, actor)
+                infos.append(info)
 
         infos = pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
         infos["critic/value_mean"] = tensordict["ret"].mean().item()
@@ -546,6 +590,7 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         """MSE: student GRU features ≈ teacher privileged features (BPTT)."""
         self.encoder_teacher.requires_grad_(False)
         self.actor_teacher.requires_grad_(False)
+        self.encoder_student.requires_grad_(True)
 
         infos = []
         self.vecnorm(tensordict)
@@ -591,6 +636,8 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
                         else torch.tensor(grad_norm),
                     }
                 )
+        
+        soft_copy_(self.encoder_student, self.encoder_student_ema, tau=0.04)
 
         return pytree.tree_map(lambda *xs: sum(xs).item() / len(xs), *infos)
 
@@ -653,8 +700,14 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         return torch.cat([tensordict, symmetry])
 
     @ScopedTimer("ppo_update")
-    def _update(self, tensordict: TensorDict):
-        assert self.cfg.stage == "teacher"
+    @set_recurrent_mode(True)
+    def _update(
+        self,
+        tensordict: TensorDict,
+        encoder: nn.Module,
+        actor: ProbabilisticActor,
+    ):
+        assert self.cfg.stage in ("teacher", "student2")
         bsize = tensordict.shape[0] // 2 if self.cfg.symaug else tensordict.shape[0]
 
         valid = (~tensordict["is_init"]).float()
@@ -662,9 +715,9 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         action_data = tensordict[ACTION_KEY]
         log_probs_data = tensordict["action_log_prob"]
 
-        self.vecnorm(tensordict)
-        self.encoder_teacher(tensordict)
-        self.actor_teacher(self.from_teacher(tensordict))
+        tensordict = self.vecnorm(tensordict)
+        tensordict = encoder(tensordict)
+        tensordict = actor(tensordict)
         dist = IndependentNormal(tensordict["loc"], tensordict["scale"])
         log_probs = dist.log_prob(action_data)
         entropy = (dist.entropy().reshape_as(valid) * valid).sum() / valid_cnt
@@ -689,10 +742,10 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         self.opt_ppo.zero_grad(set_to_none=True)
         loss.backward()
         encoder_grad_norm = nn.utils.clip_grad_norm_(
-            self.encoder_teacher.parameters(), self.max_grad_norm
+            encoder.parameters(), self.max_grad_norm
         )
         actor_grad_norm = nn.utils.clip_grad_norm_(
-            self.actor_teacher.parameters(), self.max_grad_norm
+            actor.parameters(), self.max_grad_norm
         )
         critic_grad_norm = nn.utils.clip_grad_norm_(
             self.critic.parameters(), self.max_grad_norm
@@ -741,11 +794,7 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
         failed_keys = []
         for name, module in self.named_children():
             _state_dict = state_dict.get(name, {})
-            try:
-                module.load_state_dict(_state_dict, strict=strict)
-                succeed_keys.append(name)
-            except Exception as e:
-                warnings.warn(f"Failed to load state dict for {name}: {str(e)}")
-                failed_keys.append(name)
+            module.load_state_dict(_state_dict, strict=strict)
+            succeed_keys.append(name)
         print(f"Successfully loaded {succeed_keys}.")
         return failed_keys
