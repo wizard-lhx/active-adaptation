@@ -79,25 +79,24 @@ observation:
 
 reward:
   loco:
-    linvel_exp: {weight: 1.0, sigma: 0.25, dim: 2}
-    angvel_z_exp: {weight: 0.5}
+    linvel_exp: {weight: 1.5, dim: 2}
+    linvel_projection: {weight: 0.5}
+    angvel_z_exp: {weight: 0.8}
+    angvel_xy_l2: {weight: 0.01}
     linvel_z_l2: {weight: 2.0}
-    angvel_xy_l2: {weight: 0.05}
-    base_orientation_l2: {weight: 0.2}
-    base_height_l2: {weight: 1.0, target_height: 0.45}
+    base_height_exp: {weight: 1.0}
   regularization:
-    feet_air_time: {weight: 0.1, body_names: .*_foot, thres: 0.5}
-    joint_acc_l2:
-      weight: 2.5e-7
-      joint_names: ".*_(hip|thigh|calf)_joint"
+    energy_l1: {weight: 0.0002, joint_names: ".*_(hip|thigh|calf)_joint"}
+    joint_acc_l2: {weight: 2.0e-7, joint_names: ".*_(hip|thigh|calf)_joint"}
+    joint_torques_l2: {weight: 2.0e-5, joint_names: ".*_(hip|thigh|calf)_joint"}
+    survival: {weight: 1.0}
     action_rate_l2: {weight: 0.01}
-    energy_l1:
-      weight: 2.0e-5
-      joint_names: ".*_(hip|thigh|calf)_joint"
-    action_rate2_l2: {weight: 0.0025}
-    power_distribution:
-      weight: 1.0e-5
-      joint_names: ".*_(hip|thigh|calf)_joint"
+    action_rate2_l2: {weight: 0.002}
+    feet_air_time: {weight: 2.0, body_names: .*_foot, thres: 0.5}
+    max_swing_height: {weight: 8.0, body_names: .*_foot, target_height: 0.15}
+    feet_sliding: {weight: 0.2, body_names: .*_foot}
+    undesired_contact: {body_names: [.*_calf, .*thigh], weight: 0.25}
+    body_upright: {weight: 1.0, body_name: base_link}
   debug:
     _enabled_: false
     linvel_projection: {weight: 0.5}
