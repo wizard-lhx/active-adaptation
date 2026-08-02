@@ -1,10 +1,15 @@
+from pathlib import Path
+from typing import Literal
+
 from active_adaptation.registry import Registry
 from active_adaptation.utils.symmetry import mirrored
 from active_adaptation import ROBOT_MODEL_DIR
-from typing import Literal
 
 
 registry = Registry.instance()
+
+ASSETS_DIR = Path(__file__).resolve().parents[1] / "Go2"
+USD_PATH = ASSETS_DIR / "go2.usd"
 
 INIT_POS = (0.0, 0.0, 0.4)
 INIT_JOINT_POS = {
@@ -71,6 +76,71 @@ BODY_NAMES_SIMULATION = [
     "RR_foot",
 ]
 
+EFFORT_LIMIT = 23.5
+VELOCITY_LIMIT = 30.0
+LEGS_STIFFNESS = 25.0
+LEGS_DAMPING = 0.5
+
+
+def make_isaaclab_cfg(self_collisions: bool = False):
+    from isaaclab.sensors import ContactSensorCfg
+    from active_adaptation.assets.asset_cfg import (
+        AssetSpec,
+        ArticulationCfg,
+        ImplicitActuatorCfg,
+        sim_utils,
+    )
+
+    asset_cfg = ArticulationCfg(
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(USD_PATH),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                retain_accelerations=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=1000.0,
+                max_angular_velocity=1000.0,
+                max_depenetration_velocity=1.0,
+            ),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=self_collisions,
+                solver_position_iteration_count=4,
+                solver_velocity_iteration_count=0,
+            ),
+            activate_contact_sensors=True,
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=INIT_POS,
+            joint_pos=INIT_JOINT_POS,
+            joint_vel={".*": 0.0},
+        ),
+        soft_joint_pos_limit_factor=0.9,
+        actuators={
+            "base_legs": ImplicitActuatorCfg(
+                joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
+                effort_limit_sim=EFFORT_LIMIT,
+                velocity_limit_sim=VELOCITY_LIMIT,
+                stiffness=LEGS_STIFFNESS,
+                damping=LEGS_DAMPING,
+                friction=0.0,
+            ),
+        },
+        joint_symmetry_mapping=JOINT_SYMMETRY_MAPPING,
+        spatial_symmetry_mapping=SPATIAL_SYMMETRY_MAPPING,
+        joint_names_simulation=JOINT_NAMES_SIMULATION,
+        body_names_simulation=BODY_NAMES_SIMULATION,
+    )
+    sensors = {
+        "contact_forces": ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/.*",
+            track_air_time=True,
+            history_length=3,
+        )
+    }
+    return AssetSpec(config=asset_cfg, sensors=sensors)
+
+
 def make_mjlab_cfg(motrix: bool = False):
     import mujoco
     from active_adaptation.assets.asset_cfg import AssetSpec, EntityCfg
@@ -95,9 +165,9 @@ def make_mjlab_cfg(motrix: bool = False):
             actuators=(
                 BuiltinPositionActuatorCfg(
                     target_names_expr=(".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"),
-                    effort_limit=23.5,
-                    stiffness=25.0,
-                    damping=0.5,
+                    effort_limit=EFFORT_LIMIT,
+                    stiffness=LEGS_STIFFNESS,
+                    damping=LEGS_DAMPING,
                     # armature=0.01,
                     # frictionloss=0.01,
                 ),
@@ -143,8 +213,10 @@ def make_mjlab_cfg(motrix: bool = False):
     return AssetSpec(config=cfg, sensors=sensors)
 
 
-def make_cfg(backend: Literal["mjlab", "motrix"]):
-    if backend == "mjlab":
+def make_cfg(backend: Literal["isaaclab", "mjlab", "motrix"]):
+    if backend == "isaaclab":
+        return make_isaaclab_cfg()
+    elif backend == "mjlab":
         return make_mjlab_cfg(motrix=False)
     elif backend == "motrix":
         return make_mjlab_cfg(motrix=True)
