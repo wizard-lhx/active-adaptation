@@ -125,13 +125,13 @@ DREAMWAQ_TERRAIN = TerrainGeneratorCfg(
         ),
         "stairs_up": HfPyramidStairsTerrainCfg(
             proportion=0.35,
-            step_height_range=(0.05, 0.23),
+            step_height_range=(0.05, 0.25),
             step_width=0.31,
             platform_width=3.0,
         ),
         "stairs_down": HfInvertedPyramidStairsTerrainCfg(
             proportion=0.35,
-            step_height_range=(0.05, 0.23),
+            step_height_range=(0.05, 0.25),
             step_width=0.31,
             platform_width=3.0,
         ),

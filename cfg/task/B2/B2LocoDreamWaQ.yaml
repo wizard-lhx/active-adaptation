@@ -83,7 +83,7 @@ reward:
     linvel_projection: {weight: 0.5}
     angvel_z_exp: {weight: 0.8}
     angvel_xy_l2: {weight: 0.01}
-    linvel_z_l2: {weight: 2.0}
+    linvel_z_l2: {weight: 1.0}
     base_height_exp: {weight: 1.0}
   regularization:
     energy_l1: {weight: 0.0002, joint_names: ".*_(hip|thigh|calf)_joint"}
@@ -94,9 +94,9 @@ reward:
     action_rate2_l2: {weight: 0.002}
     feet_air_time: {weight: 2.0, body_names: .*_foot, thres: 0.5}
     max_swing_height: {weight: 8.0, body_names: .*_foot, target_height: 0.15}
+    feet_clearance: {weight: 0.5, body_names: .*_foot, thres: 0.3}
     feet_sliding: {weight: 0.2, body_names: .*_foot}
     undesired_contact: {body_names: [.*_calf, .*thigh], weight: 0.25}
-    body_upright: {weight: 1.0, body_name: base_link}
   debug:
     _enabled_: false
     linvel_projection: {weight: 0.5}

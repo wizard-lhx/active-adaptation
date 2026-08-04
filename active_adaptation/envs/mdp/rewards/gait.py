@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from .base import RewardV2
 from active_adaptation.envs.utils import find_bodies, find_sensor_bodies
+from active_adaptation.utils.math import quat_rotate_inverse
 
 
 class max_swing_height(RewardV2):
@@ -42,12 +43,18 @@ class max_swing_height(RewardV2):
 
     @override
     def update(self):
-        feet_height = self.asset.data.body_link_pos_w[:, self.body_ids, 2]
-        self.max_height = torch.maximum(self.max_height, feet_height).clamp_max(self.target_height)
+        feet_pos_w = self.asset.data.body_link_pos_w[:, self.body_ids]
+        self.max_height = torch.maximum(self.max_height, feet_pos_w[..., 2])
         self.first_contact = self.contact_sensor.compute_first_contact(self.env.step_dt)[
             :, self.body_contact_ids
         ]
-        self.rew = (self.first_contact * self.max_height).sum(1, keepdim=True)
+
+        # Cast from above the feet so raised treads are visible even before clearance.
+        ground_query_pos = feet_pos_w.clone()
+        ground_query_pos[..., 2] += 10.0
+        ground_height = self.env.get_ground_height_at(ground_query_pos)
+        max_clearance = (self.max_height - ground_height).clamp(0.0, self.target_height)
+        self.rew = (self.first_contact * max_clearance).sum(1, keepdim=True)
         self.max_height = torch.where(self.first_contact, 0.0, self.max_height)
 
     @override
@@ -126,13 +133,7 @@ class quadruped_trot(RewardV2):
 
 
 class feet_clearance(RewardV2):
-    """
-    Smooth penalty for feet getting too close.
-
-    Pairwise distances between foot bodies are computed per environment (upper-triangular
-    pairs to avoid double counting). Distances larger than `thres` saturate to zero
-    penalty; distances below `thres` yield negative reward via a log distance ratio.
-    """
+    """Penalize foot pairs that are too close in the base-frame horizontal plane."""
 
     def __init__(self, body_names: str, weight: float, thres: float = 0.1):
         super().__init__(weight)
@@ -146,17 +147,23 @@ class feet_clearance(RewardV2):
         self.body_ids, self.body_names = find_bodies(self.asset, self.body_names_pattern)
         self.body_ids = torch.tensor(self.body_ids, device=self.device)
         self.num_feet = len(self.body_ids)
+        self.pair_indices = torch.triu_indices(
+            self.num_feet, self.num_feet, offset=1, device=self.device
+        )
 
     @override
     def _compute(self) -> torch.Tensor:
         feet_pos_w = self.asset.data.body_link_pos_w[:, self.body_ids]
-        pairwise_distances = (
-            feet_pos_w.reshape(self.num_envs, 1, self.num_feet, 3)
-            - feet_pos_w.reshape(self.num_envs, self.num_feet, 1, 3)
+        feet_pos_b = quat_rotate_inverse(
+            self.asset.data.root_link_quat_w.unsqueeze(1),
+            feet_pos_w - self.asset.data.root_link_pos_w.unsqueeze(1),
+        )
+        distances = (
+            feet_pos_b[:, self.pair_indices[0], :2]
+            - feet_pos_b[:, self.pair_indices[1], :2]
         ).norm(dim=-1)
-        distances = pairwise_distances.triu(diagonal=1).reshape(self.num_envs, -1)
-        reward = (distances / self.thres).clamp_max(1.0).log().sum(dim=1, keepdim=True)
-        return reward
+        shortfall = (1.0 - distances / self.thres).clamp_min(0.0)
+        return -shortfall.square().sum(dim=1, keepdim=True)
 
 
 class feet_air_time(RewardV2):

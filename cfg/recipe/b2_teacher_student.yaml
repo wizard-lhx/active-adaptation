@@ -11,7 +11,7 @@ stages:
       - algo=ppo_teacher
       - algo.teacher_keys=[policy,priv]
       - algo.student_keys=[policy]
-      - total_frames=100_000_000
+      - total_frames=150_000_000
       - backend=isaac
       - eval=False
 
