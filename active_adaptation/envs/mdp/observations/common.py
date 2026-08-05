@@ -75,17 +75,39 @@ class root_linacc_substep(ObservationV2):
 
 
 class command(ObservationV2):
+    """Current-to-oldest command history."""
+
     def __init__(self, key: str | None = None, steps: int = 1):
         self.key = key
         self.steps = steps
 
     @override
-    def compute(self):
+    def _initialize(self, env: "_EnvBase"):
+        super()._initialize(env)
+        current = self._current_command()
+        self.buffer = current.unsqueeze(1).repeat(1, self.steps, 1)
+
+    def _current_command(self) -> torch.Tensor:
         if self.key is not None:
-            command = self.command_manager.command(self.key)
-        else:
-            command = self.command_manager.command
-        return command.repeat(1, self.steps)
+            return self.command_manager.command(self.key)
+        return self.command_manager.command
+
+    @override
+    def reset(self, env_ids: torch.Tensor, tensordict: TensorDictBase):
+        current = self._current_command()[env_ids].unsqueeze(1)
+        self.buffer[env_ids] = current.expand(-1, self.steps, -1)
+
+    @override
+    def update(self):
+        self.buffer = self.buffer.roll(1, dims=1)
+        self.buffer[:, 0] = self._current_command()
+
+    @override
+    def compute(self):
+        # Commands resample after observation update callbacks, so refresh the
+        # newest slot here while retaining the history shifted in update().
+        self.buffer[:, 0] = self._current_command()
+        return self.buffer.reshape(self.num_envs, -1)
 
     @override
     def symmetry_transform(self):
