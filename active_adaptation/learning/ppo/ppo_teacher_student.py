@@ -508,6 +508,23 @@ class PPOTeacherStudentPolicy(TensorDictModuleBase):
             self.update = torch.compile(self.update)
 
     def get_rollout_policy(self, mode: str = "train", critic: bool = False):
+        if mode == "deploy":
+            if self.cfg.stage not in ("student1", "student2"):
+                raise ValueError("Only a student policy can be exported for deployment.")
+            student_vecnorm = Seq(
+                *[
+                    module
+                    for key, module in zip(self.in_keys, self.vecnorm.module)
+                    if key in self.student_keys
+                ]
+            )
+            return Seq(
+                student_vecnorm,
+                self.encoder_student_ema,
+                self.from_student,
+                self.actor_student,
+            ).select_out_keys("loc", ("next", "adapt_hx"))
+
         # VecNorm is frozen in eval mode to avoid unexpected updates
         vecnorm = self.vecnorm if mode == "train" else VecNorm.freeze()(self.vecnorm)
         modules = [vecnorm]
