@@ -226,15 +226,15 @@ class InteractiveTwist(Twist):
         if self.sling_enabled:
             corner_pos = self._sling_corner_pos_w.reshape(-1, 3)
             target_pos = self._sling_target_pos_w.reshape(-1, 3)
-            self.env.debug_draw.vector(
+            self.env.scene.draw_vector(
                 corner_pos,
                 target_pos - corner_pos,
                 color=(0.2, 1.0, 0.2, 1.0),
             )
-            self.env.debug_draw.point(
+            self.env.scene.draw_point(
                 target_pos, color=(0.2, 1.0, 0.2, 1.0), size=12.0
             )
-            self.env.debug_draw.vector(
+            self.env.scene.draw_vector(
                 corner_pos,
                 0.2
                 * self._sling_corner_forces_w.reshape(-1, 3)
@@ -246,7 +246,7 @@ class InteractiveTwist(Twist):
             body_pos = self.asset.data.body_link_pos_w[:, self.sling_body_id]
             body_quat = self.asset.data.body_link_quat_w[:, self.sling_body_id]
             push_force_w = quat_rotate(body_quat, self._push_force_b[:, 0])
-            self.env.debug_draw.vector(
+            self.env.scene.draw_vector(
                 body_pos,
                 push_force_w / 50.0,
                 color=(0.2, 0.8, 1.0, 1.0),
