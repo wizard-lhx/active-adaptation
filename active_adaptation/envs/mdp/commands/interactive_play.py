@@ -21,7 +21,7 @@ class InteractiveTwist(Twist):
     def __init__(
         self,
         *args,
-        sling_body_name: str = "base_link",
+        sling_body_name: str | None = None,
         sling_height_rate: float = 0.25,
         sling_height_range: float = 0.8,
         sling_frequency_hz: float = 1.5,
@@ -51,12 +51,15 @@ class InteractiveTwist(Twist):
         assert self.num_envs == 1, "Interactive play requires task.num_envs=1."
         assert self.env.sim.has_gui(), "Interactive play requires headless=false."
 
-        body_ids, body_names = self.asset.find_bodies(self.sling_body_name)
-        assert len(body_ids) == 1, (
-            f"sling_body_name={self.sling_body_name!r} must match exactly one body; "
-            f"matched {body_names}."
-        )
-        self.sling_body_id = body_ids[0]
+        if self.sling_body_name is None:
+            self.sling_body_id = 0
+        else:
+            body_ids, body_names = self.asset.find_bodies(self.sling_body_name)
+            assert len(body_ids) == 1, (
+                f"sling_body_name={self.sling_body_name!r} must match exactly one body; "
+                f"matched {body_names}."
+            )
+            self.sling_body_id = body_ids[0]
 
         # The sling owns UP/DOWN; the policy height command remains at its initial midpoint.
         self.key_mappings_height.clear()

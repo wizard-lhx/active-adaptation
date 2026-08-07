@@ -12,6 +12,8 @@ FIXED_OVERRIDES = (
     "task.num_envs=1",
     "task.command._target_=InteractiveTwist",
     "++task.command.teleop=true",
+    "symmetric_eval.enabled=true",
+    "disable_termination=true",
 )
 
 
