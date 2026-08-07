@@ -100,6 +100,7 @@ class PPOConfig:
     actor_num_units: Tuple[int, ...] = (256, 256, 256)
     critic_num_units: Tuple[int, ...] = (512, 256, 256)
     activation: str = "Mish"
+    obs_normalization: bool = True
     spo: bool = False # use Simple Policy Optimization Loss
     muon: bool = False # use Muon optimizer
     aux_coef: float = 0.0 # loss coefficient for auxiliary prediction loss
@@ -162,14 +163,16 @@ class PPOPolicy(TensorDictModuleBase):
         if CMD_KEY in observation_spec.keys(True, True):
             self.training_keys += [CMD_KEY, OBS_KEY, ACTION_KEY]
             inp_dim = fake_input[CMD_KEY].shape[-1] + fake_input[OBS_KEY].shape[-1]
+            obs_normalizer = VecNorm((inp_dim,), decay=1.0) if self.cfg.obs_normalization else nn.Identity()
             self.vecnorm = Seq(
                 CatTensors([CMD_KEY, OBS_KEY], "_input", del_keys=False, sort=False),
-                Mod(VecNorm((inp_dim,), decay=1.0), ["_input"], ["_obs_normed"]),
+                Mod(obs_normalizer, ["_input"], ["_obs_normed"]),
             ).to(self.device)
         else:
             self.training_keys += [OBS_KEY, ACTION_KEY]
             inp_dim = fake_input[OBS_KEY].shape[-1]
-            self.vecnorm = Mod(VecNorm((inp_dim,), decay=1.0), [OBS_KEY], ["_obs_normed"]).to(self.device)
+            obs_normalizer = VecNorm((inp_dim,), decay=1.0) if self.cfg.obs_normalization else nn.Identity()
+            self.vecnorm = Mod(obs_normalizer, [OBS_KEY], ["_obs_normed"]).to(self.device)
         self.action_dim = action_spec.shape[-1]
 
         Activation = getattr(nn, self.cfg.activation)
