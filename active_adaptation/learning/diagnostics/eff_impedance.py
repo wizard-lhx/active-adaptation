@@ -29,11 +29,14 @@ def actor_input(obs: Tensor | TensorDictBase) -> Tensor:
     return value.reshape(-1, value.shape[-1])
 
 
-def _vecnorm(policy: Any) -> VecNorm:
+def _normalize_actor_input(policy: Any, value: Tensor) -> Tensor:
     for module in policy.vecnorm.modules():
         if isinstance(module, VecNorm):
-            return module
-    raise ValueError("Could not find VecNorm in policy.vecnorm")
+            return module._normalize(value)
+    assert not policy.cfg.obs_normalization, (
+        "VecNorm is missing while algo.obs_normalization is enabled"
+    )
+    return value
 
 
 def policy_mean(policy: Any, obs: Tensor) -> Tensor:
@@ -41,7 +44,7 @@ def policy_mean(policy: Any, obs: Tensor) -> Tensor:
 
     single = obs.ndim == 1
     value = obs.unsqueeze(0) if single else obs
-    normed = _vecnorm(policy)._normalize(value)
+    normed = _normalize_actor_input(policy, value)
     td = TensorDict(
         {"_obs_normed": normed},
         batch_size=value.shape[:-1],
