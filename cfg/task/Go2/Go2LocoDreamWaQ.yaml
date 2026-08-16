@@ -1,0 +1,133 @@
+# @package task
+name: Go2LocoDreamWaQ
+
+viewer:
+  resolution: [1280, 720]
+  lookat: [0.0, 0.0, 0.0]
+  eye: [4.0, 4.0, 4.0]
+
+robot:
+  name: unitree_go2
+terrain: dreamwaq_curriculum
+
+num_envs: 4096
+max_episode_length: 1000
+
+sim:
+  step_dt: 0.02
+  isaac_physics_dt: 0.005
+  mujoco_physics_dt: 0.002
+
+input:
+  action:
+    _target_: JointPosition
+    action_scaling:
+      .*_hip_joint: 0.5
+      .*_thigh_joint: 0.5
+      .*_calf_joint: 0.5
+    max_delay: 3
+    alpha_range: [0.5, 1.0]
+
+command:
+  _target_: Twist
+  linvel_x_range: [-1.0, 1.6]
+  linvel_y_range: [-0.8, 0.8]
+  angvel_range: [-2.0, 2.0]
+  yaw_stiffness_range: [0.5, 1.1]
+  use_stiffness_ratio: 0.99
+  base_height_range: [0.35, 0.35]
+  locomotion_height_threshold: 0.30
+  resample_interval: 250
+  resample_prob: 0.5
+  stand_prob: 0.08
+  curriculum: true
+
+observation:
+  policy:
+    command: {steps: 5}
+    root_angvel_b: {steps: 5}
+    gravity_multistep: {steps: 5, noise_std: 0.05}
+    joint_pos_multistep:
+      joint_names: ".*_(hip|thigh|calf)_joint"
+      steps: 5
+      noise_std: 0.05
+      subtract_default: true
+    joint_vel_multistep:
+      joint_names: ".*_(hip|thigh|calf)_joint"
+      steps: 5
+      noise_std: 0.2
+    prev_actions: {steps: 5}
+  priv:
+    command: {}
+    root_angvel_b: {}
+    gravity_multistep: {steps: 1}
+    joint_pos_multistep:
+      joint_names: ".*_(hip|thigh|calf)_joint"
+      steps: 1
+      subtract_default: true
+    joint_vel_multistep:
+      joint_names: ".*_(hip|thigh|calf)_joint"
+      steps: 1
+    prev_actions: {}
+    root_linvel_b: {}
+    contact_forces: {body_names: "base|.*_(hip|thigh|calf|foot)"}
+    height_scan:
+      x_range: [-0.8, 0.8]
+      y_range: [-0.5, 0.5]
+      resolution: [0.1, 0.1]
+      flatten: true
+
+reward:
+  loco:
+    linvel_exp: {weight: 1.5, dim: 2}
+    linvel_projection: {weight: 0.5}
+    angvel_z_exp: {weight: 0.8}
+    angvel_xy_l2: {weight: 0.01}
+    linvel_z_l2: {weight: 1.0}
+    base_height_exp: {weight: 1.0, sigma: 0.4}
+  regularization:
+    energy_l1: {weight: 0.0002, joint_names: ".*_(hip|thigh|calf)_joint"}
+    joint_acc_l2: {weight: 2.5e-7, joint_names: ".*_(hip|thigh|calf)_joint"}
+    joint_torques_l2: {weight: 5.0e-5, joint_names: ".*_(hip|thigh|calf)_joint"}
+    survival: {weight: 1.0}
+    action_rate_l2: {weight: 0.01}
+    action_rate2_l2: {weight: 0.002}
+    feet_air_time: {weight: 0.2, body_names: .*_foot, thres: 0.4}
+    max_swing_height: {weight: 2.0, body_names: .*_foot, target_height: 0.12}
+    feet_sliding: {weight: 0.2, body_names: .*_foot}
+    undesired_contact: {body_names: [.*_calf, .*thigh], weight: 0.25}
+  debug:
+    _enabled_: false
+    linvel_projection: {weight: 0.5}
+    base_height_l1: {weight: 1.0}
+    feet_contact_count: {weight: 1.0, body_names: .*_foot}
+
+termination:
+  max_episode_length: {}
+  crash: {body_names_expr: [base, .*thigh], t_thres: 0.06}
+  fall_over: {xy_thres: 0.9}
+  undesired_contact: {body_names: [.*_calf]}
+
+randomization:
+  perturb_body_mass:
+    (?!(payload|base|Head.*)).*: [0.8, 1.2]
+    base: [0.8, 1.4]
+  randomize_materials_isaac:
+    body_names: .*_foot
+    static_friction_range: [0.5, 4.0]
+    dynamic_friction_range: [0.5, 4.0]
+    restitution_range: [0.0, 0.5]
+    homogeneous: true
+  actuator_pd_gains:
+    stiffness_range:
+      .*: [0.8, 1.1]
+    damping_range:
+      .*: [0.8, 1.1]
+  reset_joint_states_scale:
+    pos_scales:
+      .*: [0.8, 1.2]
+  random_joint_offset:
+    .*hip_joint: [-0.05, 0.05]
+    F[L,R]_thigh_joint: [-0.05, 0.05]
+    R[L,R]_thigh_joint: [-0.05, 0.05]
+    .*calf_joint: [-0.05, 0.05]

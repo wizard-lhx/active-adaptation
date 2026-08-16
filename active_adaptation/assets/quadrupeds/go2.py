@@ -41,6 +41,12 @@ SPATIAL_SYMMETRY_MAPPING = mirrored({
     "base": "base",
 })
 
+ISAAC_SPATIAL_SYMMETRY_MAPPING = {
+    **SPATIAL_SYMMETRY_MAPPING,
+    "Head_upper": "Head_upper",
+    "Head_lower": "Head_lower",
+}
+
 JOINT_NAMES_SIMULATION = [
     "FL_hip_joint",
     "FR_hip_joint",
@@ -127,7 +133,7 @@ def make_isaaclab_cfg(self_collisions: bool = False):
             ),
         },
         joint_symmetry_mapping=JOINT_SYMMETRY_MAPPING,
-        spatial_symmetry_mapping=SPATIAL_SYMMETRY_MAPPING,
+        spatial_symmetry_mapping=ISAAC_SPATIAL_SYMMETRY_MAPPING,
         joint_names_simulation=JOINT_NAMES_SIMULATION,
         body_names_simulation=BODY_NAMES_SIMULATION,
     )

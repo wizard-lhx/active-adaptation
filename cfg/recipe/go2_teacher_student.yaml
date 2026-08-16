@@ -1,0 +1,42 @@
+# @package _global_
+name: go2_teacher_student
+work_dir: ./outputs_pipeline/${name}/${now:%Y-%m-%d-%H-%M-%S}
+
+stages:
+  - name: go2_teacher
+    script: train_ppo.py
+    overrides:
+      - task=Go2/Go2LocoDreamWaQ
+      - task.num_envs=8192
+      - algo=ppo_teacher
+      - algo.teacher_keys=[policy,priv]
+      - algo.student_keys=[policy]
+      - total_frames=150_000_000
+      - backend=isaac
+      - eval=False
+
+  - name: go2_student1
+    script: train_ppo.py
+    overrides:
+      - task=Go2/Go2LocoDreamWaQ
+      - task.num_envs=8192
+      - algo=ppo_student1
+      - algo.teacher_keys=[policy,priv]
+      - algo.student_keys=[policy]
+      - total_frames=50_000_000
+      - backend=isaac
+      - eval=False
+      - checkpoint_path=${run_state.checkpoint_path}
+
+  - name: go2_student2
+    script: train_ppo.py
+    overrides:
+      - task=Go2/Go2LocoDreamWaQ
+      - task.num_envs=8192
+      - algo=ppo_student2
+      - algo.teacher_keys=[policy,priv]
+      - algo.student_keys=[policy]
+      - total_frames=50_000_000
+      - backend=isaac
+      - eval=True
+      - checkpoint_path=${run_state.checkpoint_path}
